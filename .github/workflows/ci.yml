@@ -29,6 +29,27 @@ jobs:
     steps:
       - run: apt-get update && apt-get install -y --no-install-recommends git cmake build-essential python3 python3-numpy
       - uses: actions/checkout@v4
-      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTIDAL_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DGGML_NATIVE=OFF
+      # No GPU driver is mounted on hosted runners. VMM would add a direct
+      # libcuda.so.1 dependency and fail at final executable link/load time.
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTIDAL_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DGGML_NATIVE=OFF -DGGML_CUDA_NO_VMM=ON -DGGML_CUDA_FA=OFF
       - run: cmake --build build -j 2
       - run: ctest --test-dir build --output-on-failure
+
+  devcontainer-image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --tag tidal-dev --file .devcontainer/Dockerfile .devcontainer
+      - name: Check development tools (no GPU runtime test)
+        run: |
+          docker run --rm --entrypoint bash tidal-dev -lc '
+            test "$(id -un)" = vscode &&
+            test "$(id -u)" -ne 0 &&
+            test -w /home/vscode/.cache/ccache &&
+            nvcc --version &&
+            cmake --version &&
+            ninja --version &&
+            ccache --version &&
+            gdb --version &&
+            python3 -c "import numpy; print(numpy.__version__)"
+          '

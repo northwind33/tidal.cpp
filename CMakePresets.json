@@ -1,0 +1,47 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "dev-cuda",
+      "displayName": "CUDA development (Titan RTX / SM 7.5)",
+      "description": "Debuggable CUDA build for the development container; main attention runs on CPU.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/dev-cuda",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": true,
+        "CMAKE_CUDA_ARCHITECTURES": "75",
+        "CMAKE_C_COMPILER_LAUNCHER": "ccache",
+        "CMAKE_CXX_COMPILER_LAUNCHER": "ccache",
+        "CMAKE_CUDA_COMPILER_LAUNCHER": "ccache",
+        "TIDAL_CUDA": true,
+        "BUILD_TESTING": true,
+        "GGML_NATIVE": false,
+        "GGML_CUDA_FA": false
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "dev-cuda",
+      "configurePreset": "dev-cuda"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "dev-cuda",
+      "configurePreset": "dev-cuda",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    }
+  ]
+}

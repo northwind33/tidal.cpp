@@ -65,3 +65,10 @@ python tests/test_reference.py --bin-dir build-cuda/bin --backend cuda
 ```
 
 No tokens/second, long-context speedup or Titan RTX runtime result is claimed.
+
+The first CUDA CI run compiled ggml's CUDA kernels and the engine, then failed
+linking the executables: the GPU-less container had no `libcuda.so.1` for ggml's
+VMM driver-API symbols. The workflow now sets `GGML_CUDA_NO_VMM=ON` for that CI job.
+The GPU development container retains the normal VMM default; NVIDIA Container
+Toolkit supplies the host driver libraries at runtime. See
+[the Dev Container guide](devcontainer.md) for setup and hardware validation.

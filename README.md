@@ -24,6 +24,13 @@ host; the attention output returns to the GPU. The full main KV cache stays in R
 
 ## Build
 
+For development on the Titan RTX server, a CUDA-enabled VS Code Dev Container is
+included. Connect to the server using Remote - SSH, open this repository there,
+then run **Dev Containers: Reopen in Container**. The container provides CUDA
+12.8.1, CMake, Ninja, GDB, ccache and NumPy, and configures the `dev-cuda` preset
+for SM 7.5. See [the setup and debugging guide](docs/devcontainer.md) for host
+prerequisites, build commands and real-GPU checks.
+
 Requirements: CMake 3.24+, a C++20 compiler, Git, and optionally the CUDA toolkit.
 ggml is fetched at a pinned commit (see `CMakeLists.txt`). For an existing checkout,
 pass `-DTIDAL_GGML_SOURCE_DIR=/path/to/ggml` at that same revision.
