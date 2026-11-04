@@ -109,6 +109,14 @@ uses `--gpus=all`; for a server with several GPUs, change that argument to
 `--gpus=device=0` (or the desired device UUID) and rebuild the container. It does
 not run privileged, mount the Docker socket, or install a host GPU driver.
 
+## Benchmark and profile
+
+For repeated throughput measurements, JSON regression comparisons, per-node and
+CPU attention profiling, and NVTX ranges for Nsight, see
+[benchmarking and profiling](benchmark.md). The `tidal-bench` executable is built
+by the same preset. Detailed profile times include synchronization overhead and
+are collected in a separate replay from the throughput measurements.
+
 ## Another GPU or local overrides
 
 SM 7.5 is the checked-in default for the Titan RTX. To use another target without

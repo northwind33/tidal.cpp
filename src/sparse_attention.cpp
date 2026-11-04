@@ -1,4 +1,5 @@
 #include "internal.hpp"
+#include "profiler.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -24,7 +25,8 @@ void SparseAttention::append(const std::vector<float> & key, const std::vector<f
 }
 
 std::vector<float> SparseAttention::attend(const std::vector<float> & query,
-                                         const std::vector<int32_t> & selected) const {
+                                         const std::vector<int32_t> & selected, Profiler * profiler,
+                                         int position, int layer) const {
     if (query.size() != size_t(heads_) * dim_ || selected.empty())
         throw std::invalid_argument("Wrong query width or empty attention selection");
     int previous = -1;
@@ -36,6 +38,8 @@ std::vector<float> SparseAttention::attend(const std::vector<float> & query,
     auto worker = [&](int first, int stride) {
         std::vector<float> scores(selected.size());
         for (int h = first; h < heads_; h += stride) {
+            ProfileScope qk(profiler, "cpu_head", "qk", "qsa.attention", position, layer, "CPU", h);
+            qk.event.bytes = selected.size() * dim_ * sizeof(ggml_bf16_t);
             const int kv = h / (heads_ / kv_heads_); // grouped, not tiled, query heads
             float maximum = -std::numeric_limits<float>::infinity();
             for (size_t i = 0; i < selected.size(); ++i) {
@@ -46,8 +50,13 @@ std::vector<float> SparseAttention::attend(const std::vector<float> & query,
                 scores[i] = dot / std::sqrt(float(dim_));
                 maximum = std::max(maximum, scores[i]);
             }
+            qk.finish();
+            ProfileScope softmax(profiler, "cpu_head", "softmax", "qsa.attention", position, layer, "CPU", h);
             float denominator = 0;
             for (float & score : scores) { score = std::exp(score - maximum); denominator += score; }
+            softmax.finish();
+            ProfileScope weighted(profiler, "cpu_head", "weighted_v", "qsa.attention", position, layer, "CPU", h);
+            weighted.event.bytes = selected.size() * dim_ * sizeof(ggml_bf16_t);
             for (size_t i = 0; i < selected.size(); ++i) {
                 const size_t offset = (size_t(selected[i]) * kv_heads_ + kv) * dim_;
                 const float probability = scores[i] / denominator;
@@ -58,9 +67,12 @@ std::vector<float> SparseAttention::attend(const std::vector<float> & query,
     };
     const int workers = std::min(threads_, heads_);
     std::vector<std::jthread> pool;
+    ProfileScope launch(profiler, "host", "worker_launch", "qsa.attention", position, layer, "CPU");
     for (int w = 1; w < workers; ++w) pool.emplace_back(worker, w, workers);
+    launch.finish();
     worker(0, workers);
     // Join before moving result into the return value.
+    ProfileScope join(profiler, "host", "worker_join", "qsa.attention", position, layer, "CPU");
     for (auto & thread : pool) thread.join();
     return result;
 }

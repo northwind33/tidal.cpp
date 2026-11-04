@@ -1,4 +1,5 @@
 #include "internal.hpp"
+#include "profiler.hpp"
 #include "ggml-cpu.h"
 #ifdef TIDAL_CUDA
 #include "ggml-cuda.h"
@@ -47,6 +48,10 @@ Backend make_backend(const Options & opts) {
 // capable of silently moving an unsupported GPU operation to the CPU is used.
 class Graph {
 public:
+    Profiler & profiler;
+    std::string phase, backend_label;
+    int position, layer;
+    ProfileScope build_scope;
     Context ctx = context(4 * 1024 * 1024);
     Buffer storage{nullptr, ggml_backend_buffer_free};
     ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 2048, false);
@@ -54,7 +59,16 @@ public:
     Statistics & stats;
     bool device;
     std::vector<std::function<void()>> uploads;
-    Graph(ggml_backend_t b, Statistics & s, bool d) : backend(b), stats(s), device(d) {}
+    Graph(ggml_backend_t b, Statistics & s, bool d, Profiler & p,
+          std::string ph, int pos, int l)
+        : profiler(p), phase(std::move(ph)), backend_label(ggml_backend_name(b)), position(pos), layer(l),
+          build_scope(&p, "host", "graph_build", phase, pos, l, "CPU"),
+          backend(b), stats(s), device(d) {}
+    ~Graph() {
+        ProfileScope release(&profiler, "host", "graph_free", phase, position, layer, "CPU");
+        storage.reset();
+        ctx.reset();
+    }
     ggml_context * c() { return ctx.get(); }
     void add(ggml_tensor * t) { ggml_build_forward_expand(graph, t); }
     ggml_tensor * integer(int32_t value) {
@@ -68,6 +82,8 @@ public:
         return t;
     }
     void put(ggml_tensor * t, const void * data, size_t size) {
+        ProfileScope transfer(&profiler, "transfer", device ? "H2D" : "host_write", phase, position, layer, backend_label);
+        transfer.event.bytes = size;
         auto start = Clock::now();
         ggml_backend_tensor_set(t, data, 0, size);
         stats.transfer_ms += elapsed(start);
@@ -77,6 +93,8 @@ public:
         std::vector<T> values(size_t(ggml_nelements(t)));
         if (values.size() * sizeof(T) != ggml_nbytes(t) || !ggml_is_contiguous(t))
             throw std::logic_error("Readback must be contiguous with matching type");
+        ProfileScope transfer(&profiler, "transfer", device ? "D2H" : "host_read", phase, position, layer, backend_label);
+        transfer.event.bytes = ggml_nbytes(t);
         auto start = Clock::now();
         ggml_backend_tensor_get(t, values.data(), 0, ggml_nbytes(t));
         stats.transfer_ms += elapsed(start);
@@ -84,17 +102,49 @@ public:
         return values;
     }
     void run() {
+        build_scope.finish();
+        ProfileScope validation(&profiler, "host", "supports_op", phase, position, layer, "CPU");
         for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
             auto * node = ggml_graph_node(graph, i);
             if (!ggml_backend_supports_op(backend, node))
                 throw std::runtime_error(std::string(ggml_backend_name(backend)) + " does not support " +
                                          ggml_op_name(node->op) + "; no CPU fallback");
         }
+        validation.finish();
+        ProfileScope allocation(&profiler, "host", "graph_allocate", phase, position, layer, "CPU");
         storage.reset(ggml_backend_alloc_ctx_tensors(c(), backend));
         if (!storage) throw std::runtime_error("Graph allocation failed");
+        allocation.finish();
         for (auto & upload : uploads) upload();
+        ProfileScope compute(&profiler, "graph", "compute", phase, position, layer, backend_label);
         auto start = Clock::now();
-        const auto status = ggml_backend_graph_compute(backend, graph);
+        ggml_status status = GGML_STATUS_SUCCESS;
+        if (profiler.mode == ProfileMode::Nodes) {
+            // Reuse allocated tensors; execute each node exactly once in graph
+            // order. This intentionally disables fusion and synchronizes per op.
+            auto * single = ggml_new_graph_custom(c(), 1, false);
+            for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+                auto * node = ggml_graph_node(graph, i);
+                ggml_graph_clear(single);
+                ggml_graph_add_node(single, node);
+                ProfileScope op(&profiler, "node", node->name[0] ? node->name : ggml_op_name(node->op),
+                                phase, position, layer, backend_label);
+                op.event.node = i;
+                op.event.op = ggml_op_desc(node);
+                op.event.dtype = ggml_type_name(node->type);
+                op.event.shape.assign(node->ne, node->ne + GGML_MAX_DIMS);
+                op.event.bytes = ggml_nbytes(node); // Logical output size, not measured DRAM traffic.
+                for (auto * input : node->src) if (input) {
+                    op.event.input_types.emplace_back(ggml_type_name(input->type));
+                    op.event.input_shapes.emplace_back(input->ne, input->ne + GGML_MAX_DIMS);
+                }
+                op.restart();
+                status = ggml_backend_graph_compute(backend, single);
+                if (status != GGML_STATUS_SUCCESS) break;
+            }
+        } else {
+            status = ggml_backend_graph_compute(backend, graph);
+        }
         ggml_backend_synchronize(backend);
         stats.graph_ms += elapsed(start);
         if (status != GGML_STATUS_SUCCESS) throw std::runtime_error("ggml graph execution failed");
@@ -120,6 +170,7 @@ struct Engine::Impl {
     Model model;
     Config c;
     Statistics stats;
+    Profiler profiler;
     Context state_context;
     Buffer state_buffer{nullptr, ggml_backend_buffer_free};
     ggml_tensor * hidden;
@@ -129,7 +180,7 @@ struct Engine::Impl {
 
     Impl(const std::string & path, Options opts)
         : options(std::move(opts)), backend(make_backend(options)), model(path, backend.get()), c(model.config),
-          state_context(context(1024 * 1024)), states(c.layers) {
+          profiler(options.profile, options.nvtx, options.profile_event_limit), state_context(context(1024 * 1024)), states(c.layers) {
         auto * ctx = state_context.get();
         hidden = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.hidden, c.branches);
         for (int i = 0; i < c.layers; ++i) {
@@ -153,17 +204,24 @@ struct Engine::Impl {
         if (!state_buffer) throw std::runtime_error("State allocation failed");
         reset();
     }
-    Graph graph() { return Graph(backend.get(), stats, options.backend == "cuda"); }
+    Graph graph(const std::string & phase, int layer = -1) {
+        return Graph(backend.get(), stats, options.backend == "cuda", profiler, phase, position, layer);
+    }
     ggml_tensor * weight(const std::string & n) { return model.at(n); }
     ggml_tensor * mm(Graph & g, const std::string & n, ggml_tensor * x) {
         auto * out = ggml_mul_mat(g.c(), weight(n), x);
         // Request F32 accumulation. This does not prescribe operand conversion:
         // CPU dot types and CUDA Q8_1 activation quantization still differ.
         ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, n.c_str());
         return out;
     }
     ggml_tensor * norm(Graph & g, ggml_tensor * x, const std::string & n) {
-        return ggml_mul(g.c(), ggml_rms_norm(g.c(), x, c.eps), weight(n));
+        auto * rms = ggml_rms_norm(g.c(), x, c.eps);
+        ggml_set_name(rms, (n + ".rms").c_str());
+        auto * result = ggml_mul(g.c(), rms, weight(n));
+        ggml_set_name(result, n.c_str());
+        return result;
     }
     ggml_tensor * rope(Graph & g, ggml_tensor * x, int dim, int heads, int pos) {
         x = ggml_reshape_3d(g.c(), ggml_cont(g.c(), x), dim, heads, 1);
@@ -207,7 +265,8 @@ struct Engine::Impl {
         return ggml_reshape_4d(g.c(), ggml_cont(g.c(), expanded), c.gdn_dim, c.gdn_value_heads, 1, 1);
     }
     void linear_layer(int layer) {
-        auto g = graph();
+        ProfileScope scope(&profiler, "layer", "gdn", "gdn", position, layer, ggml_backend_name(backend.get()));
+        auto g = graph("gdn", layer);
         auto & s = states[layer];
         const std::string p = "blk." + std::to_string(layer) + ".";
         auto mixed = mix(g, hidden, p + "hc_attn");
@@ -217,6 +276,8 @@ struct Engine::Impl {
         auto * row = ggml_reshape_2d(g.c(), qkv, 1, channels);
         auto * history = ggml_concat(g.c(), s.conv, row, 0);
         auto * convolved = ggml_silu(g.c(), ggml_ssm_conv(g.c(), history, weight(p + "gdn.conv")));
+        ggml_set_name(convolved->src[0], (p + "gdn.convolution").c_str());
+        ggml_set_name(convolved, (p + "gdn.conv_silu").c_str());
         auto * q = ggml_reshape_2d(g.c(), ggml_view_1d(g.c(), convolved, kd, 0), c.gdn_dim, c.gdn_key_heads);
         auto * k = ggml_reshape_2d(g.c(), ggml_view_1d(g.c(), convolved, kd, size_t(kd) * sizeof(float)),
                                   c.gdn_dim, c.gdn_key_heads);
@@ -233,6 +294,7 @@ struct Engine::Impl {
         decay = ggml_reshape_4d(g.c(), decay, 1, c.gdn_value_heads, 1, 1);
         beta = ggml_reshape_4d(g.c(), beta, 1, c.gdn_value_heads, 1, 1);
         auto * packed = ggml_gated_delta_net(g.c(), q, k, v, decay, beta, s.recurrent, 1);
+        ggml_set_name(packed, (p + "gdn.recurrence").c_str());
         auto * output = ggml_reshape_2d(g.c(), ggml_view_1d(g.c(), packed, vd, 0), c.gdn_dim, c.gdn_value_heads);
         auto * z = ggml_reshape_2d(g.c(), mm(g, p + "gdn.z", mixed.value), c.gdn_dim, c.gdn_value_heads);
         output = ggml_mul(g.c(), norm(g, output, p + "gdn.norm"), ggml_silu(g.c(), z));
@@ -246,9 +308,10 @@ struct Engine::Impl {
         g.run();
     }
     Selection sparse_layer(int layer) {
+        ProfileScope scope(&profiler, "layer", "qsa", "qsa", position, layer, ggml_backend_name(backend.get()));
         auto & s = states[layer];
         const std::string p = "blk." + std::to_string(layer) + ".";
-        auto g = graph();
+        auto g = graph("qsa.prepare", layer);
         auto mixed = mix(g, hidden, p + "hc_attn");
         auto * qg = mm(g, p + "attn.qg", mixed.value);
         auto * q = ggml_cont(g.c(), ggml_view_2d(g.c(), qg, c.head_dim, c.q_heads,
@@ -290,23 +353,32 @@ struct Engine::Impl {
             auto * scores = ggml_mul_mat(g.c(), ggml_cast(g.c(), cache, GGML_TYPE_F32),
                                         ggml_reshape_2d(g.c(), iq, c.index_dim, c.index_heads));
             ggml_prec_set_acc(scores, GGML_PREC_F32);
+            ggml_set_name(scores, (p + "index.scores").c_str());
             scores = ggml_relu(g.c(), scores);
             scores = ggml_sum_rows(g.c(), ggml_cont(g.c(), ggml_transpose(g.c(), scores)));
             scores = ggml_scale(g.c(), ggml_reshape_1d(g.c(), scores, complete), 1.0f / std::sqrt(float(c.index_dim)));
             top = ggml_cont(g.c(), ggml_top_k(g.c(), scores, std::min(c.top_blocks, complete)));
+            ggml_set_name(top, (p + "index.top_k").c_str());
             g.add(top);
         }
         g.run();
         auto blocks = top ? g.get<int32_t>(top) : std::vector<int32_t>{};
+        ProfileScope expand(&profiler, "cpu", "expand_blocks", "qsa.attention", position, layer, "CPU");
         auto selected = expand_blocks(blocks, visible, c.block_size);
+        expand.finish();
         auto queries = g.get<float>(q), keys = g.get<float>(k), values = g.get<float>(v);
         auto start = Clock::now();
+        ProfileScope append(&profiler, "cpu", "kv_append_bf16", "qsa.attention", position, layer, "CPU");
+        append.event.bytes = (keys.size() + values.size()) * sizeof(ggml_bf16_t);
         s.attention->append(keys, values);
-        auto output = s.attention->attend(queries, selected);
+        append.finish();
+        ProfileScope attention_scope(&profiler, "cpu", "sparse_attention", "qsa.attention", position, layer, "CPU");
+        auto output = s.attention->attend(queries, selected, &profiler, position, layer);
+        attention_scope.finish();
         stats.attention_ms += elapsed(start);
         ++stats.sparse_attention_calls;
 
-        auto post = graph();
+        auto post = graph("qsa.finish", layer);
         auto * attention = ggml_mul(post.c(), post.floats(output), ggml_sigmoid(post.c(), s.gate));
         auto * h = combine(post, hidden, mm(post, p + "attn.out", attention), s.inject);
         post.add(ggml_cpy(post.c(), ffn(post, h, p), hidden));
@@ -318,7 +390,8 @@ struct Engine::Impl {
         if (token < 0 || token >= c.vocab) throw std::out_of_range("Token ID outside vocabulary");
         if (position >= c.context) throw std::out_of_range("Context capacity exceeded; reset before decoding a new sequence");
         try {
-            auto emb = graph();
+            ProfileScope token_scope(&profiler, "token", "decode", "decode", position, -1, "CPU");
+            auto emb = graph("embedding");
             auto * token_embedding = ggml_get_rows(emb.c(), weight("token_embd.weight"), emb.integer(token));
             emb.add(ggml_cpy(emb.c(), ggml_repeat(emb.c(), token_embedding, hidden), hidden));
             emb.run();
@@ -327,7 +400,7 @@ struct Engine::Impl {
                 if ((layer + 1) % 4) linear_layer(layer);
                 else step.selections.push_back(sparse_layer(layer));
             }
-            auto head = graph();
+            auto head = graph("head");
             auto mixed = mix(head, hidden, "head", false);
             auto * logits = mm(head, "output.weight", mixed.value);
             head.add(logits);
@@ -346,6 +419,7 @@ struct Engine::Impl {
         position = 0;
         failed = false;
         stats = {};
+        profiler.clear();
     }
 };
 
@@ -364,4 +438,10 @@ void Engine::reset() { impl_->reset(); }
 const Config & Engine::config() const { return impl_->c; }
 const Statistics & Engine::statistics() const { return impl_->stats; }
 std::string Engine::backend_name() const { return ggml_backend_name(impl_->backend.get()); }
+std::string Engine::backend_description() const {
+    return ggml_backend_dev_description(ggml_backend_get_device(impl_->backend.get()));
+}
+void Engine::set_profile(ProfileMode mode) { impl_->profiler.mode = mode; impl_->profiler.clear(); }
+const std::vector<ProfileEvent> & Engine::profile_events() const { return impl_->profiler.events; }
+uint64_t Engine::profile_dropped_events() const { return impl_->profiler.dropped; }
 } // namespace tidal

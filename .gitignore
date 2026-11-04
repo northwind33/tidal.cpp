@@ -4,3 +4,11 @@
 __pycache__/
 *.pyc
 /CMakeUserPresets.json
+
+# Local benchmark/profiler artifacts may contain identifying machine metadata.
+/benchmarks/
+*.bench.json
+*.trace.json
+*.nsys-rep
+*.ncu-rep
+*.qdrep

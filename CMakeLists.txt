@@ -16,12 +16,14 @@ set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
 if(TIDAL_GGML_SOURCE_DIR)
     add_subdirectory("${TIDAL_GGML_SOURCE_DIR}" ggml)
+    set(TIDAL_GGML_BUILD_SOURCE "${TIDAL_GGML_SOURCE_DIR}")
 else()
     include(FetchContent)
     FetchContent_Declare(ggml
         GIT_REPOSITORY https://github.com/ggml-org/ggml.git
         GIT_TAG facdc44a67da17df4433adcc468b424f48e9ded2)
     FetchContent_MakeAvailable(ggml)
+    set(TIDAL_GGML_BUILD_SOURCE "${ggml_SOURCE_DIR}")
 endif()
 
 add_library(tidal src/model.cpp src/engine.cpp src/sparse_attention.cpp)
@@ -30,6 +32,13 @@ target_link_libraries(tidal PUBLIC ggml ggml-cpu)
 if(TIDAL_CUDA)
     target_link_libraries(tidal PRIVATE ggml-cuda)
     target_compile_definitions(tidal PRIVATE TIDAL_CUDA=1)
+    find_package(CUDAToolkit REQUIRED)
+    find_path(TIDAL_NVTX_INCLUDE nvtx3/nvToolsExt.h HINTS ${CUDAToolkit_INCLUDE_DIRS})
+    if(TIDAL_NVTX_INCLUDE)
+        target_include_directories(tidal PRIVATE ${TIDAL_NVTX_INCLUDE})
+        target_link_libraries(tidal PRIVATE ${CMAKE_DL_LIBS})
+        target_compile_definitions(tidal PRIVATE TIDAL_NVTX=1)
+    endif()
 endif()
 if(MSVC)
     target_compile_options(tidal PRIVATE /W4)
@@ -47,6 +56,24 @@ add_executable(tidal-dummy tools/dummy.cpp)
 target_link_libraries(tidal-dummy PRIVATE tidal)
 target_include_directories(tidal-dummy PRIVATE src)
 
+add_executable(tidal-bench tools/bench.cpp)
+target_link_libraries(tidal-bench PRIVATE tidal)
+add_custom_target(tidal-build-info
+    COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+        -DGGML_DIR=${TIDAL_GGML_BUILD_SOURCE}
+        -DOUTPUT=${CMAKE_BINARY_DIR}/tidal-build-info.hpp -P ${CMAKE_SOURCE_DIR}/cmake/build_info.cmake
+    BYPRODUCTS ${CMAKE_BINARY_DIR}/tidal-build-info.hpp
+    VERBATIM)
+add_dependencies(tidal-bench tidal-build-info)
+target_include_directories(tidal-bench PRIVATE ${CMAKE_BINARY_DIR})
+if(TIDAL_CUDA)
+    target_link_libraries(tidal-bench PRIVATE CUDA::cudart)
+    target_compile_definitions(tidal-bench PRIVATE TIDAL_BENCH_CUDA=1)
+endif()
+target_compile_definitions(tidal-bench PRIVATE
+    TIDAL_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
+    TIDAL_BUILD_TYPE="${CMAKE_BUILD_TYPE}")
+
 include(CTest)
 if(BUILD_TESTING)
     add_executable(tidal-matvec-test tests/matvec.cpp)
@@ -62,6 +89,10 @@ if(BUILD_TESTING)
     add_test(NAME core COMMAND tidal-tests)
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_FOUND)
+        add_test(NAME benchmark COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_benchmark.py
+            --bin-dir $<TARGET_FILE_DIR:tidal-bench>)
+        set_tests_properties(benchmark PROPERTIES TIMEOUT 180)
         execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy"
             RESULT_VARIABLE TIDAL_NUMPY_STATUS OUTPUT_QUIET ERROR_QUIET)
         if(TIDAL_NUMPY_STATUS EQUAL 0)

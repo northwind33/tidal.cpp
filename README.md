@@ -80,6 +80,24 @@ and bytes. JSON contains every step's logits and selected token IDs. `--repeat 2
 resets and replays the same sequence to check deterministic state reset. Timing is
 diagnostic; graph allocation and thread creation are intentionally unoptimized.
 
+## Benchmark and profile
+
+`tidal-bench` reports prefill/decode/total tokens per second with warmup and repeated
+measurements. Detailed profiling runs separately so it does not contaminate those
+throughput samples:
+
+```sh
+build/dev-cuda/bin/tidal-bench --model models/tiny-q4.gguf --backend cuda \
+  --prompt 24 --steps 32 --warmup 2 --repetitions 10 \
+  --profile nodes --json build/dev-cuda/bench.json --trace build/dev-cuda/trace.json
+```
+
+Profiles include per-layer/ggml-node synchronized wall times, tensor shapes/types,
+transfers, graph allocation, and CPU QK/softmax/V stages. NVTX ranges connect to
+Nsight; `tools/compare_bench.py` compares saved reports and can flag regressions.
+See [benchmarking and profiling](docs/benchmark.md) for measurement semantics,
+baseline comparisons, and the distinction between wall timings and CUDA kernel metrics.
+
 ## Verify
 
 ```sh

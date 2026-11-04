@@ -33,4 +33,5 @@ public:
     int integer(const std::string & name, int fallback) const {
         return number(get(name, std::to_string(fallback)));
     }
+    bool contains(const std::string & name) const { return values_.contains(name); }
 };

@@ -37,12 +37,14 @@ struct Model {
     ggml_tensor * at(const std::string & name) const { return weights.at(name); }
 };
 
+class Profiler;
 class SparseAttention {
 public:
     SparseAttention(int heads, int kv_heads, int dim, int capacity, int threads);
     void append(const std::vector<float> & key, const std::vector<float> & value);
     std::vector<float> attend(const std::vector<float> & query,
-                              const std::vector<int32_t> & selected) const;
+                              const std::vector<int32_t> & selected, Profiler * profiler = nullptr,
+                              int position = -1, int layer = -1) const;
     void reset() { size_ = 0; }
     int size() const { return size_; }
 private:

@@ -33,10 +33,25 @@ struct Config {
     void validate() const;
 };
 
+enum class ProfileMode { Off, Phases, Nodes };
+
+struct ProfileEvent {
+    std::string category, name, phase, backend, op, dtype;
+    std::vector<int64_t> shape;
+    std::vector<std::string> input_types;
+    std::vector<std::vector<int64_t>> input_shapes;
+    int position = -1, layer = -1, head = -1, node = -1;
+    uint64_t bytes = 0;
+    double start_us = 0, wall_us = 0;
+};
+
 struct Options {
     std::string backend = "cuda";
     int device = 0;
     int threads = 4;
+    ProfileMode profile = ProfileMode::Off;
+    bool nvtx = false;
+    uint64_t profile_event_limit = 500000;
 };
 
 struct Selection {
@@ -73,6 +88,12 @@ public:
     const Config & config() const;
     const Statistics & statistics() const;
     std::string backend_name() const;
+    std::string backend_description() const;
+    // Changes instrumentation and clears events without resetting the sequence.
+    // reset() also clears events. Read profile data only between decode calls.
+    void set_profile(ProfileMode mode);
+    const std::vector<ProfileEvent> & profile_events() const;
+    uint64_t profile_dropped_events() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
