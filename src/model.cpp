@@ -34,12 +34,13 @@ void Config::validate() const {
         if (this->*(f.value) <= 0)
             throw std::invalid_argument(std::string(f.name) + " must be positive");
     }
-    // Bound allocations and products before constructing ggml tensors. This is a tiny-model schema.
-    if (hidden > 1024 || ffn > 4096 || vocab > 65536 || layers > 32 || context > 1048576 ||
-        branches > 8 || rank > 256 || q_heads > 32 || kv_heads > 32 || head_dim > 256 ||
-        gdn_key_heads > 32 || gdn_value_heads > 32 || index_heads > 16 || index_dim > 256 ||
-        conv_kernel > 16 || block_size > 32 || top_blocks > 4096)
-        throw std::invalid_argument("Configuration exceeds the tiny-engine limits");
+    // Bound dimension products before constructing tensors. Weight sizes use
+    // int64_t; actual allocation is determined by the file and backend memory.
+    if (hidden > 16384 || ffn > 131072 || vocab > 262144 || layers > 128 || context > 1048576 ||
+        branches > 8 || rank > 2048 || q_heads > 128 || kv_heads > 128 || head_dim > 256 ||
+        gdn_key_heads > 128 || gdn_value_heads > 128 || index_heads > 64 || index_dim > 256 ||
+        conv_kernel > 16 || block_size > 128 || top_blocks > 4096)
+        throw std::invalid_argument("Configuration exceeds supported dimension limits");
     if (layers % 4 || branches < 2 || conv_kernel < 2 || block_size < 2 || q_heads % kv_heads || gdn_value_heads % gdn_key_heads ||
         rope_dim % 2 || rope_dim > head_dim || rope_dim > index_dim ||
         (gdn_dim != 32 && gdn_dim != 64 && gdn_dim != 128) ||
@@ -234,6 +235,8 @@ Model::Model(const std::string & path, ggml_backend_t backend) {
                       << " -> " << ggml_type_name(type) << " on " << ggml_backend_name(backend) << '\n';
         }
     }
+    std::cerr << "model weight bytes: stored=" << info.stored_weight_bytes << " resident="
+              << info.resident_weight_bytes << " converted_tensors=" << info.converted_tensors << '\n';
     buffer.reset(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
     if (!buffer) throw std::runtime_error("Cannot allocate model weights");
     info.weight_buffer_bytes = ggml_backend_buffer_get_size(buffer.get());

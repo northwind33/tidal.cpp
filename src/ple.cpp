@@ -80,7 +80,7 @@ void read_ple(const gguf_context * f, Config & c) {
         return id;
     };
     if (gguf_find_key(f, "tidal.ple.layers") >= 0) {
-        const auto id = array_id("tidal.ple.layers", GGUF_TYPE_UINT32, 32);
+        const auto id = array_id("tidal.ple.layers", GGUF_TYPE_UINT32, 128);
         const auto count = gguf_get_arr_n(f, id);
         if (!count) throw std::runtime_error("Empty PLE layer list: omit the PLE metadata group instead");
         p.ngram_size = scalar("tidal.ple.ngram_size");

@@ -52,6 +52,10 @@ Every token additionally requires normalized vocabulary RMS error below 2.5%.
 F32 reductions can cross BF16 cache rounding boundaries even with F32 matrix
 weights. The eight-layer, hidden-256, seed-123 fixture exercises two independent
 QSA caches and reset/replay, using atol/rtol 3e-4.
+A separate F32 fixture retains the 27B preset's 40 heads and width-128 GDN/QSA,
+with a smaller residual/FFN and four layers, for independent NumPy validation of
+the wider state layout. The full 27B opt-in test is described in
+[the large-model guide](large-model.md).
 
 ## PLE coverage and limits
 

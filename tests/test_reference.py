@@ -152,6 +152,21 @@ def check_multi(root, bins, backend):
     print("8 layers / hidden 256: two independent QSA caches + reset passed", flush=True)
 
 
+def check_wide_heads(root, bins, backend):
+    # Retain the 27B preset's 40 heads / width-128 GDN and QSA, while shrinking
+    # the residual/FFN/layer count enough for an independent F32 NumPy oracle.
+    model, trace = root / "wide-heads.gguf", root / "wide-heads.json"
+    run(bins / "tidal-dummy", "--preset", "dense-27b", "--hidden", 256, "--ffn", 512,
+        "--layers", 4, "--vocab", 256, "--context", 32, "--output", model)
+    run(bins / "tidal-cli", "--model", model, "--backend", backend,
+        "--tokens", ",".join(map(str, PROMPT)), "--steps", 0, "--json", trace, "--repeat", 2)
+    result, ref = json.loads(trace.read_text()), Reference(model, backend)
+    assert ref.c["residual_init_scale"] == .25
+    check_trace(result, ref, TOLERANCES[backend]["f32"], "width-128 / 40-head state")
+    check_placement(result, ref.c, backend, len(PROMPT))
+    print("width-128 / 40-head state: independent logits, QSA and reset passed", flush=True)
+
+
 def check_ple(root, bins, backend, kind, variant="default"):
     model, trace = root / f"ple-{kind}-{variant}.gguf", root / f"ple-{kind}-{variant}.json"
     extra = ["--ple-layers", "0,2", "--ple-type", kind]
@@ -281,6 +296,7 @@ def main():
         cases += [(f"ple-quantized-{kind}", lambda kind=kind: check_ple(root, args.bin_dir, args.backend, kind, "quantized"))
                   for kind in dict.fromkeys(args.formats) if kind in ("q4_0", "q8_0")]
         cases += [("multi", lambda: check_multi(root, args.bin_dir, args.backend)),
+                  ("wide-heads", lambda: check_wide_heads(root, args.bin_dir, args.backend)),
                   ("ple-rejections", lambda: check_ple_rejections(root, args.bin_dir, args.backend)),
                   ("rejections", lambda: check_rejections(root, args.bin_dir, args.backend))]
         for name, check in cases:

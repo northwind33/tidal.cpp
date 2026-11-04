@@ -1,6 +1,6 @@
 # tidal.cpp
 
-A C++20 / ggml inference prototype for a **tiny, random-weight Dense derivative
+A C++20 / ggml inference prototype for **random-weight Dense/MoE derivatives
 of Qwen3.8-Flash-Next (`qwen4exp`)**. It implements stateful autoregressive decoding
 with GPU Gated DeltaNet and QSA indexing, and CPU sparse attention over a BF16 KV cache.
 
@@ -82,6 +82,9 @@ The default is 1,063,672 parameters: hidden 128, FFN 256, four residual streams,
 three GDN layers and one QSA layer, vocabulary/context 256. QSA uses four-token
 blocks and a two-block budget, so even a short test exercises actual sparsity.
 `--hidden 256 --layers 8 --context 4096` creates a larger test fixture.
+`--preset dense-27b` constructs a 27.108B Dense model without PLE. A mixed 6.128-bpw
+recipe and an opt-in 24-GiB CUDA/CPU integration test are described in
+[the large-model guide](docs/large-model.md).
 
 To include PLE in the GGUF (layer IDs are **zero-based**, GDN layers only):
 

@@ -80,7 +80,7 @@ int main(int argc, char ** argv) {
         Args args(argc, argv, {"--help", "--output", "--type", "--seed", "--context", "--layers", "--hidden",
             "--ple-layers", "--ple-ngram", "--ple-heads", "--ple-dim", "--ple-conv", "--ple-eos",
             "--ple-vocab-base", "--ple-type", "--experts", "--experts-used", "--expert-ffn", "--shared-ffn", "--norm-topk",
-            "--list-types", "--tensor-types", "--dry-run", "--threads", "--chunk-mib", "--preset", "--rank"});
+            "--list-types", "--tensor-types", "--dry-run", "--threads", "--chunk-mib", "--preset", "--rank", "--ffn", "--vocab"});
         if (!args.get("--help").empty()) {
             std::cout << "tidal-dummy --output model.gguf [--type FORMAT] "
                          "[--seed 42] [--context 256] [--layers 4] [--hidden 128]\n"
@@ -88,7 +88,7 @@ int main(int argc, char ** argv) {
                          "  [--ple-ngram 3] [--ple-heads 2] [--ple-dim 128] [--ple-conv 4]\n"
                          "  [--ple-eos 0] [--ple-vocab-base 17] [--ple-type bf16]\n";
             std::cout << "  Optional MoE: --experts 4 [--experts-used 2] [--expert-ffn 128] [--shared-ffn 128] [--norm-topk 1]\n";
-            std::cout << "  --list-types 1 | --preset quant-test | --tensor-types rules.txt (glob=type, last match wins)\n"
+            std::cout << "  --list-types 1 | --preset tiny|quant-test|dense-27b | --tensor-types rules.txt (glob=type, last match wins)\n"
                          "  --dry-run 1 plans without writing; --chunk-mib 16 --threads 4 bound generation memory\n";
             return 0;
         }
@@ -114,13 +114,21 @@ int main(int argc, char ** argv) {
         tidal::Config config;
         const auto preset = args.get("--preset", "tiny");
         if (preset == "quant-test") { config.hidden = 256; config.rank = 256; config.gdn_dim = 64; config.head_dim = 64; }
+        else if (preset == "dense-27b") {
+            config.hidden = 5120; config.ffn = 18944; config.vocab = 131072;
+            config.layers = 64; config.context = 2048; config.rank = 256;
+            config.q_heads = 40; config.kv_heads = 8; config.head_dim = 128; config.rope_dim = 64;
+            config.gdn_key_heads = 8; config.gdn_value_heads = 40; config.gdn_dim = 128;
+            config.index_dim = 128; config.block_size = 16; config.top_blocks = 8;
+        }
         else if (preset != "tiny") throw std::invalid_argument("Unknown model preset: " + preset);
         config.context = args.integer("--context", config.context);
         config.layers = args.integer("--layers", config.layers);
         config.hidden = args.integer("--hidden", config.hidden);
         config.rank = args.integer("--rank", config.rank);
-        if (config.hidden <= 0 || config.hidden > 1024) throw std::invalid_argument("hidden must be in [32, 1024]");
-        config.ffn = 2 * config.hidden;
+        if (config.hidden <= 0 || config.hidden > 16384) throw std::invalid_argument("hidden must be in [32, 16384]");
+        config.ffn = args.integer("--ffn", preset == "dense-27b" ? config.ffn : 2 * config.hidden);
+        config.vocab = args.integer("--vocab", config.vocab);
         config.experts = args.integer("--experts", 0);
         config.experts_used = args.integer("--experts-used", config.experts ? 2 : 0);
         config.expert_ffn = args.integer("--expert-ffn", config.experts ? config.hidden : 0);
@@ -131,20 +139,29 @@ int main(int argc, char ** argv) {
         config.validate();
         configure_ple(config, args, seed);
         const auto ple_type = tidal::parse_storage_type(args.get("--ple-type", "bf16"));
-        tidal::Context ctx(ggml_init({1024 * 1024, nullptr, true}), ggml_free);
+        const size_t context_bytes = tidal::tensor_specs(config).size() * ggml_tensor_overhead() + 4096;
+        tidal::Context ctx(ggml_init({context_bytes, nullptr, true}), ggml_free);
         tidal::Gguf file(gguf_init_empty(), gguf_free);
         if (!ctx || !file) throw std::runtime_error("Cannot allocate GGUF writer");
         tidal::write_config(file.get(), config);
         gguf_set_val_u32(file.get(), "tidal.seed", uint32_t(seed));
         gguf_set_val_str(file.get(), "tidal.weight_type", name.c_str());
-        gguf_set_val_str(file.get(), "general.description", config.experts ? "Random synthetic Qwen-derived MoE; not trained, no tokenizer/MTP" : config.ple.layers.empty()
+        // Deep random residual networks amplify tiny backend rounding changes.
+        // Scale residual output projections at initialization, without changing
+        // the model equations or the legacy tiny fixtures.
+        const float residual_scale = preset == "dense-27b" ? 1.0f / float(config.layers) : 1.0f;
+        if (preset == "dense-27b") gguf_set_val_f32(file.get(), "tidal.residual_init_scale", residual_scale);
+        gguf_set_val_str(file.get(), "general.description", config.experts ? "Random synthetic Qwen-derived MoE; not trained, no tokenizer/MTP" :
+            preset == "dense-27b" ? "Random synthetic large Qwen-derived Dense; not trained, no tokenizer/MTP" : config.ple.layers.empty()
             ? "Random tiny Dense derivative; not trained, no tokenizer, no MoE/PLE/MTP"
             : "Random tiny Dense derivative with PLE; not trained, no tokenizer, no MoE/MTP");
         auto rules = read_type_rules(args.get("--tensor-types"));
         const auto plan = plan_weights(config, ctx.get(), file.get(), type, ple_type, rules);
         if (dry) return 0;
         write_weights(path, file.get(), plan, chunk_mib, threads, [&](const tidal::TensorSpec & spec, float * data, int64_t count) {
-            const float scale = std::sqrt(3.0f / float(spec.columns));
+            float scale = std::sqrt(3.0f / float(spec.columns));
+            if (spec.name.ends_with(".ffn.down") || spec.name.ends_with(".gdn.out") || spec.name.ends_with(".attn.out"))
+                scale *= residual_scale;
             for (int64_t i = 0; i < count; ++i) {
                 float & value = data[i];
                 float r = 2 * rng.uniform() - 1;

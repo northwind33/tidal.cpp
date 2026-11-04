@@ -98,6 +98,8 @@ if(BUILD_TESTING)
     add_test(NAME core COMMAND tidal-tests)
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_FOUND)
+        add_test(NAME model-plan COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_plan.py --bin-dir $<TARGET_FILE_DIR:tidal-dummy>)
         add_test(NAME benchmark COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_benchmark.py
             --bin-dir $<TARGET_FILE_DIR:tidal-bench>)

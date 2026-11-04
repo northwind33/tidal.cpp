@@ -1,4 +1,4 @@
-# Tiny hybrid decoder
+# Hybrid decoder
 
 ## Reference and deliberate reductions
 
@@ -137,11 +137,17 @@ can therefore differ; see [the validation contract](validation.md).
 
 ## GGUF contract and API
 
-The architecture tag is `tidal-qwen4exp-dense`, schema `tidal.version = 1`.
+Architecture tags are `tidal-qwen4exp-dense` and `tidal-qwen4exp-moe`, with schema `tidal.version = 1`.
 All configuration keys use `tidal.*`. Tensor names and shapes are centralized in
 `src/model.cpp`; ggml dimensions are `[input, output]`, reversed relative to the
 usual row-major matrix shape. Unknown architectures, metadata versions, missing
 tensors, shape/type mismatches and truncated payloads are rejected.
+
+Dimension validation supports the synthetic 27B preset as well as tiny fixtures;
+tensor element/byte products use 64-bit sizes. Loader payload bounds are checked
+before backend allocation, and file data is streamed in bounded row chunks.
+The [large-model guide](large-model.md) specifies the hypothetical Dense layout,
+mixed-format recipe and opt-in runtime checks.
 
 PLE is an optional extension of version 1: old files omit the entire `tidal.ple.*`
 group. A present group requires these keys; partial/unknown PLE keys are rejected:
