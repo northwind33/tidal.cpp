@@ -36,7 +36,8 @@ def main():
     b = args.bin_dir
     with tempfile.TemporaryDirectory(prefix="tidal-moe-") as tmp:
         root = Path(tmp)
-        cases = [("top2", "f32", []), ("top1", "f32", ["--experts-used", 1]),
+        cases = [("single", "f32", ["--experts-used", 1]),
+                 ("top2", "f32", []), ("top1", "f32", ["--experts-used", 1]),
                  ("all", "f32", ["--experts-used", 4]),
                  ("unnormalized", "f32", ["--norm-topk", 0]),
                  ("no-shared", "f32", ["--shared-ffn", 0]),
@@ -45,7 +46,8 @@ def main():
                  ("q4", "q4_0", []), ("q8", "q8_0", [])]
         for label, kind, extra in cases:
             model, trace = root / f"{label}.gguf", root / f"{label}.json"
-            run(b / "tidal-dummy", "--output", model, "--experts", 4, "--context", 32, "--type", kind, *extra)
+            run(b / "tidal-dummy", "--output", model, "--experts", 1 if label == "single" else 4,
+                "--context", 32, "--type", kind, *extra)
             run(b / "tidal-cli", "--model", model, "--backend", args.backend,
                 "--tokens", ",".join(map(str, PROMPT)), "--steps", 6, "--repeat", 2, "--json", trace)
             result, ref = json.loads(trace.read_text()), Reference(model, args.backend)

@@ -45,12 +45,13 @@ int main(int argc, char ** argv) {
                        std::memcmp(decoded.data(), resident.data(), resident.size()))
                 throw std::runtime_error("Load-time conversion differs: " + spec.name);
             const bool lookup = spec.kind == tidal::TensorSpec::Embedding || spec.kind == tidal::TensorSpec::Lookup;
-            const bool matrix = spec.kind == tidal::TensorSpec::Matrix || spec.kind == tidal::TensorSpec::Router;
+            const bool matrix = spec.kind == tidal::TensorSpec::Matrix || spec.kind == tidal::TensorSpec::Router ||
+                                spec.kind == tidal::TensorSpec::Expert;
             if (!lookup && !matrix) continue;
             const int32_t expert = int32_t(spec.slices - 1), row = int32_t(spec.rows - 1);
             tidal::Context ctx(ggml_init({1024 * 1024, nullptr, true}), ggml_free);
             auto * x = ggml_new_tensor_1d(ctx.get(), lookup ? GGML_TYPE_I32 : GGML_TYPE_F32, lookup ? 1 : spec.columns);
-            auto * ids = spec.slices > 1 ? ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, 1) : nullptr;
+            auto * ids = spec.kind == tidal::TensorSpec::Expert ? ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, 1) : nullptr;
             auto * y = lookup ? ggml_get_rows(ctx.get(), weight, x) : ids ? ggml_mul_mat_id(ctx.get(), weight, x, ids)
                                                                                        : ggml_mul_mat(ctx.get(), weight, x);
             if (matrix && !ids) ggml_prec_set_acc(y, GGML_PREC_F32);

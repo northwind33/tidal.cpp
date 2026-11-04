@@ -82,7 +82,7 @@ std::vector<TensorSpec> tensor_specs(const Config & c) {
             add(p + "ffn.router", c.hidden, c.experts, TensorSpec::Router);
             for (auto name : {"gate_exps", "up_exps", "down_exps"}) {
                 const bool down = std::string(name) == "down_exps";
-                add(p + "ffn." + name, down ? c.expert_ffn : c.hidden, down ? c.hidden : c.expert_ffn);
+                add(p + "ffn." + name, down ? c.expert_ffn : c.hidden, down ? c.hidden : c.expert_ffn, TensorSpec::Expert);
                 specs.back().slices = c.experts;
             }
             if (c.shared_ffn) {
@@ -207,17 +207,18 @@ Model::Model(const std::string & path, ggml_backend_t backend) {
             throw std::runtime_error("Truncated GGUF tensor: " + spec.name);
         auto type = t->type;
         const bool lookup = spec.kind == TensorSpec::Lookup || spec.kind == TensorSpec::Embedding;
-        const bool matrix = spec.kind == TensorSpec::Matrix || spec.kind == TensorSpec::Router;
+        const bool expert = spec.kind == TensorSpec::Expert;
+        const bool matrix = expert || spec.kind == TensorSpec::Matrix || spec.kind == TensorSpec::Router;
         if (!matrix && !lookup) type = GGML_TYPE_F32;
         else {
             Context probe(ggml_init({65536, nullptr, true}), ggml_free);
             if (!probe) throw std::runtime_error("Cannot allocate backend probe");
             auto * x = ggml_new_tensor_1d(probe.get(), lookup ? GGML_TYPE_I32 : GGML_TYPE_F32,
                                            lookup ? 1 : spec.columns);
-            auto * op = lookup ? ggml_get_rows(probe.get(), t, x) : spec.slices > 1
+            auto * op = lookup ? ggml_get_rows(probe.get(), t, x) : expert
                 ? ggml_mul_mat_id(probe.get(), t, x, ggml_new_tensor_2d(probe.get(), GGML_TYPE_I32, 1, 1))
                 : ggml_mul_mat(probe.get(), t, x);
-            if (matrix && spec.slices == 1) ggml_prec_set_acc(op, GGML_PREC_F32);
+            if (matrix && !expert) ggml_prec_set_acc(op, GGML_PREC_F32);
             const bool cpu_dot = !matrix || !ggml_backend_is_cpu(backend) || ggml_get_type_traits_cpu(type)->vec_dot;
             if (!cpu_dot || !ggml_backend_supports_op(backend, op)) type = GGML_TYPE_F32;
         }

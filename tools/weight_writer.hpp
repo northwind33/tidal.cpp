@@ -48,7 +48,7 @@ inline std::vector<PlannedWeight> plan_weights(const tidal::Config & c, ggml_con
     std::map<std::string, uint64_t> by_type;
     uint64_t parameters = 0, bytes = 0;
     for (const auto & spec : tidal::tensor_specs(c)) {
-        auto type = spec.kind == tidal::TensorSpec::Matrix ? matrices :
+        auto type = (spec.kind == tidal::TensorSpec::Matrix || spec.kind == tidal::TensorSpec::Expert) ? matrices :
             spec.kind == tidal::TensorSpec::Embedding ? GGML_TYPE_BF16 :
             spec.kind == tidal::TensorSpec::Lookup ? ple_type : GGML_TYPE_F32;
         for (auto & rule : rules) if (glob_match(rule.pattern, spec.name)) { ++rule.matches; type = rule.type; }

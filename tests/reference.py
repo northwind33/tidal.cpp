@@ -105,6 +105,13 @@ class Reference:
         self.backend = backend
         self.quantized = {}
         self.c, self.w, self.types, _ = read_gguf(path, self.quantized)
+        # GGUF omits trailing dimensions of length one. Preserve the logical
+        # expert axis even for the degenerate one-expert configuration.
+        for name, weight in self.w.items():
+            if name.endswith("_exps") and weight.ndim == 2:
+                self.w[name] = weight[None, ...]
+            elif name.endswith(".ffn.router") and weight.ndim == 1:
+                self.w[name] = weight[None, ...]
         c = self.c
         self.position = 0
         self.tokens = []

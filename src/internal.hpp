@@ -23,7 +23,7 @@ struct TensorSpec {
     std::string name;
     int64_t columns;
     int64_t rows;
-    enum Kind { Matrix, Norm, Conv, ALog, Bias, Embedding, Lookup, Router } kind;
+    enum Kind { Matrix, Norm, Conv, ALog, Bias, Embedding, Lookup, Router, Expert } kind;
     int64_t slices = 1;
 };
 std::vector<TensorSpec> tensor_specs(const Config & c);

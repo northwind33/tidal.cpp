@@ -50,6 +50,10 @@ def main():
             path = root / f"moe-{group}.gguf"
             run(*common, "--output", path, "--experts", 4, "--tensor-types", rule)
             models.append(path)
+            # Expert count one still uses MUL_MAT_ID, not a Dense matvec.
+            single = root / f"moe-single-{group}.gguf"
+            run(*common, "--output", single, "--experts", 1, "--experts-used", 1, "--tensor-types", rule)
+            models.append(single)
         for path in models:
             run(b / "tidal-weights-test", path, args.backend)
             trace = root / "trace.json"
