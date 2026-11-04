@@ -6,13 +6,16 @@ with GPU Gated DeltaNet and QSA indexing, and CPU sparse attention over a BF16 K
 
 This is an initial correctness milestone, not a trained language model or a loader
 for the released MoE checkpoint. Token IDs are synthetic; generated IDs have no
-linguistic meaning. PLE, MoE routing, vision, MTP and batched prefill are outside this
+linguistic meaning. Optional PLE follows the original n-gram embedding, gating and
+dilated convolution equations. MoE routing, vision, MTP and batched prefill are outside this
 version. Prompt ingestion uses the same one-token state transitions as decoding.
 
 | Work / storage | `--backend cuda` | `--backend cpu` |
 |---|---|---|
 | Quantized or unquantized matrix weights | GPU | CPU |
 | GDN convolution, gates, recurrent state and output | GPU | CPU |
+| PLE embedding table, lookup, projections, gates, dilated convolution and state | GPU | CPU |
+| PLE n-gram hashing and recent token IDs | CPU | CPU |
 | Gated Residual, Q/K/V projections, RoPE, Dense FFN, output head | GPU | CPU |
 | QSA raw-key pooling, compressed BF16 index cache, scores and top-k | GPU | CPU |
 | Main BF16 KV cache, selected QK, stable softmax, weighted V | **CPU** | CPU |
@@ -74,6 +77,21 @@ The default is 1,063,672 parameters: hidden 128, FFN 256, four residual streams,
 three GDN layers and one QSA layer, vocabulary/context 256. QSA uses four-token
 blocks and a two-block budget, so even a short test exercises actual sparsity.
 `--hidden 256 --layers 8 --context 4096` creates a larger test fixture.
+
+To include PLE in the GGUF (layer IDs are **zero-based**, GDN layers only):
+
+```sh
+build/dev-cuda/bin/tidal-dummy --output models/tiny-ple.gguf --type q4_0 --ple-layers 0,2
+build/dev-cuda/bin/tidal-cli --model models/tiny-ple.gguf --backend cuda \
+  --tokens 0,1,7,23,0,9,42,5,6,2,77,13 --steps 8 --repeat 2
+```
+
+PLE tables default to BF16; `--ple-type` selects any supported matrix format.
+`--ple-ngram`, `--ple-heads`, `--ple-dim`, `--ple-conv`, `--ple-eos` and
+`--ple-vocab-base` control synthetic PLE dimensions. Small prime vocabulary ranges
+keep fixtures manageable. Older PLE-free GGUFs retain their behavior. This extends
+the `tidal-qwen4exp-dense` contract; released `qwen4exp` MoE GGUFs still require a
+checkpoint loader/converter and the remaining architecture components.
 
 The CLI reports the backend, CPU attention calls, synchronized graph/transfer times
 and bytes. JSON contains every step's logits and selected token IDs. `--repeat 2`

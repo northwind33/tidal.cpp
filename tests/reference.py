@@ -42,7 +42,11 @@ def read_gguf(path, quantized=None):
     for _ in range(n_metadata):
         key, kind = string(), take("I")
         metadata_offsets[key] = position
-        metadata[key] = string() if kind == 8 else take({4: "I", 5: "i", 6: "f", 7: "?"}[kind])
+        if kind == 9:
+            element_kind, count = take("I"), take("Q")
+            metadata[key] = [take({4: "I", 10: "Q"}[element_kind]) for _ in range(count)]
+        else:
+            metadata[key] = string() if kind == 8 else take({4: "I", 5: "i", 6: "f", 7: "?", 10: "Q"}[kind])
     tensors = []
     for _ in range(n_tensors):
         name, dimensions = string(), take("I")
@@ -103,6 +107,7 @@ class Reference:
         self.c, self.w, self.types, _ = read_gguf(path, self.quantized)
         c = self.c
         self.position = 0
+        self.tokens = []
         self.states = []
         for layer in range(c["layers"]):
             if (layer + 1) % 4:
@@ -113,6 +118,9 @@ class Reference:
                 })
             else:
                 self.states.append({"keys": [], "values": [], "raw": [], "pooled": []})
+            if layer in c.get("ple.layers", []):
+                history = (c["ple.conv_kernel"] - 1) * c["ple.ngram_size"]
+                self.states[-1]["ple_conv"] = np.zeros((history, c["branches"], c["hidden"]), dtype=np.float32)
 
     def mm(self, name, x):
         # Model the pinned backend's single-vector arithmetic independently.
@@ -134,8 +142,11 @@ class Reference:
                 quant = np.rint(blocks * inv[:, None])
             else:
                 # CUDA Q8_1 uses roundf(x/d), with halfway cases away from zero.
-                scaled = np.divide(blocks, scale[:, None], out=np.zeros_like(blocks),
-                                   where=scale[:, None] != 0)
+                # ggml enables fast math: division becomes reciprocal multiply.
+                # Quantized PLE rows frequently hit the resulting halfway cases.
+                scale = maximum * np.float32(1 / 127)
+                inverse = np.divide(1, scale, out=np.zeros_like(scale), where=scale != 0)
+                scaled = blocks * inverse[:, None]
                 magnitude = np.abs(scaled)
                 integral = np.floor(magnitude)
                 # Adding 0.5 in F32 can round a value just BELOW a tie upward.
@@ -204,6 +215,37 @@ class Reference:
         output = self.norm(p + "gdn.norm", output) * silu(z)
         return self.mm(p + "gdn.out", output.reshape(-1))
 
+    def ple(self, layer, token, h, state):
+        c = self.c
+        p, meta = f"blk.{layer}.ple.", f"ple.{layer}."
+        # Construct the whole segment independently of the engine's bounded
+        # window. The current EOS retains its context; the following token resets.
+        last_eos = max((i for i, t in enumerate(self.tokens) if t == c["ple.eos_token_id"]), default=-1)
+        segment = self.tokens[last_eos + 1:] + [token]
+        shifted = [segment[-1 - j] if j < len(segment) else c["ple.eos_token_id"]
+                   for j in range(c["ple.ngram_size"])]
+        rows = []
+        for n in range(2, c["ple.ngram_size"] + 1):
+            mixed = 0
+            for j in range(n):
+                mixed ^= shifted[j] * c[meta + "multipliers"][j]
+            for head in range(c["ple.heads_per_ngram"]):
+                i = (n - 2) * c["ple.heads_per_ngram"] + head
+                rows.append(mixed % c[meta + "vocab_sizes"][i] + c[meta + "offsets"][i])
+        emb = self.w[p + "embedding"][rows].reshape(-1)
+        key = self.norm(p + "norm_key", self.mm(p + "key", emb).reshape(h.shape))
+        query = self.norm(p + "norm_query", h)
+        score = (key * query).sum(axis=-1, keepdims=True) / np.sqrt(np.float32(c["hidden"]))
+        gate = sigmoid(np.sign(score) * np.sqrt(np.maximum(np.abs(score), np.float32(1e-6))))
+        gated = gate * self.mm(p + "value", emb)
+        normalized = self.norm(p + "norm_conv", gated)
+        history = np.concatenate([state["ple_conv"], normalized[None]], axis=0)
+        state["ple_conv"] = history[1:].copy()
+        taps = history[::c["ple.ngram_size"]]
+        kernel = self.w[p + "conv"].reshape(c["branches"], c["hidden"], c["ple.conv_kernel"])
+        convolved = np.einsum("tbh,bht->bh", taps, kernel)
+        return h + (gated + silu(convolved))
+
     def attention(self, p, x, state):
         c, pos = self.c, self.position
         d, h, hk, di = c["head_dim"], c["q_heads"], c["kv_heads"], c["index_dim"]
@@ -242,6 +284,8 @@ class Reference:
         selections = []
         for layer, state in enumerate(self.states):
             p = f"blk.{layer}."
+            if layer in c.get("ple.layers", []):
+                h = self.ple(layer, token, h, state)
             x, injection = self.mix(p + "hc_attn", h)
             if (layer + 1) % 4:
                 output = self.gdn(p, x, state)
@@ -251,4 +295,5 @@ class Reference:
             h = self.ffn(p, h + injection[:, None] * output)
         x, _ = self.mix("head", h, inject=False)
         self.position += 1
+        self.tokens.append(token)
         return self.mm("output.weight", x), selections

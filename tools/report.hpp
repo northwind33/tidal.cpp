@@ -50,7 +50,22 @@ inline void config(std::ostream & out, const tidal::Config & c) {
     FIELD(gdn_key_heads); FIELD(gdn_value_heads); FIELD(gdn_dim); FIELD(conv_kernel);
     FIELD(index_heads); FIELD(index_dim); FIELD(block_size); FIELD(top_blocks); FIELD(eps);
 #undef FIELD
-    out << "\"rope_base\":" << c.rope_base << '}';
+    out << "\"rope_base\":" << c.rope_base;
+    if (!c.ple.layers.empty()) {
+        const auto & p = c.ple;
+        out << ",\"ple\":{\"ngram_size\":" << p.ngram_size << ",\"heads_per_ngram\":" << p.heads_per_ngram
+            << ",\"embedding_dim\":" << p.embedding_dim << ",\"conv_kernel\":" << p.conv_kernel
+            << ",\"eos_token_id\":" << p.eos_token_id << ",\"layers\":[";
+        for (size_t i = 0; i < p.layers.size(); ++i) {
+            if (i) out << ',';
+            const auto & l = p.layers[i];
+            out << "{\"layer\":" << l.layer << ",\"vocab\":" << l.vocab << ",\"multipliers\":";
+            array(out, l.multipliers); out << ",\"offsets\":"; array(out, l.offsets);
+            out << ",\"vocab_sizes\":"; array(out, l.vocab_sizes); out << '}';
+        }
+        out << "]}";
+    }
+    out << '}';
 }
 inline void stats(std::ostream & out, const tidal::Statistics & s) {
     out << "{\"graph_nodes\":" << s.device_graph_nodes

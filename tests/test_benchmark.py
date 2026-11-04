@@ -97,6 +97,24 @@ def main():
             profile = json.loads(output.read_text())["profile"]
             assert profile["dropped_events"] == 0 and profile["qsa_matches_baseline"]
             assert profile["logits_max_nrmse_vs_baseline"] < .025, (kind, profile["logits_max_nrmse_vs_baseline"])
+        # PLE has its own graph and host hashing phase; diagnostic replay must
+        # preserve the new histories, and config reports must identify the model.
+        ple, output = root / "ple.gguf", root / "ple.json"
+        run(dummy, "--output", ple, "--ple-layers", "0,2", "--context", 32)
+        run(bench, "--model", ple, "--backend", args.backend, "--prompt", 8, "--steps", 4,
+            "--warmup", 0, "--repetitions", 1, "--profile", "nodes", "--json", output)
+        report = json.loads(output.read_text())
+        assert [l["layer"] for l in report["model"]["config"]["ple"]["layers"]] == [0, 2]
+        profile = report["profile"]
+        assert profile["qsa_matches_baseline"] and profile["greedy_matches_baseline"]
+        assert profile["logits_max_abs_vs_baseline"] < 5e-4 and profile["dropped_events"] == 0
+        events = [e for e in profile["events"] if e["args"]["phase"] == "ple"]
+        assert len([e for e in events if e["name"] == "ngram_hash"]) == 24
+        for layer in [0, 2]:
+            nodes = [e for e in events if e["cat"] == "node" and e["args"]["layer"] == layer]
+            assert all(e["args"]["backend"].startswith("CUDA" if args.backend == "cuda" else "CPU") for e in nodes)
+            names = {e["name"] for e in nodes}
+            assert {f"blk.{layer}.ple.{n}" for n in ["lookup", "key", "value", "gate", "conv.tap.0", "conv_silu"]} <= names
         # Validate performance regression detection deterministically, independent of wall-clock noise.
         baseline = root / "off.json"
         run(sys.executable, compare, baseline, baseline, "--max-regression", 0)

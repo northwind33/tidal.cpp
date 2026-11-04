@@ -88,6 +88,11 @@ to the Python command to focus on one format; multi-layer and invalid-input
 checks still run. See [the validation contract](validation.md) for test coverage
 and backend-specific precision rules.
 
+The numerical command also includes PLE fixtures and state/placement checks.
+To generate one manually, add `--ple-layers 0,2` to `tidal-dummy` (zero-based GDN
+layers). See [the PLE contract](architecture.md#optional-per-layer-embedding-ple)
+and its [numerical validation limits](validation.md#ple-coverage-and-limits).
+
 The preset uses Ninja and `RelWithDebInfo`, exports `compile_commands.json`, and
 enables ccache for C/C++/CUDA compilation. `GGML_CUDA_FA=OFF` skips unused GPU
 FlashAttention kernels: this engine computes main attention on the CPU. GDN and

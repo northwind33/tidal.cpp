@@ -31,15 +31,28 @@ int main(int argc, char ** argv) {
         tidal::Model model(argv[1], backend.get());
         std::cout << std::setprecision(9);
         for (std::string name; std::cin >> name;) {
+            const bool gather = name == "@rows";
+            if (gather && !(std::cin >> name)) throw std::invalid_argument("Missing table name");
             auto * weight = model.at(name);
-            std::vector<float> input(size_t(weight->ne[0]));
-            for (auto & value : input)
-                if (!(std::cin >> value)) throw std::invalid_argument("Truncated input vector");
+            std::vector<float> input;
+            std::vector<int32_t> rows;
+            if (gather) {
+                int count;
+                if (!(std::cin >> count) || count <= 0 || count > 64) throw std::invalid_argument("Invalid row count");
+                rows.resize(count);
+                for (auto & row : rows)
+                    if (!(std::cin >> row) || row < 0 || row >= weight->ne[1]) throw std::invalid_argument("Invalid row index");
+            } else {
+                input.resize(size_t(weight->ne[0]));
+                for (auto & value : input)
+                    if (!(std::cin >> value)) throw std::invalid_argument("Truncated input vector");
+            }
             tidal::Context ctx(ggml_init({1024 * 1024, nullptr, true}), ggml_free);
             if (!ctx) throw std::runtime_error("Context allocation failed");
-            auto * x = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, int64_t(input.size()));
-            auto * y = ggml_mul_mat(ctx.get(), weight, x);
-            ggml_prec_set_acc(y, GGML_PREC_F32); // Same contract as Engine::mm.
+            auto * x = ggml_new_tensor_1d(ctx.get(), gather ? GGML_TYPE_I32 : GGML_TYPE_F32,
+                                          int64_t(gather ? rows.size() : input.size()));
+            auto * y = gather ? ggml_get_rows(ctx.get(), weight, x) : ggml_mul_mat(ctx.get(), weight, x);
+            if (!gather) ggml_prec_set_acc(y, GGML_PREC_F32); // Same contract as Engine::mm.
             if (!ggml_backend_supports_op(backend.get(), y))
                 throw std::runtime_error("Backend does not support this matvec");
             auto * graph = ggml_new_graph(ctx.get());
@@ -47,7 +60,8 @@ int main(int argc, char ** argv) {
             tidal::Buffer buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()),
                                  ggml_backend_buffer_free);
             if (!buffer) throw std::runtime_error("Buffer allocation failed");
-            ggml_backend_tensor_set(x, input.data(), 0, input.size() * sizeof(float));
+            if (gather) ggml_backend_tensor_set(x, rows.data(), 0, rows.size() * sizeof(int32_t));
+            else ggml_backend_tensor_set(x, input.data(), 0, input.size() * sizeof(float));
             if (ggml_backend_graph_compute(backend.get(), graph) != GGML_STATUS_SUCCESS)
                 throw std::runtime_error("Matvec execution failed");
             std::vector<float> output(size_t(ggml_nelements(y)));

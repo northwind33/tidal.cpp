@@ -26,7 +26,7 @@ else()
     set(TIDAL_GGML_BUILD_SOURCE "${ggml_SOURCE_DIR}")
 endif()
 
-add_library(tidal src/model.cpp src/engine.cpp src/sparse_attention.cpp)
+add_library(tidal src/model.cpp src/ple.cpp src/engine.cpp src/sparse_attention.cpp)
 target_include_directories(tidal PUBLIC include PRIVATE src)
 target_link_libraries(tidal PUBLIC ggml ggml-cpu)
 if(TIDAL_CUDA)
@@ -76,6 +76,8 @@ target_compile_definitions(tidal-bench PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(tidal-state-test tests/state.cpp)
+    target_link_libraries(tidal-state-test PRIVATE tidal)
     add_executable(tidal-matvec-test tests/matvec.cpp)
     target_link_libraries(tidal-matvec-test PRIVATE tidal)
     target_include_directories(tidal-matvec-test PRIVATE src)

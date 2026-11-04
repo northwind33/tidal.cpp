@@ -6,8 +6,8 @@ The user's Qwen3-Flash-Next refers here to Qwen3.8-Flash-Next, exposed as
 `qwen4_exp` in Transformers and `qwen4exp` in llama.cpp. The released model is MoE;
 this fixture follows the earlier Dense-engine plan. It retains the decoder's
 GDN/QSA rhythm, Gated Residual reads/writes, Q/K normalization, partial NeoX RoPE,
-gated attention output and SwiGLU. MoE is replaced by a Dense SwiGLU, and PLE,
-vision and MTP are disabled. There is no tokenizer or claim of checkpoint compatibility.
+gated attention output and SwiGLU. MoE is replaced by a Dense SwiGLU. PLE is optional;
+vision and MTP are disabled. There is no tokenizer or claim of released-checkpoint compatibility.
 
 Sources inspected on 2026-11-04:
 
@@ -27,7 +27,8 @@ the engine and dummy-model generator are C++.
 
 1. Gather the BF16 embedding on the selected backend and duplicate it across the
    residual streams for this token.
-2. At each GDN layer, normalize each residual stream, compute low-rank read gates,
+2. Apply PLE, when configured, before the layer's attention residual read (see below).
+   At each GDN layer, normalize each residual stream, compute low-rank read gates,
    average the gated reads, and project Q/K/V, output gate, decay and delta gate.
    Apply the depthwise causal convolution with previous-token history. L2-normalize
    Q and K, repeat-interleave key heads to value heads, then use ggml's fused GDN
@@ -55,14 +56,44 @@ future token. Selection lists are sorted and checked for duplicates before atten
 Equal top-k scores can select different tied blocks across backends; fixtures avoid
 ties at the budget boundary. There is no random sampling: generation uses argmax.
 
+## Optional per-layer embedding (PLE)
+
+The equations follow `Qwen4ExpTextNGramEmbedding` and `Qwen4ExpTextPLELayer` in the
+pinned Transformers source above. Each configured GDN layer owns its own table,
+hash constants, projections, norm weights and convolution history:
+
+1. For n-gram orders 2 through N, XOR the signed-int64-safe products of token IDs
+   and per-layer multipliers. Each head takes the remainder by its vocabulary size
+   and adds its table offset. Missing history is EOS; a preceding EOS masks itself
+   and earlier tokens. The current EOS still uses its preceding context.
+2. Gather and concatenate one embedding row per head. Project a key for each
+   residual branch and a shared value. RMS-normalize the key and current residual
+   separately within each branch of width `hidden`.
+3. Compute `s = dot(key, query) / sqrt(hidden)` and gate the shared value by
+   `sigmoid(sign(s) * sqrt(max(abs(s), 1e-6)))` in each branch.
+4. Group-normalize the gated value, then apply a causal depthwise convolution with
+   dilation N and SiLU. Add both the gated value and convolution output to the
+   residual before the usual GDN/FFN operations.
+
+The host keeps at most N-1 token IDs and computes the integer hashes. Row indices
+upload once per PLE layer/token; lookup and all floating-point operations execute
+on the selected backend. The table is not copied back to the host. The F32
+convolution history holds `(kernel-1)*N` vectors per layer on the backend. EOS
+resets the hash context only, not convolution, GDN or attention state. `reset()`
+clears all of them. Kernel size 1 has no convolution history.
+
+Profiling exposes a `ple` phase/layer, host `ngram_hash`, embedding `lookup`, key/value
+projections, grouped norms, gate, individual convolution taps and SiLU nodes.
+
 ## Precision and storage
 
 | Tensor / operation | Precision |
 |---|---|
-| Embeddings | BF16 |
+| Token embeddings | BF16 |
+| PLE embedding tables | F32, F16, BF16, Q8_0 or Q4_0 (BF16 default in generator) |
 | Matrix weights | F32, F16, BF16, Q8_0 or Q4_0 |
 | Norm gamma, convolution weights, A-log and dt bias | F32 |
-| Graph activations, GDN recurrent/conv state, raw index ring | F32 |
+| Graph activations, GDN recurrent/conv state, PLE conv state, raw index ring | F32 |
 | Compressed index cache, host main KV cache | BF16 |
 | Sparse attention scores, softmax, weighted values | F32 |
 
@@ -94,8 +125,40 @@ All configuration keys use `tidal.*`. Tensor names and shapes are centralized in
 usual row-major matrix shape. Unknown architectures, metadata versions, missing
 tensors, shape/type mismatches and truncated payloads are rejected.
 
+PLE is an optional extension of version 1: old files omit the entire `tidal.ple.*`
+group. A present group requires these keys; partial/unknown PLE keys are rejected:
+
+| Metadata | GGUF type / meaning |
+|---|---|
+| `tidal.ple.layers` | UINT32 array of sorted, unique, zero-based GDN layer IDs |
+| `tidal.ple.ngram_size`, `heads_per_ngram`, `embedding_dim`, `conv_kernel`, `eos_token_id` | UINT32 scalars (each key uses the `tidal.ple.` prefix) |
+| `tidal.ple.L.vocab` | UINT32 padded table row count for decoder layer L |
+| `tidal.ple.L.multipliers` | UINT64 array, N entries |
+| `tidal.ple.L.offsets`, `tidal.ple.L.vocab_sizes` | UINT64 arrays, H = (N-1)*heads_per_ngram entries |
+
+Multipliers must keep every valid token product within signed int64. Head ranges
+must be contiguous, nonempty and within the table; remaining rows are padding.
+Runtime uses stored constants, allowing externally initialized hash tables.
+The dummy writer uses the original SplitMix64 derivation with `--seed`, PLE module
+ordinal (not decoder layer ID), successive prime head sizes and 128-row padding.
+Transformers' `ple_layer_ids` are one-based and must be converted when authoring
+this schema. Tensor layout is:
+
+| Tensor prefix `blk.L.ple.` | ggml dimensions |
+|---|---|
+| `embedding` | [embedding_dim / H, vocab] |
+| `key`, `value` | [embedding_dim, hidden * branches], [embedding_dim, hidden] |
+| `norm_key`, `norm_query`, `norm_conv` | [hidden, branches], effective gamma |
+| `conv` | [conv_kernel, hidden * branches], oldest tap first |
+
+The prototype bounds N to 2..16, H to 1..64, embedding_dim to a multiple of 32 up
+to 4096 divisible by H, and kernel size to 1..16. Each table is bounded to 1,048,576
+rows and 67,108,864 elements. Quantized table rows also need ggml block alignment.
+These are fixture limits, not support for the released model's large PLE tables
+or native `qwen4exp` GGUF tensor/metadata naming.
+
 One Engine owns one sequence. `decode` advances it once, `prefill` repeats those
-transitions, and `reset` clears all GDN/index state, logical CPU KV lengths and
+transitions, and `reset` clears all PLE/GDN/index state, logical CPU KV lengths and
 statistics. Exceeding the configured capacity raises an error; no sliding-window
 eviction occurs. Failed graph execution poisons the sequence until `reset`, so a
 partially updated state cannot silently be reused. Independent Engines may run

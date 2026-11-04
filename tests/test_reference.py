@@ -43,18 +43,31 @@ def check_matvecs(binary, model, backend):
     requests, expected = [], []
     # Include short and long rows, small outputs, and all input quantization
     # edge cases independently of the nonlinear/recurrent model trajectory.
-    for name in ["blk.0.hc_attn.down", "blk.0.hc_attn.inject", "blk.0.hc_attn.up",
-                 "blk.0.gdn.qkv", "output.weight"]:
+    names = ["blk.0.hc_attn.down", "blk.0.hc_attn.inject", "blk.0.hc_attn.up",
+             "blk.0.gdn.qkv", "output.weight"]
+    names += [f"blk.{layer}.ple.{part}" for layer in reference.c.get("ple.layers", []) for part in ["key", "value"]]
+    for name in names:
         width = reference.w[name].shape[1]
         mixed = rng.uniform(-2, 2, width).astype(np.float32)
         if width > 32:
             mixed[:32] = 0  # Zero activation block must not divide by zero.
         below_half = np.nextafter(np.float32(0.5), np.float32(0))
         ties = np.resize(np.array([127, -127, 0.5, -0.5, 1.5, -1.5, below_half, -below_half],
-                                  dtype=np.float32), width)
-        for x in [np.zeros(width, dtype=np.float32), mixed, ties]:
+                                  dtype=np.float32), width) / np.float32(128)
+        # Power-of-two scaling preserves Q8 rounding boundaries while avoiding
+        # large F32 cancellation errors in the floating-point matvec fixtures.
+        inputs = [np.zeros(width, dtype=np.float32), mixed, ties]
+        if reference.types[name] in (2, 8):
+            inputs.append(np.resize(np.arange(-8, 8, dtype=np.float32), width) * np.float32(np.float16(.012)))
+        for x in inputs:
             requests.append(name + " " + " ".join(map(str, x)))
             expected.append((name, reference.mm(name, x)))
+    for layer in reference.c.get("ple.layers", []):
+        name = f"blk.{layer}.ple.embedding"
+        rows = reference.c[f"ple.{layer}.offsets"]
+        rows = [rows[-1], 0, *rows, reference.w[name].shape[0] - 1]
+        requests.append("@rows " + name + " " + str(len(rows)) + " " + " ".join(map(str, rows)))
+        expected.append((name, reference.w[name][rows].reshape(-1)))
     result = run(binary, model, backend, input="\n".join(requests) + "\n")
     lines = result.stdout.splitlines()
     assert len(lines) == len(expected), result.stdout
@@ -81,12 +94,14 @@ def check_placement(result, config, backend, steps):
               for visible in range(1, steps + 1))
     d2h = 4 * (steps * config["vocab"] + qsa_layers * (steps * (q_width + 2 * kv_width) + ids))
     h2d = 4 * (steps + qsa_layers * (steps * (3 + q_width) + steps // config["block_size"]))
+    if config.get("ple.layers"):
+        h2d += 4 * steps * len(config["ple.layers"]) * (config["ple.ngram_size"] - 1) * config["ple.heads_per_ngram"]
     assert stats["device_to_host_bytes"] == (d2h if backend == "cuda" else 0), stats
     assert stats["host_to_device_bytes"] == (h2d if backend == "cuda" else 0), stats
 
 
-def check_trace(result, reference, tolerance, label):
-    sequence = PROMPT + result["generated"]
+def check_trace(result, reference, tolerance, label, prompt=PROMPT):
+    sequence = prompt + result["generated"]
     assert len(result["trace"]) == len(sequence)
     max_error, max_nrmse = 0, 0
     for i, token in enumerate(sequence):
@@ -101,7 +116,7 @@ def check_trace(result, reference, tolerance, label):
         assert nrmse < 0.025, (label, i, nrmse)
         assert step["position"] == i
         assert step["selections"] == selected, (label, i, step["selections"], selected)
-        if len(PROMPT) - 1 <= i < len(sequence) - 1:
+        if len(prompt) - 1 <= i < len(sequence) - 1:
             # Check the oracle's greedy decision, not just logits conditioned
             # on tokens chosen by the engine under test.
             assert sequence[i + 1] == int(np.argmax(expected)), (label, i, "greedy token")
@@ -135,6 +150,93 @@ def check_multi(root, bins, backend):
     check_placement(result, reference.c, backend, len(PROMPT))
     check_trace(result, reference, 3e-4, "8 layers / hidden 256")
     print("8 layers / hidden 256: two independent QSA caches + reset passed", flush=True)
+
+
+def check_ple(root, bins, backend, kind, variant="default"):
+    model, trace = root / f"ple-{kind}-{variant}.gguf", root / f"ple-{kind}-{variant}.json"
+    extra = ["--ple-layers", "0,2", "--ple-type", kind]
+    prompt = [0, 0] + PROMPT[:-2]  # Beginning padding, consecutive EOS, and later EOS.
+    if variant == "alternate":
+        extra = ["--layers", 8, "--ple-layers", "1,4,6", "--ple-ngram", 4,
+                 "--ple-heads", 2, "--ple-dim", 192, "--ple-conv", 3, "--ple-eos", 7]
+        prompt = [7, 7] + PROMPT[:-2]
+    elif variant == "pointwise":
+        extra = ["--ple-layers", "1", "--ple-ngram", 2, "--ple-heads", 1,
+                 "--ple-dim", 96, "--ple-conv", 1, "--ple-eos", 255]
+    # Keep quantized table lookup under the tight F32 end-to-end contract.
+    # Fully quantized models have separate native-kernel and state checks below:
+    # small rounding changes at activation-quantizer thresholds can change QSA
+    # top-k/argmax, making independent long-trajectory equality inappropriate.
+    matrix_kind = "f32" if kind in ("q4_0", "q8_0") and variant == "default" else kind
+    run(bins / "tidal-dummy", "--output", model, "--type", matrix_kind, "--context", 32, *extra)
+    check_matvecs(bins / "tidal-matvec-test", model, backend)
+    run(bins / "tidal-cli", "--model", model, "--backend", backend,
+        "--tokens", ",".join(map(str, prompt)), "--steps", 6, "--json", trace, "--repeat", 2)
+    result, reference = json.loads(trace.read_text()), Reference(model, backend)
+    if variant == "default":
+        # Golden constants from the pinned Transformers hash initialization,
+        # using seed=42, vocabulary=256 and PLE module ordinals 0 and 1.
+        assert reference.c["ple.0.multipliers"] == [26958270162658125, 10360346520797407, 16259569841195497]
+        assert reference.c["ple.2.multipliers"] == [3558921994396713, 21786721718226283, 26872783636338227]
+        assert reference.c["ple.0.vocab_sizes"] == [17, 19, 23, 29]
+        assert reference.c["ple.2.vocab_sizes"] == [31, 37, 41, 43]
+    check_placement(result, reference.c, backend, 30)
+    if variant != "quantized":
+        check_trace(result, reference, TOLERANCES[backend][matrix_kind], f"PLE {kind} {variant}", prompt)
+    else:
+        assert len(result["trace"]) == 30 and len(result["generated"]) == 6
+        assert all(np.isfinite(step["logits"]).all() for step in result["trace"])
+    run(bins / "tidal-state-test", model, backend)
+    coverage = "oracle logits + QSA + greedy" if variant != "quantized" else "native projection/lookup + finite generation"
+    print(f"PLE {kind} {variant}: {coverage} + EOS + reset/chunked state + placement passed", flush=True)
+
+
+def check_ple_rejections(root, bins, backend):
+    model, bad = root / "ple-valid.gguf", root / "ple-bad.gguf"
+    run(bins / "tidal-dummy", "--output", model, "--ple-layers", "0,2")
+    baseline = root / "ple-free.gguf"
+    run(bins / "tidal-dummy", "--output", baseline)
+    base_config, base_weights, _, _ = read_gguf(baseline)
+    _, ple_weights, _, _ = read_gguf(model)
+    assert not any(key.startswith("ple.") for key in base_config)
+    for name, weight in base_weights.items():
+        np.testing.assert_array_equal(ple_weights[name], weight, err_msg="PLE changed a base-model weight")
+    original = model.read_bytes()
+    _, _, _, offsets = read_gguf(model)
+    mutations = [("tidal.ple.ngram_size", 0, "I", 1),
+                 ("tidal.ple.ngram_size", 0, "I", 0xFFFFFFFF),
+                 ("tidal.ple.embedding_dim", 0, "I", 31),
+                 ("tidal.ple.heads_per_ngram", 0, "I", 0),
+                 ("tidal.ple.conv_kernel", 0, "I", 0),
+                 ("tidal.ple.eos_token_id", 0, "I", 256),
+                 ("tidal.ple.layers", 12, "I", 3),  # QSA, not GDN
+                 ("tidal.ple.layers", 16, "I", 0),  # duplicate layer
+                 ("tidal.ple.layers", 16, "I", 4),
+                 ("tidal.ple.0.multipliers", 0, "I", 11),  # wrong array element type
+                 ("tidal.ple.0.multipliers", 12, "Q", (1 << 64) - 1),
+                 ("tidal.ple.0.vocab_sizes", 12, "Q", 0),
+                 ("tidal.ple.0.offsets", 12, "Q", 1),
+                 ("tidal.ple.0.vocab", 0, "I", 1)]
+    for key, relative, fmt, value in mutations:
+        data = bytearray(original)
+        struct.pack_into("<" + fmt, data, offsets[key] + relative, value)
+        bad.write_bytes(data)
+        failure = run(bins / "tidal-cli", "--model", bad, "--backend", backend, ok=False)
+        assert "PLE" in failure.stderr, (key, failure.stderr)
+    for before, after in [(b"tidal.ple.layers", b"tidal.xle.layers"),
+                          (b"tidal.ple.conv_kernel", b"tidal.ple.conv_kerneX"),
+                          (b"blk.0.ple.key", b"blk.0.ple.bad")]:
+        bad.write_bytes(original.replace(before, after))
+        run(bins / "tidal-cli", "--model", bad, "--backend", backend, ok=False)
+    for extra in [["--ple-layers", ""], ["--ple-layers", "0,"], ["--ple-layers", "0,0"],
+                  ["--ple-layers", "2,0"], ["--ple-layers", "3"], ["--ple-layers", "-1"],
+                  ["--ple-layers", "4"], ["--ple-dim", "128"],
+                  ["--ple-layers", "0", "--ple-ngram", "2147483647"],
+                  ["--ple-layers", "0", "--ple-dim", "33"],
+                  ["--ple-layers", "0", "--ple-vocab-base", "0"],
+                  ["--ple-layers", "0", "--ple-conv", "0"]]:
+        run(bins / "tidal-dummy", "--output", root / "invalid-ple.gguf", *extra, ok=False)
+    print("Malformed PLE metadata, missing tensors and generator arguments rejected", flush=True)
 
 
 def check_rejections(root, bins, backend):
@@ -172,7 +274,14 @@ def main():
         root = Path(tmp)
         cases = [(kind, lambda kind=kind: check_format(root, args.bin_dir, args.backend, kind))
                  for kind in dict.fromkeys(args.formats)]
+        cases += [(f"ple-{kind}", lambda kind=kind: check_ple(root, args.bin_dir, args.backend, kind))
+                  for kind in dict.fromkeys(args.formats)]
+        cases += [(f"ple-{variant}", lambda variant=variant: check_ple(root, args.bin_dir, args.backend, "f32", variant))
+                  for variant in ["alternate", "pointwise"]]
+        cases += [(f"ple-quantized-{kind}", lambda kind=kind: check_ple(root, args.bin_dir, args.backend, kind, "quantized"))
+                  for kind in dict.fromkeys(args.formats) if kind in ("q4_0", "q8_0")]
         cases += [("multi", lambda: check_multi(root, args.bin_dir, args.backend)),
+                  ("ple-rejections", lambda: check_ple_rejections(root, args.bin_dir, args.backend)),
                   ("rejections", lambda: check_rejections(root, args.bin_dir, args.backend))]
         for name, check in cases:
             try:

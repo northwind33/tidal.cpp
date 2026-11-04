@@ -7,6 +7,22 @@
 
 namespace tidal {
 
+struct PLELayer {
+    int layer = 0; // Zero-based decoder layer, in ascending order.
+    int vocab = 0; // Includes padding rows in the embedding table.
+    std::vector<uint64_t> multipliers, offsets, vocab_sizes;
+};
+
+struct PLEConfig {
+    int ngram_size = 3;
+    int heads_per_ngram = 2;
+    int embedding_dim = 128; // Concatenated heads.
+    int conv_kernel = 4;
+    int eos_token_id = 0;
+    std::vector<PLELayer> layers; // Empty preserves the original PLE-free schema.
+    int heads() const { return (ngram_size - 1) * heads_per_ngram; }
+};
+
 // A deliberately small Dense derivative, not the released MoE checkpoint schema.
 struct Config {
     int hidden = 128;
@@ -30,6 +46,7 @@ struct Config {
     int top_blocks = 2;
     float eps = 1e-6f;
     float rope_base = 10000.0f;
+    PLEConfig ple;
     void validate() const;
 };
 

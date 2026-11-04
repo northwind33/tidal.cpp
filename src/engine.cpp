@@ -72,8 +72,11 @@ public:
     ggml_context * c() { return ctx.get(); }
     void add(ggml_tensor * t) { ggml_build_forward_expand(graph, t); }
     ggml_tensor * integer(int32_t value) {
-        auto * t = ggml_new_tensor_1d(c(), GGML_TYPE_I32, 1);
-        uploads.emplace_back([this, t, value] { put(t, &value, sizeof(value)); });
+        return integers({value});
+    }
+    ggml_tensor * integers(const std::vector<int32_t> & values) {
+        auto * t = ggml_new_tensor_1d(c(), GGML_TYPE_I32, int64_t(values.size()));
+        uploads.emplace_back([this, t, values] { put(t, values.data(), values.size() * sizeof(int32_t)); });
         return t;
     }
     ggml_tensor * floats(const std::vector<float> & values) {
@@ -153,6 +156,8 @@ public:
 };
 
 struct LayerState {
+    const PLELayer * ple = nullptr;
+    ggml_tensor * ple_conv = nullptr;
     ggml_tensor * conv = nullptr;
     ggml_tensor * recurrent = nullptr;
     ggml_tensor * raw_index = nullptr;
@@ -175,6 +180,7 @@ struct Engine::Impl {
     Buffer state_buffer{nullptr, ggml_backend_buffer_free};
     ggml_tensor * hidden;
     std::vector<LayerState> states;
+    std::vector<int32_t> previous_tokens;
     int position = 0;
     bool failed = false;
 
@@ -199,6 +205,13 @@ struct Engine::Impl {
                 s.attention = std::make_unique<SparseAttention>(c.q_heads, c.kv_heads, c.head_dim,
                                                                c.context, options.threads);
             }
+        }
+        for (const auto & l : c.ple.layers) {
+            auto & s = states[l.layer];
+            s.ple = &l;
+            if (c.ple.conv_kernel > 1)
+                s.ple_conv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.hidden * c.branches,
+                                               (c.ple.conv_kernel - 1) * c.ple.ngram_size);
         }
         state_buffer.reset(ggml_backend_alloc_ctx_tensors(ctx, backend.get()));
         if (!state_buffer) throw std::runtime_error("State allocation failed");
@@ -263,6 +276,48 @@ struct Engine::Impl {
             expanded = expanded ? ggml_concat(g.c(), expanded, head, 0) : head;
         }
         return ggml_reshape_4d(g.c(), ggml_cont(g.c(), expanded), c.gdn_dim, c.gdn_value_heads, 1, 1);
+    }
+    void ple_layer(int layer, int32_t token) {
+        auto & s = states[layer];
+        ProfileScope scope(&profiler, "layer", "ple", "ple", position, layer, ggml_backend_name(backend.get()));
+        ProfileScope hash(&profiler, "host", "ngram_hash", "ple", position, layer, "CPU");
+        auto rows = ple_rows(c.ple, *s.ple, token, previous_tokens);
+        hash.finish();
+        auto g = graph("ple", layer);
+        const auto p = "blk." + std::to_string(layer) + ".ple.";
+        auto * emb = ggml_get_rows(g.c(), weight(p + "embedding"), g.integers(rows));
+        ggml_set_name(emb, (p + "lookup").c_str());
+        emb = ggml_reshape_1d(g.c(), emb, c.ple.embedding_dim);
+        auto * key = norm(g, ggml_reshape_2d(g.c(), mm(g, p + "key", emb), c.hidden, c.branches), p + "norm_key");
+        auto * query = norm(g, hidden, p + "norm_query");
+        auto * score = ggml_scale(g.c(), ggml_sum_rows(g.c(), ggml_mul(g.c(), key, query)),
+                                  1.0f / std::sqrt(float(c.hidden)));
+        auto * magnitude = ggml_sqrt(g.c(), ggml_clamp(g.c(), ggml_abs(g.c(), score), 1e-6f, INFINITY));
+        auto * gate = ggml_sigmoid(g.c(), ggml_mul(g.c(), ggml_sgn(g.c(), score), magnitude));
+        ggml_set_name(gate, (p + "gate").c_str());
+        auto * value = ggml_repeat(g.c(), mm(g, p + "value", emb), hidden);
+        auto * gated = ggml_mul(g.c(), value, gate);
+        ggml_set_name(gated, (p + "gated_value").c_str());
+        const int channels = c.hidden * c.branches;
+        auto * normalized = ggml_reshape_2d(g.c(), norm(g, gated, p + "norm_conv"), channels, 1);
+        auto * history = s.ple_conv ? ggml_concat(g.c(), s.ple_conv, normalized, 1) : normalized;
+        auto * kernel = weight(p + "conv");
+        ggml_tensor * convolved = nullptr;
+        for (int k = 0; k < c.ple.conv_kernel; ++k) {
+            auto * input = ggml_view_1d(g.c(), history, channels, size_t(k * c.ple.ngram_size) * history->nb[1]);
+            auto * tap = ggml_cont(g.c(), ggml_view_2d(g.c(), kernel, 1, channels, kernel->nb[1], k * kernel->nb[0]));
+            auto * term = ggml_mul(g.c(), input, ggml_reshape_1d(g.c(), tap, channels));
+            ggml_set_name(term, (p + "conv.tap." + std::to_string(k)).c_str());
+            convolved = convolved ? ggml_add(g.c(), convolved, term) : term;
+        }
+        convolved = ggml_reshape_2d(g.c(), ggml_silu(g.c(), convolved), c.hidden, c.branches);
+        ggml_set_name(convolved, (p + "conv_silu").c_str());
+        g.add(ggml_cpy(g.c(), ggml_add(g.c(), hidden, ggml_add(g.c(), gated, convolved)), hidden));
+        if (s.ple_conv) {
+            auto * tail = ggml_view_2d(g.c(), history, channels, s.ple_conv->ne[1], history->nb[1], history->nb[1]);
+            g.add(ggml_cpy(g.c(), tail, s.ple_conv));
+        }
+        g.run();
     }
     void linear_layer(int layer) {
         ProfileScope scope(&profiler, "layer", "gdn", "gdn", position, layer, ggml_backend_name(backend.get()));
@@ -397,6 +452,7 @@ struct Engine::Impl {
             emb.run();
             Step step{position, {}, {}};
             for (int layer = 0; layer < c.layers; ++layer) {
+                if (states[layer].ple) ple_layer(layer, token);
                 if ((layer + 1) % 4) linear_layer(layer);
                 else step.selections.push_back(sparse_layer(layer));
             }
@@ -408,6 +464,10 @@ struct Engine::Impl {
             step.logits = head.get<float>(logits);
             if (!std::all_of(step.logits.begin(), step.logits.end(), [](float f) { return std::isfinite(f); }))
                 throw std::runtime_error("Non-finite logits");
+            if (!c.ple.layers.empty()) {
+                previous_tokens.push_back(token);
+                if (previous_tokens.size() >= size_t(c.ple.ngram_size)) previous_tokens.erase(previous_tokens.begin());
+            }
             ++position;
             return step;
         } catch (...) { failed = true; throw; }
@@ -416,6 +476,7 @@ struct Engine::Impl {
         ggml_backend_synchronize(backend.get());
         ggml_backend_buffer_clear(state_buffer.get(), 0);
         for (auto & s : states) if (s.attention) s.attention->reset();
+        previous_tokens.clear();
         position = 0;
         failed = false;
         stats = {};

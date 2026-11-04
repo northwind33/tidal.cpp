@@ -22,11 +22,17 @@ struct TensorSpec {
     std::string name;
     int64_t columns;
     int64_t rows;
-    enum Kind { Matrix, Norm, Conv, ALog, Bias, Embedding } kind;
+    enum Kind { Matrix, Norm, Conv, ALog, Bias, Embedding, Lookup } kind;
 };
 std::vector<TensorSpec> tensor_specs(const Config & c);
 void write_config(gguf_context * file, const Config & config);
 Config read_config(const gguf_context * file);
+void validate_ple(const Config & config);
+void write_ple(gguf_context * file, const PLEConfig & config);
+void read_ple(const gguf_context * file, Config & config);
+// Previous tokens are oldest-first. Only the ngram_size-1 most recent are needed.
+std::vector<int32_t> ple_rows(const PLEConfig & config, const PLELayer & layer,
+                              int32_t token, const std::vector<int32_t> & previous);
 
 struct Model {
     Config config;

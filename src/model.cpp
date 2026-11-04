@@ -44,6 +44,7 @@ void Config::validate() const {
         throw std::invalid_argument("Unsupported layer/head/rotary/quantization dimensions");
     if (!std::isfinite(eps) || eps <= 0 || !std::isfinite(rope_base) || rope_base <= 1)
         throw std::invalid_argument("Invalid RMS epsilon or RoPE base");
+    validate_ple(*this);
 }
 
 std::vector<TensorSpec> tensor_specs(const Config & c) {
@@ -92,6 +93,16 @@ std::vector<TensorSpec> tensor_specs(const Config & c) {
             add(p + "index.k_norm", c.index_dim, 1, TensorSpec::Norm);
         }
     }
+    // Append optional tensors so PLE does not change seeded base-model weights.
+    for (const auto & l : c.ple.layers) {
+        const std::string p = "blk." + std::to_string(l.layer) + ".ple.";
+        add(p + "embedding", c.ple.embedding_dim / c.ple.heads(), l.vocab, TensorSpec::Lookup);
+        add(p + "key", c.ple.embedding_dim, c.hidden * c.branches);
+        add(p + "value", c.ple.embedding_dim, c.hidden);
+        for (const auto * name : {"norm_key", "norm_query", "norm_conv"})
+            add(p + name, c.hidden, c.branches, TensorSpec::Norm);
+        add(p + "conv", c.ple.conv_kernel, c.hidden * c.branches, TensorSpec::Conv);
+    }
     return specs;
 }
 
@@ -103,6 +114,7 @@ void write_config(gguf_context * f, const Config & c) {
         gguf_set_val_u32(f, (std::string("tidal.") + field.name).c_str(), c.*(field.value));
     gguf_set_val_f32(f, "tidal.eps", c.eps);
     gguf_set_val_f32(f, "tidal.rope_base", c.rope_base);
+    write_ple(f, c.ple);
 }
 
 Config read_config(const gguf_context * f) {
@@ -118,6 +130,7 @@ Config read_config(const gguf_context * f) {
     }
     c.eps = gguf_get_val_f32(f, key(f, "tidal.eps", GGUF_TYPE_FLOAT32));
     c.rope_base = gguf_get_val_f32(f, key(f, "tidal.rope_base", GGUF_TYPE_FLOAT32));
+    read_ple(f, c);
     c.validate();
     return c;
 }
@@ -135,7 +148,7 @@ Model::Model(const std::string & path, ggml_backend_t backend) {
         auto * t = ggml_get_tensor(ctx.get(), spec.name.c_str());
         if (!t || t->ne[0] != spec.columns || t->ne[1] != spec.rows || t->ne[2] != 1 || t->ne[3] != 1)
             throw std::runtime_error("Missing or invalid tensor shape: " + spec.name);
-        const bool matrix = spec.kind == TensorSpec::Matrix;
+        const bool matrix = spec.kind == TensorSpec::Matrix || spec.kind == TensorSpec::Lookup;
         const bool embedding = spec.kind == TensorSpec::Embedding;
         const bool supported = t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 ||
             t->type == GGML_TYPE_BF16 || t->type == GGML_TYPE_Q4_0 || t->type == GGML_TYPE_Q8_0;
