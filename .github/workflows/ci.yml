@@ -17,6 +17,8 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install numpy
+      - name: Check Dev Container cache relocation (no GPU required)
+        run: python tests/test_devcontainer.py
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF
       - run: cmake --build build -j 2
       - run: ctest --test-dir build --output-on-failure

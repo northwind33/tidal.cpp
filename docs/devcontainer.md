@@ -43,6 +43,25 @@ pinned ggml dependency. It configures the project without starting the full buil
 The normal development account is `vscode`, with its UID/GID mapped to the Linux
 host user to avoid root-owned files in the checkout.
 
+### Recover from a host-path CMake cache
+
+If the checkout was configured on the host first, its cache may refer to
+`/home/<user>/src/tidal.cpp` while the container sees `/workspaces/tidal.cpp`.
+The post-create script detects a changed source or build path and moves the
+complete `build/dev-cuda` directory to a unique `build/dev-cuda.stale.*` backup
+before configuring again. This also isolates old dependency sub-build caches.
+Existing output is preserved; a cache already configured at the current paths
+is reused on subsequent runs.
+
+If an older version of the script failed with this error, update the checkout
+and rerun it **inside the existing container**; rebuilding the image is unnecessary:
+
+```sh
+git pull --ff-only origin feat/tiny-hybrid-engine
+bash .devcontainer/post-create.sh
+cmake --build --preset dev-cuda
+```
+
 ## Build, test and run
 
 Inside the container terminal:
@@ -113,6 +132,11 @@ After the default post-create configuration, run `cmake --preset my-cuda` and
 container; select a fixed compute capability instead for portable binaries.
 
 ## CI and verification limits
+
+`python3 tests/test_devcontainer.py` uses real CMake projects to check fresh and
+repeated setup, relocated source/build paths, preservation of dependency caches,
+and an unchanged build when GPU preflight fails. Only `nvcc` and `nvidia-smi` are
+stubbed for this regression test; it does not exercise CUDA or the engine.
 
 CI builds this Dockerfile and checks the non-root account, CUDA compiler, CMake,
 Ninja, GDB and NumPy without requesting a GPU. The separate CUDA compile job
