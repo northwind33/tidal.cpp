@@ -34,7 +34,8 @@ RUN if getent passwd 1000 >/dev/null; then \
     && usermod --shell /bin/bash vscode \
     && printf 'vscode ALL=(root) NOPASSWD:ALL\n' > /etc/sudoers.d/vscode \
     && chmod 0440 /etc/sudoers.d/vscode \
-    && install -d -o vscode -g "$(id -gn vscode)" /home/vscode/.cache/ccache
+    && install -d -o vscode -g "$(id -gn vscode)" \
+        /home/vscode/.cache /home/vscode/.cache/ccache
 
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \

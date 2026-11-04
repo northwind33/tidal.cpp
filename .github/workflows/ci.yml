@@ -45,6 +45,7 @@ jobs:
           docker run --rm --entrypoint bash tidal-dev -lc '
             test "$(id -un)" = vscode &&
             test "$(id -u)" -ne 0 &&
+            test -w /home/vscode/.cache &&
             test -w /home/vscode/.cache/ccache &&
             nvcc --version &&
             cmake --version &&
