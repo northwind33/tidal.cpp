@@ -157,7 +157,8 @@ struct Engine::Impl {
     ggml_tensor * weight(const std::string & n) { return model.at(n); }
     ggml_tensor * mm(Graph & g, const std::string & n, ggml_tensor * x) {
         auto * out = ggml_mul_mat(g.c(), weight(n), x);
-        // Keep scalar reference comparisons meaningful even when CUDA has a lower-precision matmul path.
+        // Request F32 accumulation. This does not prescribe operand conversion:
+        // CPU dot types and CUDA Q8_1 activation quantization still differ.
         ggml_prec_set_acc(out, GGML_PREC_F32);
         return out;
     }

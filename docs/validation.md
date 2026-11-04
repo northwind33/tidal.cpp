@@ -1,74 +1,96 @@
-# Validation record
+# Validation contract
 
-Initial local validation, 2026-11-04: Linux x86-64, GCC 13.3, CMake 4.4.4,
-ggml `facdc44a67da17df4433adcc468b424f48e9ded2`, CPU AVX2 build with `GGML_NATIVE=OFF`.
-
-## Numerical results
-
-Each format uses seed 42, hidden 128, three GDN layers plus one QSA layer,
-24 fixed prompt tokens and six greedily generated tokens. Every step's entire
-256-logit vector and selected QSA token IDs are compared to the separate NumPy
-implementation. The same sequence is reset/replayed and checked for exact logits.
-
-| Matrix format | Maximum absolute logit difference | QSA selected IDs |
-|---|---:|---|
-| F32 | 0.00010186425 | Match at every position |
-| F16 | 0.0018075559 | Match at every position |
-| BF16 | 0.0096533003 | Match at every position |
-| Q8_0 | 0.020599455 | Match at every position |
-| Q4_0 | 0.020034760 | Match at every position |
-
-These compare each file with its own dequantized weights, **not** Q4/Q8 logits
-against the original F32 model. ggml's CPU low-precision matvecs also round their
-activation operands. The oracle independently emulates this conversion; small
-reduction differences near rounding thresholds can create a discrete change that
-propagates through recurrent states. Tests set separate per-format absolute and
-relative bounds (F32: 2e-4; F16: 3e-3; BF16: 0.012; Q4/Q8: 0.025), and require
-normalized vocabulary RMS error below 2.5%. These are numerical implementation
-checks on random fixtures, not model quality or accuracy benchmarks.
-
-The suite also passes with eight layers, hidden 256, seed 123 and two independent
-QSA caches. Core tests verify incomplete-tail selection, block expansion, duplicate
-and future-index rejection, stable softmax at large logits, GQA head mapping,
-selected-only V aggregation, and stale-KV exclusion after reset. CLI tests check
-invalid tokens/options, context limits, malformed/truncated GGUF and missing CUDA.
+The numerical suites compare the tiny Dense decoder against an independent
+NumPy GGUF reader and model implementation. Machine-specific measurements,
+hardware/software inventories and local test logs are not stored in this file.
 
 ## Reproduce
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF
-cmake --build build -j
-ctest --test-dir build --output-on-failure
-python tests/test_reference.py --bin-dir build/bin
+cmake --build --preset dev-cuda
+ctest --preset dev-cuda
+python3 tests/test_reference.py --bin-dir build/dev-cuda/bin --backend cuda
 ```
 
-Both CTest suites pass locally. An additional Debug build enables AddressSanitizer
-and UndefinedBehaviorSanitizer for the tidal library and its executables. The
-managed executor blocks LeakSanitizer's process inspection, so leak detection must
-be disabled here; it is not evidence that the leak check passed.
+CTest's numerical reference suite uses CPU execution, including in a CUDA build.
+The explicit Python command exercises CUDA model/indexer graphs with CPU sparse
+attention. A CUDA compile alone does not establish GPU runtime correctness.
 
-## CUDA boundary
-
-The implementation selects exactly one ggml backend for all model/indexer graphs
-and checks every node with `ggml_backend_supports_op`. CPU sparse attention is a
-separate C++ implementation with CPU-owned BF16 storage. CUDA requests never fall
-back to CPU. The test runner can assert the reported CUDA backend and nonzero
-host/device transfers.
-
-No CUDA device or toolkit is available in the initial editing environment. The
-GitHub `cuda-compile` job builds/links the SM 7.5 path but runs numerical tests in
-CPU mode. **A passing CUDA build does not establish GPU runtime correctness or
-performance.** The remaining hardware acceptance command is:
+A CPU-only build can use:
 
 ```sh
-python tests/test_reference.py --bin-dir build-cuda/bin --backend cuda
+cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF
+cmake --build build-cpu -j
+ctest --test-dir build-cpu --output-on-failure
 ```
 
-No tokens/second, long-context speedup or Titan RTX runtime result is claimed.
+## Numerical coverage
 
-The first CUDA CI run compiled ggml's CUDA kernels and the engine, then failed
-linking the executables: the GPU-less container had no `libcuda.so.1` for ggml's
-VMM driver-API symbols. The workflow now sets `GGML_CUDA_NO_VMM=ON` for that CI job.
-The GPU development container retains the normal VMM default; NVIDIA Container
-Toolkit supplies the host driver libraries at runtime. See
-[the Dev Container guide](devcontainer.md) for setup and hardware validation.
+Each format uses seed 42, hidden 128, three GDN layers plus one QSA layer,
+24 fixed prompt tokens and six greedily generated tokens. Every step's entire
+256-logit vector and selected QSA token IDs are compared to the NumPy reference
+with the requested backend's arithmetic. Generated tokens must equal the oracle's
+argmax. Reset/replay requires identical positions, logits and QSA selections.
+
+Tests compare each GGUF to its own weights and native operand conversions, not
+quantized logits to the original F32 model. Low-precision CPU and CUDA execution
+can produce different trajectories. This validates implementation on synthetic
+fixtures, not trained-model quality or universal error bounds.
+
+Absolute and relative tolerances used by `assert_allclose` are:
+
+| Matrix format | CPU atol / rtol | CUDA atol / rtol |
+|---|---:|---:|
+| F32 | 2e-4 | 4e-4 |
+| F16 | 3e-3 | 1e-3 |
+| BF16 | 0.012 | 4e-4 |
+| Q8_0 / Q4_0 | 0.025 | 0.025 |
+
+Every token additionally requires normalized vocabulary RMS error below 2.5%.
+F32 reductions can cross BF16 cache rounding boundaries even with F32 matrix
+weights. The eight-layer, hidden-256, seed-123 fixture exercises two independent
+QSA caches and reset/replay, using atol/rtol 3e-4.
+
+## Backend-specific reference arithmetic
+
+- CUDA F16/BF16 matvecs with F32 accumulation consume F32 activations. CPU dot
+  products convert those activations to the corresponding floating-point type.
+- Q4/Q8 dot products accumulate integer products within blocks before applying
+  scales. Dequantizing both operands before a floating-point matrix product
+  changes reduction rounding and can alter subsequent activation quantization.
+- CUDA Q8_1 uses half-away-from-zero rounding and stores the original activation
+  sum in FP16. Q4_0's unsigned-nibble correction uses that sum. CPU Q8_0 uses no
+  such sum; the AVX2 path rounds to nearest-even.
+
+`tidal-matvec-test` runs native ggml matvecs on GGUF weights and F32 vectors supplied
+by Python. It checks five representative matrices per format with zero blocks,
+mixed values and positive/negative halfway and near-halfway inputs, at atol/rtol
+2e-5. The full model oracle remains pure NumPy and does not call this executable
+to calculate expected logits.
+
+Cases execute independently, so a failed format does not suppress other formats,
+multi-layer checks or malformed-input tests. To select one format:
+
+```sh
+python3 tests/test_reference.py --bin-dir build/dev-cuda/bin --backend cuda --formats q4_0
+```
+
+Core tests cover incomplete tails, block expansion, stable softmax, grouped KV
+heads, selected-only V aggregation and stale-KV exclusion after reset. CLI tests
+cover invalid inputs, capacity limits, malformed/truncated GGUF and strict CUDA
+rejection. Dev Container regression tests stub GPU preflight commands; they do
+not establish GPU correctness.
+
+## Placement and CI
+
+All model/indexer graphs use exactly one backend and check every node with
+`ggml_backend_supports_op`; CUDA requests have no automatic CPU fallback. CPU
+sparse attention owns the main BF16 KV cache. Tests check backend identity,
+attention calls and the exact transfer-byte budget derived from model dimensions.
+Only current Q/K/V, selected block IDs and logits download; token/RoPE positions
+and attention outputs upload. Full main KV caches remain in CPU RAM.
+
+The GitHub CUDA job builds SM 7.5 and runs numerical tests in CPU mode on GPU-less
+runners. It uses `GGML_CUDA_NO_VMM=ON` to avoid a host-driver linking dependency.
+The GPU development container uses normal VMM and host drivers supplied by
+NVIDIA Container Toolkit. Real GPU validation is a separate explicit test run.

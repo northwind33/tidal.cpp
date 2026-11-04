@@ -97,6 +97,10 @@ NumPy GGUF reader/dequantizer and model implementation. They cover all five form
 complete/incomplete blocks, generation, reset, two superblocks, stable sparse GQA,
 invalid input, truncated files, and strict backend rejection. Low-precision tests
 allow documented activation-rounding error; F32 has a much tighter tolerance.
+The oracle models CPU and CUDA operand conversions separately, checked against
+isolated native matvecs. Generated tokens, reset/replay QSA selections and exact
+transfer-byte budgets are also verified. Test coverage and per-format error
+bounds are documented in [the validation contract](docs/validation.md).
 
 CI builds and tests the CPU implementation and compiles/links the CUDA path for
 SM 7.5. The CUDA CI job's numerical tests use **CPU mode** because hosted runners

@@ -16,7 +16,7 @@ def bf16(x):
     return ((bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000).view(np.float32)
 
 
-def read_gguf(path):
+def read_gguf(path, quantized=None):
     data = Path(path).read_bytes()
     position = 0
 
@@ -68,6 +68,11 @@ def read_gguf(path):
             else:
                 quant = raw[:, 2:].copy().view(np.int8).astype(np.float32)
             value = (scale * quant).reshape(-1)
+            if quantized is not None:
+                # Keep block scales and integer codes: native quantized dot
+                # products scale integer sums, not individual float products.
+                quantized[name] = (scale.reshape(-1, shape[0] // 32),
+                                   quant.reshape(-1, shape[0] // 32, 32))
         else:
             raise ValueError(f"Unsupported GGUF type: {kind}")
         weights[name] = value.reshape(tuple(reversed(shape)))
@@ -90,8 +95,12 @@ def softmax(x):
 
 
 class Reference:
-    def __init__(self, path):
-        self.c, self.w, self.types, _ = read_gguf(path)
+    def __init__(self, path, backend="cpu"):
+        if backend not in ("cpu", "cuda"):
+            raise ValueError(f"Unknown reference backend: {backend}")
+        self.backend = backend
+        self.quantized = {}
+        self.c, self.w, self.types, _ = read_gguf(path, self.quantized)
         c = self.c
         self.position = 0
         self.states = []
@@ -106,20 +115,42 @@ class Reference:
                 self.states.append({"keys": [], "values": [], "raw": [], "pooled": []})
 
     def mm(self, name, x):
-        # Standard GGUF CPU matvec kernels convert activations to their dot type.
-        # Preserve that rounding without reusing any ggml implementation.
+        # Model the pinned backend's single-vector arithmetic independently.
+        # CUDA F16/BF16 matvecs with F32 accumulation keep F32 activations;
+        # CPU dot products convert them to the weight's floating-point type.
         kind = self.types[name]
         x = np.asarray(x, dtype=np.float32)
-        if kind == 1:
+        if kind == 1 and self.backend == "cpu":
             x = x.astype(np.float16).astype(np.float32)
-        elif kind == 30:
+        elif kind == 30 and self.backend == "cpu":
             x = bf16(x)
         elif kind in (2, 8):
             blocks = x.reshape(-1, 32)
-            scale = np.max(np.abs(blocks), axis=-1, keepdims=True) / 127
-            inv = np.divide(1, scale, out=np.zeros_like(scale), where=scale != 0)
-            quant = np.rint(blocks * inv).clip(-127, 127)
-            x = (quant * scale.astype(np.float16).astype(np.float32)).reshape(x.shape)
+            maximum = np.max(np.abs(blocks), axis=-1)
+            scale = maximum / 127
+            if self.backend == "cpu":
+                # AVX2 Q8_0 activation quantization: nearest-even, 127/max.
+                inv = np.divide(127, maximum, out=np.zeros_like(maximum), where=maximum != 0)
+                quant = np.rint(blocks * inv[:, None])
+            else:
+                # CUDA Q8_1 uses roundf(x/d), with halfway cases away from zero.
+                scaled = np.divide(blocks, scale[:, None], out=np.zeros_like(blocks),
+                                   where=scale[:, None] != 0)
+                magnitude = np.abs(scaled)
+                integral = np.floor(magnitude)
+                # Adding 0.5 in F32 can round a value just BELOW a tie upward.
+                quant = np.copysign(integral + (magnitude - integral >= 0.5), scaled)
+            scale = scale.astype(np.float16).astype(np.float32)
+            weight_scale, codes = self.quantized[name]
+            if kind == 2 and self.backend == "cuda":
+                # Q4_0 stores unsigned nibbles. CUDA subtracts their zero point
+                # using Q8_1's FP16 sum of ORIGINAL activations, not sum(q)*d.
+                # These differ even when no quantization tie is involved.
+                dot = np.einsum("obd,bd->ob", codes + 8, quant)
+                original_sum = blocks.sum(axis=-1).astype(np.float16).astype(np.float32)
+                return (weight_scale * (dot * scale - 8 * original_sum)).sum(axis=-1)
+            dot = np.einsum("obd,bd->ob", codes, quant)
+            return (weight_scale * scale * dot).sum(axis=-1)
         return self.w[name] @ x
 
     def norm(self, name, x):

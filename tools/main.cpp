@@ -48,9 +48,20 @@ int main(int argc, char ** argv) {
             }
             if (run == 0 && repeat > 1) initial_trace = trace;
             if (run > 0) {
-                for (size_t i = 0; i < trace.size(); ++i)
-                    if (trace[i].logits != initial_trace[i].logits)
-                        throw std::runtime_error("Reset/replay produced different logits");
+                if (trace.size() != initial_trace.size())
+                    throw std::runtime_error("Reset/replay produced a different trace length");
+                for (size_t i = 0; i < trace.size(); ++i) {
+                    const auto & step = trace[i];
+                    const auto & first = initial_trace[i];
+                    if (step.position != first.position || step.logits != first.logits)
+                        throw std::runtime_error("Reset/replay produced different positions or logits");
+                    if (step.selections.size() != first.selections.size())
+                        throw std::runtime_error("Reset/replay produced different QSA layer counts");
+                    for (size_t j = 0; j < step.selections.size(); ++j)
+                        if (step.selections[j].layer != first.selections[j].layer ||
+                            step.selections[j].tokens != first.selections[j].tokens)
+                            throw std::runtime_error("Reset/replay produced different QSA selections");
+                }
             }
         }
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();

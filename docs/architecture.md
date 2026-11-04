@@ -78,6 +78,14 @@ their native quantized matvecs. The BF16 index cache is the only stored matrix
 widened for scoring. BF16 is a storage format here, not a requirement for native
 BF16 GPU arithmetic.
 
+F32 accumulation does not make operand conversion identical across backends.
+CPU F16/BF16 dot products round activations to those types, whereas the CUDA
+single-vector paths retain F32 activations. CPU Q4/Q8 matvecs quantize activations
+to Q8_0; CUDA uses Q8_1, including an FP16 original-activation sum used in Q4_0's
+zero-point correction. The NumPy oracle models these paths separately, including
+integer block dot products. Low-precision CPU/CUDA logits and greedy sequences
+can therefore differ; see [the validation contract](validation.md).
+
 ## GGUF contract and API
 
 The architecture tag is `tidal-qwen4exp-dense`, schema `tidal.version = 1`.

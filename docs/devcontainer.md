@@ -82,6 +82,11 @@ build/dev-cuda/bin/tidal-cli --model models/dev-q4.gguf --backend cuda \
 CTest runs the CPU reference tests, even in a CUDA build. The separate Python
 command is the GPU numerical/placement check. The generator refuses to overwrite
 existing model files; reuse the generated file or choose a new filename on a repeat.
+Rebuild after updating tests: the numerical suite also uses `tidal-matvec-test`
+to verify the oracle against isolated backend operations. Add `--formats q4_0`
+to the Python command to focus on one format; multi-layer and invalid-input
+checks still run. See [the validation contract](validation.md) for test coverage
+and backend-specific precision rules.
 
 The preset uses Ninja and `RelWithDebInfo`, exports `compile_commands.json`, and
 enables ccache for C/C++/CUDA compilation. `GGML_CUDA_FA=OFF` skips unused GPU
