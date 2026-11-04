@@ -97,6 +97,14 @@ struct Statistics {
     double transfer_ms = 0;
 };
 
+struct ModelInfo {
+    uint64_t parameters = 0;
+    uint64_t stored_weight_bytes = 0;
+    uint64_t resident_weight_bytes = 0;
+    uint64_t weight_buffer_bytes = 0;
+    uint64_t converted_tensors = 0;
+};
+
 class Engine {
 public:
     explicit Engine(const std::string & path, Options options = {});
@@ -109,6 +117,7 @@ public:
     void reset();
     const Config & config() const;
     const Statistics & statistics() const;
+    const ModelInfo & model_info() const;
     std::string backend_name() const;
     std::string backend_description() const;
     // Changes instrumentation and clears events without resetting the sequence.

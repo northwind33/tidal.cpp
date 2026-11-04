@@ -77,6 +77,11 @@ inline void stats(std::ostream & out, const tidal::Statistics & s) {
         << ",\"graph_ms\":" << s.graph_ms << ",\"cpu_attention_ms\":" << s.attention_ms
         << ",\"transfer_ms\":" << s.transfer_ms << '}';
 }
+inline void model_info(std::ostream & out, const tidal::ModelInfo & m) {
+    out << "{\"parameters\":" << m.parameters << ",\"stored_weight_bytes\":" << m.stored_weight_bytes
+        << ",\"resident_weight_bytes\":" << m.resident_weight_bytes << ",\"weight_buffer_bytes\":" << m.weight_buffer_bytes
+        << ",\"converted_tensors\":" << m.converted_tensors << '}';
+}
 inline void event_args(std::ostream & out, const tidal::ProfileEvent & e) {
     out << "{\"phase\":"; string(out, e.phase);
     out << ",\"backend\":"; string(out, e.backend);

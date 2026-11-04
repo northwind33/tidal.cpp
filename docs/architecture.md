@@ -107,9 +107,8 @@ accumulation policy; pinned CUDA rejects forced-F32 accumulation on MUL_MAT_ID.
 
 | Tensor / operation | Precision |
 |---|---|
-| Token embeddings | BF16 |
-| PLE embedding tables | F32, F16, BF16, Q8_0 or Q4_0 (BF16 default in generator) |
-| Matrix weights | F32, F16, BF16, Q8_0 or Q4_0 |
+| Token/PLE embeddings | Any supported weight storage format (BF16 default) |
+| Matrix weights, including expert stacks | Any supported weight storage format |
 | Norm gamma, convolution weights, A-log and dt bias | F32 |
 | Graph activations, GDN recurrent/conv state, PLE conv state, raw index ring | F32 |
 | Compressed index cache, host main KV cache | BF16 |
@@ -122,9 +121,10 @@ scaled RMSNorm instead of ggml's different clamp-based L2 operation.
 
 Q/K/V tensors use F32 transfers in this prototype, then K/V are rounded to BF16 on
 the host. Model weights and GDN state never round-trip through host memory during
-decoding. Quantized matrices remain quantized in backend memory; ggml executes
-their native quantized matvecs. The BF16 index cache is the only stored matrix
-widened for scoring. BF16 is a storage format here, not a requirement for native
+decoding. Supported quantized matrices remain encoded in backend memory; ggml
+executes their native matvecs. Unsupported backend types are explicitly converted
+to F32 at load time, as described in [quantization support](quantization.md).
+The BF16 index cache is widened for scoring. BF16 is a storage format here, not a requirement for native
 BF16 GPU arithmetic.
 
 F32 accumulation does not make operand conversion identical across backends.

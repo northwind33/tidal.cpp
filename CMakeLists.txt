@@ -26,7 +26,7 @@ else()
     set(TIDAL_GGML_BUILD_SOURCE "${ggml_SOURCE_DIR}")
 endif()
 
-add_library(tidal src/model.cpp src/ple.cpp src/engine.cpp src/sparse_attention.cpp)
+add_library(tidal src/model.cpp src/quant.cpp src/ple.cpp src/engine.cpp src/sparse_attention.cpp)
 target_include_directories(tidal PUBLIC include PRIVATE src)
 target_link_libraries(tidal PUBLIC ggml ggml-cpu)
 if(TIDAL_CUDA)
@@ -76,6 +76,13 @@ target_compile_definitions(tidal-bench PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(tidal-weights-test tests/weights.cpp)
+    target_link_libraries(tidal-weights-test PRIVATE tidal)
+    target_include_directories(tidal-weights-test PRIVATE src)
+    if(TIDAL_CUDA)
+        target_link_libraries(tidal-weights-test PRIVATE ggml-cuda)
+        target_compile_definitions(tidal-weights-test PRIVATE TIDAL_CUDA=1)
+    endif()
     add_executable(tidal-state-test tests/state.cpp)
     target_link_libraries(tidal-state-test PRIVATE tidal)
     add_executable(tidal-matvec-test tests/matvec.cpp)
@@ -98,6 +105,9 @@ if(BUILD_TESTING)
         execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy"
             RESULT_VARIABLE TIDAL_NUMPY_STATUS OUTPUT_QUIET ERROR_QUIET)
         if(TIDAL_NUMPY_STATUS EQUAL 0)
+            add_test(NAME quantization COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_quant.py --bin-dir $<TARGET_FILE_DIR:tidal-cli>)
+            set_tests_properties(quantization PROPERTIES TIMEOUT 600)
             add_test(NAME moe-reference COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_moe.py --bin-dir $<TARGET_FILE_DIR:tidal-cli>)
             set_tests_properties(moe-reference PROPERTIES TIMEOUT 180)

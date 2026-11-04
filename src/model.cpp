@@ -1,7 +1,10 @@
 #include "internal.hpp"
+#include "ggml-cpu.h"
 
+#include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <iostream>
 #include <limits>
 
 namespace tidal {
@@ -180,43 +183,84 @@ Config read_config(const gguf_context * f) {
 Model::Model(const std::string & path, ggml_backend_t backend) {
     ggml_context * raw = nullptr;
     Gguf file(gguf_init_from_file(path.c_str(), {true, &raw}), gguf_free);
-    ctx.reset(raw);
-    if (!file || !ctx) throw std::runtime_error("Cannot read GGUF: " + path);
+    Context source(raw, ggml_free);
+    if (!file || !source) throw std::runtime_error("Cannot read GGUF: " + path);
     config = read_config(file.get());
     const auto specs = tensor_specs(config);
     if (gguf_get_n_tensors(file.get()) != int64_t(specs.size()))
         throw std::runtime_error("Unexpected number of model tensors");
-    for (const auto & spec : specs) {
-        auto * t = ggml_get_tensor(ctx.get(), spec.name.c_str());
-        if (!t || t->ne[0] != spec.columns || t->ne[1] != spec.rows || t->ne[2] != spec.slices || t->ne[3] != 1)
-            throw std::runtime_error("Missing or invalid tensor shape: " + spec.name);
-        const bool matrix = spec.kind == TensorSpec::Matrix || spec.kind == TensorSpec::Lookup || spec.kind == TensorSpec::Router;
-        const bool embedding = spec.kind == TensorSpec::Embedding;
-        const bool supported = t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 ||
-            t->type == GGML_TYPE_BF16 || t->type == GGML_TYPE_Q4_0 || t->type == GGML_TYPE_Q8_0;
-        if (!supported || (!matrix && !embedding && t->type != GGML_TYPE_F32) ||
-            (embedding && t->type != GGML_TYPE_BF16))
-            throw std::runtime_error("Unsupported tensor type: " + spec.name);
-        weights.emplace(spec.name, t);
-    }
-    buffer.reset(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
-    if (!buffer) throw std::runtime_error("Cannot allocate model weights");
-    ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     std::ifstream input(path, std::ios::binary);
     input.seekg(0, std::ios::end);
     const auto length = input.tellg();
     if (length < 0) throw std::runtime_error("Cannot determine model file length");
-    for (const auto & [name, tensor] : weights) {
-        const auto id = gguf_find_tensor(file.get(), name.c_str());
+    ctx.reset(ggml_init({specs.size() * ggml_tensor_overhead() + 4096, nullptr, true}));
+    if (!ctx) throw std::runtime_error("Cannot allocate weight metadata");
+    for (const auto & spec : specs) {
+        auto * t = ggml_get_tensor(source.get(), spec.name.c_str());
+        if (!t || t->ne[0] != spec.columns || t->ne[1] != spec.rows || t->ne[2] != spec.slices || t->ne[3] != 1)
+            throw std::runtime_error("Missing or invalid tensor shape: " + spec.name);
+        if (!storage_type(t->type))
+            throw std::runtime_error("Unsupported tensor type: " + spec.name);
+        const auto id = gguf_find_tensor(file.get(), spec.name.c_str());
         const uint64_t offset = gguf_get_data_offset(file.get()) + gguf_get_tensor_offset(file.get(), id);
-        const auto size = ggml_nbytes(tensor);
-        if (offset > uint64_t(length) || size > uint64_t(length) - offset)
-            throw std::runtime_error("Truncated GGUF tensor: " + name);
-        std::vector<char> data(size);
+        if (offset > uint64_t(length) || ggml_nbytes(t) > uint64_t(length) - offset)
+            throw std::runtime_error("Truncated GGUF tensor: " + spec.name);
+        auto type = t->type;
+        const bool lookup = spec.kind == TensorSpec::Lookup || spec.kind == TensorSpec::Embedding;
+        const bool matrix = spec.kind == TensorSpec::Matrix || spec.kind == TensorSpec::Router;
+        if (!matrix && !lookup) type = GGML_TYPE_F32;
+        else {
+            Context probe(ggml_init({65536, nullptr, true}), ggml_free);
+            if (!probe) throw std::runtime_error("Cannot allocate backend probe");
+            auto * x = ggml_new_tensor_1d(probe.get(), lookup ? GGML_TYPE_I32 : GGML_TYPE_F32,
+                                           lookup ? 1 : spec.columns);
+            auto * op = lookup ? ggml_get_rows(probe.get(), t, x) : spec.slices > 1
+                ? ggml_mul_mat_id(probe.get(), t, x, ggml_new_tensor_2d(probe.get(), GGML_TYPE_I32, 1, 1))
+                : ggml_mul_mat(probe.get(), t, x);
+            if (matrix && spec.slices == 1) ggml_prec_set_acc(op, GGML_PREC_F32);
+            const bool cpu_dot = !matrix || !ggml_backend_is_cpu(backend) || ggml_get_type_traits_cpu(type)->vec_dot;
+            if (!cpu_dot || !ggml_backend_supports_op(backend, op)) type = GGML_TYPE_F32;
+        }
+        auto * tensor = ggml_new_tensor_3d(ctx.get(), type, spec.columns, spec.rows, spec.slices);
+        ggml_set_name(tensor, spec.name.c_str());
+        weights.emplace(spec.name, tensor);
+        info.parameters += uint64_t(ggml_nelements(t));
+        info.stored_weight_bytes += ggml_nbytes(t);
+        info.resident_weight_bytes += ggml_nbytes(tensor);
+        if (type != t->type) {
+            ++info.converted_tensors;
+            std::cerr << "weight conversion: " << spec.name << ' ' << ggml_type_name(t->type)
+                      << " -> " << ggml_type_name(type) << " on " << ggml_backend_name(backend) << '\n';
+        }
+    }
+    buffer.reset(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+    if (!buffer) throw std::runtime_error("Cannot allocate model weights");
+    info.weight_buffer_bytes = ggml_backend_buffer_get_size(buffer.get());
+    ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    // Read in file order with bounded staging memory, including converted tensors.
+    for (int64_t id = 0; id < gguf_get_n_tensors(file.get()); ++id) {
+        const std::string name = gguf_get_tensor_name(file.get(), id);
+        auto * tensor = weights.at(name);
+        auto * encoded = ggml_get_tensor(source.get(), name.c_str());
+        const uint64_t offset = gguf_get_data_offset(file.get()) + gguf_get_tensor_offset(file.get(), id);
+        const size_t row_bytes = ggml_row_size(encoded->type, encoded->ne[0]);
+        const int64_t rows = ggml_nelements(encoded) / encoded->ne[0];
+        const int64_t chunk_rows = std::max<int64_t>(1, (8 * 1024 * 1024) / (encoded->ne[0] * sizeof(float)));
+        std::vector<char> data(size_t(std::min(rows, chunk_rows)) * row_bytes);
+        std::vector<float> converted(encoded->type == tensor->type ? 0 : size_t(std::min(rows, chunk_rows) * encoded->ne[0]));
         input.seekg(std::streamoff(offset));
-        input.read(data.data(), std::streamsize(size));
-        if (!input) throw std::runtime_error("Failed to read tensor: " + name);
-        ggml_backend_tensor_set(tensor, data.data(), 0, size);
+        for (int64_t row = 0; row < rows; row += chunk_rows) {
+            const int64_t count = std::min(chunk_rows, rows - row);
+            const size_t bytes = size_t(count) * row_bytes;
+            input.read(data.data(), std::streamsize(bytes));
+            if (!input) throw std::runtime_error("Failed to read tensor: " + name);
+            if (converted.empty()) ggml_backend_tensor_set(tensor, data.data(), size_t(row) * row_bytes, bytes);
+            else {
+                dequantize(encoded->type, data.data(), converted.data(), count * encoded->ne[0]);
+                ggml_backend_tensor_set(tensor, converted.data(), size_t(row * encoded->ne[0]) * sizeof(float),
+                                          size_t(count * encoded->ne[0]) * sizeof(float));
+            }
+        }
     }
 }
 } // namespace tidal

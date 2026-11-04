@@ -11,6 +11,7 @@ cmake --build --preset dev-cuda
 ctest --preset dev-cuda
 python3 tests/test_reference.py --bin-dir build/dev-cuda/bin --backend cuda
 python3 tests/test_moe.py --bin-dir build/dev-cuda/bin --backend cuda
+python3 tests/test_quant.py --bin-dir build/dev-cuda/bin --backend cuda
 ```
 
 CTest's numerical reference suite uses CPU execution, including in a CUDA build.

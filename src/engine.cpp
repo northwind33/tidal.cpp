@@ -529,6 +529,7 @@ std::vector<Step> Engine::prefill(const std::vector<int32_t> & tokens) {
 void Engine::reset() { impl_->reset(); }
 const Config & Engine::config() const { return impl_->c; }
 const Statistics & Engine::statistics() const { return impl_->stats; }
+const ModelInfo & Engine::model_info() const { return impl_->model.info; }
 std::string Engine::backend_name() const { return ggml_backend_name(impl_->backend.get()); }
 std::string Engine::backend_description() const {
     return ggml_backend_dev_description(ggml_backend_get_device(impl_->backend.get()));

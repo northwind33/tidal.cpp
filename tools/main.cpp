@@ -1,5 +1,6 @@
 #include "tidal/tidal.hpp"
 #include "args.hpp"
+#include "report.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -66,6 +67,7 @@ int main(int argc, char ** argv) {
         }
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         const auto & s = engine.statistics();
+        std::cout << "model="; report::model_info(std::cout, engine.model_info()); std::cout << '\n';
         std::cout << "backend=" << engine.backend_name() << "; sparse_attention=CPU; KV=BF16; "
                   << "tokens=" << trace.size() << "; repeats=" << repeat << '\n';
         std::cout << "generated="; array(std::cout, generated); std::cout << '\n';
@@ -79,6 +81,7 @@ int main(int argc, char ** argv) {
             out << std::setprecision(9) << "{\"backend\":\"" << engine.backend_name()
                 << "\",\"sparse_attention_backend\":\"CPU\",\"kv_type\":\"BF16\",\"generated\":";
             array(out, generated);
+            out << ",\"model\":"; report::model_info(out, engine.model_info());
             out << ",\"statistics\":{\"backend_graph_nodes\":" << s.device_graph_nodes
                 << ",\"sparse_attention_calls\":" << s.sparse_attention_calls
                 << ",\"device_to_host_bytes\":" << s.device_to_host_bytes

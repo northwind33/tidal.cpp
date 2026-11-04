@@ -217,6 +217,7 @@ int main(int argc, char ** argv) {
         out << ",\"ggml_revision\":"; report::string(out, TIDAL_GGML_REVISION); out << '}'
             << ",\"model\":{\"path\":"; report::string(out, path);
         out << ",\"size_bytes\":" << std::filesystem::file_size(path) << ",\"fnv1a64\":"; report::string(out, fingerprint);
+        out << ",\"weights\":"; report::model_info(out, engine.model_info());
         out << ",\"config\":"; report::config(out, engine.config()); out << '}'
             << ",\"workload\":{\"prompt\":"; report::array(out, prompt);
         out << ",\"steps\":" << steps << ",\"warmup\":" << warmup << ",\"repetitions\":" << repetitions << '}'

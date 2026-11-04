@@ -1,6 +1,7 @@
 /build*/
 /models/
 *.gguf
+*.gguf.partial
 __pycache__/
 *.pyc
 /CMakeUserPresets.json

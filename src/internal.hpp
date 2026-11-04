@@ -27,6 +27,10 @@ struct TensorSpec {
     int64_t slices = 1;
 };
 std::vector<TensorSpec> tensor_specs(const Config & c);
+bool storage_type(ggml_type type);
+std::vector<ggml_type> storage_types();
+ggml_type parse_storage_type(const std::string & name);
+void dequantize(ggml_type type, const void * data, float * values, int64_t count);
 void write_config(gguf_context * file, const Config & config);
 Config read_config(const gguf_context * file);
 void validate_ple(const Config & config);
@@ -38,6 +42,7 @@ std::vector<int32_t> ple_rows(const PLEConfig & config, const PLELayer & layer,
 
 struct Model {
     Config config;
+    ModelInfo info;
     Context ctx{nullptr, ggml_free};
     Buffer buffer{nullptr, ggml_backend_buffer_free};
     std::map<std::string, ggml_tensor *> weights;

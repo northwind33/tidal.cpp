@@ -57,9 +57,12 @@ not require native BF16 tensor cores.
 
 ## Generate and run
 
-The generator writes a complete GGUF directly, with the same seeded source tensors
-for every weight type. Embeddings stay BF16; normalization, convolution and decay
-parameters stay F32. Matrix formats: **F32, F16, BF16, Q8_0 and Q4_0**.
+The generator streams a complete GGUF directly, with the same seeded source tensors
+for every weight type. Embeddings default to BF16; normalization, convolution and
+decay parameters default to F32. All **25 ggml weight quantization formats** plus
+F32/F16/BF16 are accepted, including K-quants, IQ, TQ, MXFP4/NVFP4 and Q1_0/Q2_0.
+Use `tidal-dummy --list-types 1` for the pinned version's exact list and block sizes.
+`--preset quant-test` provides dimensions aligned for all these formats.
 
 ```sh
 mkdir -p models
@@ -101,6 +104,26 @@ The CLI reports the backend, CPU attention calls, synchronized graph/transfer ti
 and bytes. JSON contains every step's logits and selected token IDs. `--repeat 2`
 resets and replays the same sequence to check deterministic state reset. Timing is
 diagnostic; graph allocation and thread creation are intentionally unoptimized.
+
+For per-tensor mixed quantization, pass `--tensor-types rules.txt`. Each line is
+`tensor_glob=type`, with `*`/`?` wildcards, comments beginning with `#`, and the last
+matching rule taking precedence. Unmatched rules and incompatible block widths
+are errors. For example:
+
+```text
+*.ffn.*=q5_K
+*.attn.*=q6_K
+*.attn.*_norm=f32
+token_embd.weight=q8_0
+output.weight=q6_K
+```
+
+This provides mixed storage within one GGUF; it does not reproduce Unsloth's
+calibration or sensitivity-based format selection. IQ formats requiring an imatrix
+receive uniform importance weights in the **synthetic dummy generator**.
+`--dry-run 1` reports parameter count, encoded bytes and effective bpw without
+writing; `--chunk-mib 16 --threads 4` controls streaming generation.
+See [format support and conversion](docs/quantization.md) for backend behavior.
 
 ## Benchmark and profile
 

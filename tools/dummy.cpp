@@ -1,5 +1,6 @@
 #include "internal.hpp"
 #include "args.hpp"
+#include "weight_writer.hpp"
 
 #include <cmath>
 #include <cstring>
@@ -78,30 +79,46 @@ int main(int argc, char ** argv) {
     try {
         Args args(argc, argv, {"--help", "--output", "--type", "--seed", "--context", "--layers", "--hidden",
             "--ple-layers", "--ple-ngram", "--ple-heads", "--ple-dim", "--ple-conv", "--ple-eos",
-            "--ple-vocab-base", "--ple-type", "--experts", "--experts-used", "--expert-ffn", "--shared-ffn", "--norm-topk"});
+            "--ple-vocab-base", "--ple-type", "--experts", "--experts-used", "--expert-ffn", "--shared-ffn", "--norm-topk",
+            "--list-types", "--tensor-types", "--dry-run", "--threads", "--chunk-mib", "--preset", "--rank"});
         if (!args.get("--help").empty()) {
-            std::cout << "tidal-dummy --output model.gguf [--type f32|f16|bf16|q8_0|q4_0] "
+            std::cout << "tidal-dummy --output model.gguf [--type FORMAT] "
                          "[--seed 42] [--context 256] [--layers 4] [--hidden 128]\n"
                          "  Optional PLE: --ple-layers 0,2 (zero-based GDN layers)\n"
                          "  [--ple-ngram 3] [--ple-heads 2] [--ple-dim 128] [--ple-conv 4]\n"
                          "  [--ple-eos 0] [--ple-vocab-base 17] [--ple-type bf16]\n";
             std::cout << "  Optional MoE: --experts 4 [--experts-used 2] [--expert-ffn 128] [--shared-ffn 128] [--norm-topk 1]\n";
+            std::cout << "  --list-types 1 | --preset quant-test | --tensor-types rules.txt (glob=type, last match wins)\n"
+                         "  --dry-run 1 plans without writing; --chunk-mib 16 --threads 4 bound generation memory\n";
+            return 0;
+        }
+        if (args.integer("--list-types", 0)) {
+            for (auto type : tidal::storage_types())
+                std::cout << ggml_type_name(type) << " block=" << ggml_blck_size(type)
+                          << " bpw=" << 8.0 * double(ggml_type_size(type)) / double(ggml_blck_size(type))
+                          << " requires_imatrix=" << ggml_quantize_requires_imatrix(type) << '\n';
             return 0;
         }
         const auto path = args.get("--output");
-        if (path.empty()) throw std::invalid_argument("--output is required");
-        if (std::filesystem::exists(path)) throw std::invalid_argument("Refusing to overwrite an existing model: " + path);
+        const int dry = args.integer("--dry-run", 0);
+        const int threads = args.integer("--threads", 4), chunk_mib = args.integer("--chunk-mib", 16);
+        if (dry < 0 || dry > 1 || threads < 1 || threads > 64 || chunk_mib < 1 || chunk_mib > 256)
+            throw std::invalid_argument("Invalid dry-run, thread count or chunk size");
+        if (!dry && path.empty()) throw std::invalid_argument("--output is required");
+        if (!dry && std::filesystem::exists(path)) throw std::invalid_argument("Refusing to overwrite an existing model: " + path);
         const auto name = args.get("--type", "f32");
-        const std::map<std::string, ggml_type> types = {{"f32", GGML_TYPE_F32}, {"f16", GGML_TYPE_F16},
-            {"bf16", GGML_TYPE_BF16}, {"q8_0", GGML_TYPE_Q8_0}, {"q4_0", GGML_TYPE_Q4_0}};
-        if (!types.contains(name)) throw std::invalid_argument("Unsupported weight type: " + name);
+        const auto type = tidal::parse_storage_type(name);
         const int seed = args.integer("--seed", 42);
         if (seed <= 0) throw std::invalid_argument("Seed must be a positive 32-bit integer");
         Random rng{uint32_t(seed)};
         tidal::Config config;
+        const auto preset = args.get("--preset", "tiny");
+        if (preset == "quant-test") { config.hidden = 256; config.rank = 256; config.gdn_dim = 64; config.head_dim = 64; }
+        else if (preset != "tiny") throw std::invalid_argument("Unknown model preset: " + preset);
         config.context = args.integer("--context", config.context);
         config.layers = args.integer("--layers", config.layers);
         config.hidden = args.integer("--hidden", config.hidden);
+        config.rank = args.integer("--rank", config.rank);
         if (config.hidden <= 0 || config.hidden > 1024) throw std::invalid_argument("hidden must be in [32, 1024]");
         config.ffn = 2 * config.hidden;
         config.experts = args.integer("--experts", 0);
@@ -113,8 +130,7 @@ int main(int argc, char ** argv) {
         config.norm_topk = bool(norm_topk);
         config.validate();
         configure_ple(config, args, seed);
-        const auto ple_type = args.get("--ple-type", "bf16");
-        if (!types.contains(ple_type)) throw std::invalid_argument("Unsupported PLE embedding type");
+        const auto ple_type = tidal::parse_storage_type(args.get("--ple-type", "bf16"));
         tidal::Context ctx(ggml_init({1024 * 1024, nullptr, true}), ggml_free);
         tidal::Gguf file(gguf_init_empty(), gguf_free);
         if (!ctx || !file) throw std::runtime_error("Cannot allocate GGUF writer");
@@ -124,19 +140,13 @@ int main(int argc, char ** argv) {
         gguf_set_val_str(file.get(), "general.description", config.experts ? "Random synthetic Qwen-derived MoE; not trained, no tokenizer/MTP" : config.ple.layers.empty()
             ? "Random tiny Dense derivative; not trained, no tokenizer, no MoE/PLE/MTP"
             : "Random tiny Dense derivative with PLE; not trained, no tokenizer, no MoE/MTP");
-        std::vector<std::vector<uint8_t>> storage;
-        size_t parameters = 0, bytes = 0;
-        for (const auto & spec : tidal::tensor_specs(config)) {
-            ggml_type type = GGML_TYPE_F32;
-            if (spec.kind == tidal::TensorSpec::Matrix) type = types.at(name);
-            if (spec.kind == tidal::TensorSpec::Embedding) type = GGML_TYPE_BF16;
-            if (spec.kind == tidal::TensorSpec::Lookup) type = types.at(ple_type);
-            if (spec.columns % ggml_blck_size(type)) throw std::runtime_error("Tensor width is not quantization aligned");
-            auto * tensor = ggml_new_tensor_3d(ctx.get(), type, spec.columns, spec.rows, spec.slices);
-            ggml_set_name(tensor, spec.name.c_str());
-            const auto count = size_t(spec.columns * spec.rows * spec.slices);
-            std::vector<float> source(count);
-            for (float & value : source) {
+        auto rules = read_type_rules(args.get("--tensor-types"));
+        const auto plan = plan_weights(config, ctx.get(), file.get(), type, ple_type, rules);
+        if (dry) return 0;
+        write_weights(path, file.get(), plan, chunk_mib, threads, [&](const tidal::TensorSpec & spec, float * data, int64_t count) {
+            const float scale = std::sqrt(3.0f / float(spec.columns));
+            for (int64_t i = 0; i < count; ++i) {
+                float & value = data[i];
                 float r = 2 * rng.uniform() - 1;
                 switch (spec.kind) {
                     case tidal::TensorSpec::Norm: value = 1 + 0.05f * r; break; // already folded (1+w)
@@ -145,19 +155,10 @@ int main(int argc, char ** argv) {
                     case tidal::TensorSpec::Bias: value = -1.0f + 0.2f * r; break;
                     case tidal::TensorSpec::Embedding:
                     case tidal::TensorSpec::Lookup: value = 0.1f * r; break;
-                    default: value = r * std::sqrt(3.0f / float(spec.columns)); break;
+                    default: value = r * scale; break;
                 }
             }
-            storage.emplace_back(ggml_nbytes(tensor));
-            auto & encoded = storage.back();
-            const auto written = ggml_quantize_chunk(type, source.data(), encoded.data(), 0, spec.rows * spec.slices, spec.columns, nullptr);
-            if (written != encoded.size()) throw std::runtime_error("Unexpected quantized tensor length");
-            tensor->data = encoded.data();
-            gguf_add_tensor(file.get(), tensor);
-            bytes += encoded.size(); parameters += count;
-        }
-        if (!gguf_write_to_file(file.get(), path.c_str(), false)) throw std::runtime_error("Failed to write " + path);
-        std::cout << path << ": " << parameters << " parameters, " << bytes << " tensor bytes, " << name << " matrices\n";
+        });
         return 0;
     } catch (const std::exception & e) { std::cerr << "tidal-dummy: " << e.what() << '\n'; return 1; }
 }
