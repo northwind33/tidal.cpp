@@ -44,6 +44,11 @@ void Config::validate() const {
         throw std::invalid_argument("Unsupported layer/head/rotary/quantization dimensions");
     if (!std::isfinite(eps) || eps <= 0 || !std::isfinite(rope_base) || rope_base <= 1)
         throw std::invalid_argument("Invalid RMS epsilon or RoPE base");
+    if (experts < 0 || experts > 256 || experts_used < 0 || expert_ffn < 0 || shared_ffn < 0 ||
+        (experts == 0 && (experts_used || expert_ffn || shared_ffn)) ||
+        (experts && (experts_used < 1 || experts_used > experts || expert_ffn < 32 ||
+                     expert_ffn > 65536 || shared_ffn > 65536 || expert_ffn % 32 || shared_ffn % 32)))
+        throw std::invalid_argument("Invalid MoE expert count, top-k or FFN dimensions");
     validate_ple(*this);
 }
 
@@ -66,9 +71,24 @@ std::vector<TensorSpec> tensor_specs(const Config & c) {
         const std::string p = "blk." + std::to_string(layer) + ".";
         hc(p + "hc_attn", true);
         hc(p + "hc_ffn", true);
-        add(p + "ffn.gate", c.hidden, c.ffn);
-        add(p + "ffn.up", c.hidden, c.ffn);
-        add(p + "ffn.down", c.ffn, c.hidden);
+        if (!c.experts) {
+            add(p + "ffn.gate", c.hidden, c.ffn);
+            add(p + "ffn.up", c.hidden, c.ffn);
+            add(p + "ffn.down", c.ffn, c.hidden);
+        } else {
+            add(p + "ffn.router", c.hidden, c.experts, TensorSpec::Router);
+            for (auto name : {"gate_exps", "up_exps", "down_exps"}) {
+                const bool down = std::string(name) == "down_exps";
+                add(p + "ffn." + name, down ? c.expert_ffn : c.hidden, down ? c.hidden : c.expert_ffn);
+                specs.back().slices = c.experts;
+            }
+            if (c.shared_ffn) {
+                add(p + "ffn.shared.gate", c.hidden, c.shared_ffn);
+                add(p + "ffn.shared.up", c.hidden, c.shared_ffn);
+                add(p + "ffn.shared.down", c.shared_ffn, c.hidden);
+                add(p + "ffn.shared_gate", c.hidden, 1, TensorSpec::Router);
+            }
+        }
         if ((layer + 1) % 4) {
             int k = c.gdn_key_heads * c.gdn_dim, v = c.gdn_value_heads * c.gdn_dim;
             add(p + "gdn.qkv", c.hidden, 2 * k + v);
@@ -108,18 +128,26 @@ std::vector<TensorSpec> tensor_specs(const Config & c) {
 
 void write_config(gguf_context * f, const Config & c) {
     c.validate();
-    gguf_set_val_str(f, "general.architecture", architecture);
+    gguf_set_val_str(f, "general.architecture", c.experts ? moe_architecture : architecture);
     gguf_set_val_u32(f, "tidal.version", format_version);
     for (auto field : fields)
         gguf_set_val_u32(f, (std::string("tidal.") + field.name).c_str(), c.*(field.value));
     gguf_set_val_f32(f, "tidal.eps", c.eps);
     gguf_set_val_f32(f, "tidal.rope_base", c.rope_base);
+    if (c.experts) {
+        gguf_set_val_u32(f, "tidal.experts", c.experts);
+        gguf_set_val_u32(f, "tidal.experts_used", c.experts_used);
+        gguf_set_val_u32(f, "tidal.expert_ffn", c.expert_ffn);
+        gguf_set_val_u32(f, "tidal.shared_ffn", c.shared_ffn);
+        gguf_set_val_bool(f, "tidal.norm_topk", c.norm_topk);
+    }
     write_ple(f, c.ple);
 }
 
 Config read_config(const gguf_context * f) {
-    if (std::string(gguf_get_val_str(f, key(f, "general.architecture", GGUF_TYPE_STRING))) != architecture)
-        throw std::runtime_error("Expected tidal-qwen4exp-dense; production Qwen checkpoints are not supported");
+    const std::string arch = gguf_get_val_str(f, key(f, "general.architecture", GGUF_TYPE_STRING));
+    if (arch != architecture && arch != moe_architecture)
+        throw std::runtime_error("Expected tidal-qwen4exp-dense or tidal-qwen4exp-moe; convert external checkpoints first");
     if (gguf_get_val_u32(f, key(f, "tidal.version", GGUF_TYPE_UINT32)) != format_version)
         throw std::runtime_error("Unsupported tidal GGUF schema version");
     Config c;
@@ -130,6 +158,20 @@ Config read_config(const gguf_context * f) {
     }
     c.eps = gguf_get_val_f32(f, key(f, "tidal.eps", GGUF_TYPE_FLOAT32));
     c.rope_base = gguf_get_val_f32(f, key(f, "tidal.rope_base", GGUF_TYPE_FLOAT32));
+    const IntField moe_fields[] = {{"experts", &Config::experts}, {"experts_used", &Config::experts_used},
+                                  {"expert_ffn", &Config::expert_ffn}, {"shared_ffn", &Config::shared_ffn}};
+    for (auto field : moe_fields) {
+        const auto name = std::string("tidal.") + field.name;
+        if (arch == moe_architecture) {
+            auto value = gguf_get_val_u32(f, key(f, name, GGUF_TYPE_UINT32));
+            if (value > uint32_t(INT32_MAX)) throw std::runtime_error("MoE metadata overflow");
+            c.*(field.value) = int(value);
+        } else if (gguf_find_key(f, name.c_str()) >= 0) throw std::runtime_error("MoE metadata in Dense architecture");
+    }
+    if (arch == moe_architecture) {
+        c.norm_topk = gguf_get_val_bool(f, key(f, "tidal.norm_topk", GGUF_TYPE_BOOL));
+        if (!c.experts) throw std::runtime_error("MoE model must have experts");
+    } else if (gguf_find_key(f, "tidal.norm_topk") >= 0) throw std::runtime_error("MoE metadata in Dense architecture");
     read_ple(f, c);
     c.validate();
     return c;
@@ -146,9 +188,9 @@ Model::Model(const std::string & path, ggml_backend_t backend) {
         throw std::runtime_error("Unexpected number of model tensors");
     for (const auto & spec : specs) {
         auto * t = ggml_get_tensor(ctx.get(), spec.name.c_str());
-        if (!t || t->ne[0] != spec.columns || t->ne[1] != spec.rows || t->ne[2] != 1 || t->ne[3] != 1)
+        if (!t || t->ne[0] != spec.columns || t->ne[1] != spec.rows || t->ne[2] != spec.slices || t->ne[3] != 1)
             throw std::runtime_error("Missing or invalid tensor shape: " + spec.name);
-        const bool matrix = spec.kind == TensorSpec::Matrix || spec.kind == TensorSpec::Lookup;
+        const bool matrix = spec.kind == TensorSpec::Matrix || spec.kind == TensorSpec::Lookup || spec.kind == TensorSpec::Router;
         const bool embedding = spec.kind == TensorSpec::Embedding;
         const bool supported = t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 ||
             t->type == GGML_TYPE_BF16 || t->type == GGML_TYPE_Q4_0 || t->type == GGML_TYPE_Q8_0;

@@ -7,7 +7,8 @@ with GPU Gated DeltaNet and QSA indexing, and CPU sparse attention over a BF16 K
 This is an initial correctness milestone, not a trained language model or a loader
 for the released MoE checkpoint. Token IDs are synthetic; generated IDs have no
 linguistic meaning. Optional PLE follows the original n-gram embedding, gating and
-dilated convolution equations. MoE routing, vision, MTP and batched prefill are outside this
+dilated convolution equations. Optional MoE implements top-k routing, sparse
+SwiGLU experts and a gated shared expert. Vision, MTP and batched prefill are outside this
 version. Prompt ingestion uses the same one-token state transitions as decoding.
 
 | Work / storage | `--backend cuda` | `--backend cpu` |
@@ -17,6 +18,7 @@ version. Prompt ingestion uses the same one-token state transitions as decoding.
 | PLE embedding table, lookup, projections, gates, dilated convolution and state | GPU | CPU |
 | PLE n-gram hashing and recent token IDs | CPU | CPU |
 | Gated Residual, Q/K/V projections, RoPE, Dense FFN, output head | GPU | CPU |
+| MoE routing, selected experts and gated shared expert | GPU | CPU |
 | QSA raw-key pooling, compressed BF16 index cache, scores and top-k | GPU | CPU |
 | Main BF16 KV cache, selected QK, stable softmax, weighted V | **CPU** | CPU |
 
@@ -90,8 +92,10 @@ PLE tables default to BF16; `--ple-type` selects any supported matrix format.
 `--ple-ngram`, `--ple-heads`, `--ple-dim`, `--ple-conv`, `--ple-eos` and
 `--ple-vocab-base` control synthetic PLE dimensions. Small prime vocabulary ranges
 keep fixtures manageable. Older PLE-free GGUFs retain their behavior. This extends
-the `tidal-qwen4exp-dense` contract; released `qwen4exp` MoE GGUFs still require a
-checkpoint loader/converter and the remaining architecture components.
+the `tidal-qwen4exp-dense` contract. `--experts 4 --experts-used 2` instead writes
+`tidal-qwen4exp-moe`; `--expert-ffn`, `--shared-ffn` (0 disables the shared expert)
+and `--norm-topk 0|1` configure the experts. Released `qwen4exp` GGUFs still require
+a converter into the engine's tensor and metadata contract.
 
 The CLI reports the backend, CPU attention calls, synchronized graph/transfer times
 and bytes. JSON contains every step's logits and selected token IDs. `--repeat 2`

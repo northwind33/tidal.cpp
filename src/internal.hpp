@@ -11,6 +11,7 @@
 
 namespace tidal {
 constexpr const char * architecture = "tidal-qwen4exp-dense";
+constexpr const char * moe_architecture = "tidal-qwen4exp-moe";
 constexpr uint32_t format_version = 1;
 
 using Context = std::unique_ptr<ggml_context, decltype(&ggml_free)>;
@@ -22,7 +23,8 @@ struct TensorSpec {
     std::string name;
     int64_t columns;
     int64_t rows;
-    enum Kind { Matrix, Norm, Conv, ALog, Bias, Embedding, Lookup } kind;
+    enum Kind { Matrix, Norm, Conv, ALog, Bias, Embedding, Lookup, Router } kind;
+    int64_t slices = 1;
 };
 std::vector<TensorSpec> tensor_specs(const Config & c);
 void write_config(gguf_context * file, const Config & config);

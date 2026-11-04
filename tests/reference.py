@@ -122,15 +122,15 @@ class Reference:
                 history = (c["ple.conv_kernel"] - 1) * c["ple.ngram_size"]
                 self.states[-1]["ple_conv"] = np.zeros((history, c["branches"], c["hidden"]), dtype=np.float32)
 
-    def mm(self, name, x):
+    def mm(self, name, x, expert=None):
         # Model the pinned backend's single-vector arithmetic independently.
         # CUDA F16/BF16 matvecs with F32 accumulation keep F32 activations;
         # CPU dot products convert them to the weight's floating-point type.
         kind = self.types[name]
         x = np.asarray(x, dtype=np.float32)
-        if kind == 1 and self.backend == "cpu":
+        if kind == 1 and (self.backend == "cpu" or expert is not None):
             x = x.astype(np.float16).astype(np.float32)
-        elif kind == 30 and self.backend == "cpu":
+        elif kind == 30 and (self.backend == "cpu" or expert is not None):
             x = bf16(x)
         elif kind in (2, 8):
             blocks = x.reshape(-1, 32)
@@ -153,6 +153,10 @@ class Reference:
                 quant = np.copysign(integral + (magnitude - integral >= 0.5), scaled)
             scale = scale.astype(np.float16).astype(np.float32)
             weight_scale, codes = self.quantized[name]
+            if expert is not None:
+                rows = self.w[name].shape[1]
+                weight_scale = weight_scale[expert * rows:(expert + 1) * rows]
+                codes = codes[expert * rows:(expert + 1) * rows]
             if kind == 2 and self.backend == "cuda":
                 # Q4_0 stores unsigned nibbles. CUDA subtracts their zero point
                 # using Q8_1's FP16 sum of ORIGINAL activations, not sum(q)*d.
@@ -162,7 +166,7 @@ class Reference:
                 return (weight_scale * (dot * scale - 8 * original_sum)).sum(axis=-1)
             dot = np.einsum("obd,bd->ob", codes, quant)
             return (weight_scale * scale * dot).sum(axis=-1)
-        return self.w[name] @ x
+        return (self.w[name] if expert is None else self.w[name][expert]) @ x
 
     def norm(self, name, x):
         return x / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + self.c["eps"]) * self.w[name]
@@ -186,7 +190,22 @@ class Reference:
 
     def ffn(self, prefix, h):
         x, injection = self.mix(prefix + "hc_ffn", h)
-        output = self.mm(prefix + "ffn.down", silu(self.mm(prefix + "ffn.gate", x)) * self.mm(prefix + "ffn.up", x))
+        p = prefix + "ffn."
+        if self.c.get("experts", 0):
+            probabilities = softmax(self.mm(p + "router", x))
+            ids = np.argsort(-probabilities, kind="stable")[:self.c["experts_used"]]
+            scores = probabilities[ids]
+            if self.c["norm_topk"]:
+                scores = scores / scores.sum()
+            output = np.zeros(self.c["hidden"], dtype=np.float32)
+            for expert, score in zip(ids, scores):
+                active = silu(self.mm(p + "gate_exps", x, expert)) * self.mm(p + "up_exps", x, expert)
+                output += score * self.mm(p + "down_exps", active, expert)
+            if self.c["shared_ffn"]:
+                shared = self.mm(p + "shared.down", silu(self.mm(p + "shared.gate", x)) * self.mm(p + "shared.up", x))
+                output += sigmoid(self.mm(p + "shared_gate", x)) * shared
+        else:
+            output = self.mm(p + "down", silu(self.mm(p + "gate", x)) * self.mm(p + "up", x))
         return h + injection[:, None] * output
 
     def gdn(self, p, x, state):

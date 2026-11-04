@@ -6,7 +6,7 @@ The user's Qwen3-Flash-Next refers here to Qwen3.8-Flash-Next, exposed as
 `qwen4_exp` in Transformers and `qwen4exp` in llama.cpp. The released model is MoE;
 this fixture follows the earlier Dense-engine plan. It retains the decoder's
 GDN/QSA rhythm, Gated Residual reads/writes, Q/K normalization, partial NeoX RoPE,
-gated attention output and SwiGLU. MoE is replaced by a Dense SwiGLU. PLE is optional;
+gated attention output and SwiGLU. The FFN can be Dense or MoE. PLE is optional;
 vision and MTP are disabled. There is no tokenizer or claim of released-checkpoint compatibility.
 
 Sources inspected on 2026-11-04:
@@ -84,6 +84,24 @@ clears all of them. Kernel size 1 has no convolution history.
 
 Profiling exposes a `ple` phase/layer, host `ngram_hash`, embedding `lookup`, key/value
 projections, grouped norms, gate, individual convolution taps and SiLU nodes.
+
+## Mixture of experts
+
+With `tidal-qwen4exp-moe`, every FFN uses the reference's softmax router, top-k
+experts, optional normalization of selected probabilities and sigmoid-gated
+shared SwiGLU expert. Routing, gathering probabilities and `MUL_MAT_ID` expert
+operations run on the selected backend. Expert IDs are unique and remain on the
+device. Only selected experts execute; no host routing readback is needed.
+
+`tidal.experts`, `experts_used`, `expert_ffn`, `shared_ffn` are UINT32 metadata;
+`tidal.norm_topk` is BOOL. All are required for the MoE tag and rejected on a Dense
+model. Expert counts are bounded to 256, with 1..experts selected per token.
+For each `blk.L.ffn.` prefix, `router` is [hidden, experts], `gate_exps` and
+`up_exps` are [hidden, expert_ffn, experts], and `down_exps` is
+[expert_ffn, hidden, experts]. With shared_ffn > 0, `shared.gate`, `shared.up`,
+`shared.down` are ordinary Dense matrices and `shared_gate` is [hidden, 1].
+Router weights default to F32. Expert operations use the backend's native
+accumulation policy; pinned CUDA rejects forced-F32 accumulation on MUL_MAT_ID.
 
 ## Precision and storage
 

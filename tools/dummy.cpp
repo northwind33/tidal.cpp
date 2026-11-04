@@ -78,13 +78,14 @@ int main(int argc, char ** argv) {
     try {
         Args args(argc, argv, {"--help", "--output", "--type", "--seed", "--context", "--layers", "--hidden",
             "--ple-layers", "--ple-ngram", "--ple-heads", "--ple-dim", "--ple-conv", "--ple-eos",
-            "--ple-vocab-base", "--ple-type"});
+            "--ple-vocab-base", "--ple-type", "--experts", "--experts-used", "--expert-ffn", "--shared-ffn", "--norm-topk"});
         if (!args.get("--help").empty()) {
             std::cout << "tidal-dummy --output model.gguf [--type f32|f16|bf16|q8_0|q4_0] "
                          "[--seed 42] [--context 256] [--layers 4] [--hidden 128]\n"
                          "  Optional PLE: --ple-layers 0,2 (zero-based GDN layers)\n"
                          "  [--ple-ngram 3] [--ple-heads 2] [--ple-dim 128] [--ple-conv 4]\n"
                          "  [--ple-eos 0] [--ple-vocab-base 17] [--ple-type bf16]\n";
+            std::cout << "  Optional MoE: --experts 4 [--experts-used 2] [--expert-ffn 128] [--shared-ffn 128] [--norm-topk 1]\n";
             return 0;
         }
         const auto path = args.get("--output");
@@ -103,6 +104,13 @@ int main(int argc, char ** argv) {
         config.hidden = args.integer("--hidden", config.hidden);
         if (config.hidden <= 0 || config.hidden > 1024) throw std::invalid_argument("hidden must be in [32, 1024]");
         config.ffn = 2 * config.hidden;
+        config.experts = args.integer("--experts", 0);
+        config.experts_used = args.integer("--experts-used", config.experts ? 2 : 0);
+        config.expert_ffn = args.integer("--expert-ffn", config.experts ? config.hidden : 0);
+        config.shared_ffn = args.integer("--shared-ffn", config.experts ? config.hidden : 0);
+        const int norm_topk = args.integer("--norm-topk", 1);
+        if (norm_topk != 0 && norm_topk != 1) throw std::invalid_argument("--norm-topk must be 0 or 1");
+        config.norm_topk = bool(norm_topk);
         config.validate();
         configure_ple(config, args, seed);
         const auto ple_type = args.get("--ple-type", "bf16");
@@ -113,7 +121,7 @@ int main(int argc, char ** argv) {
         tidal::write_config(file.get(), config);
         gguf_set_val_u32(file.get(), "tidal.seed", uint32_t(seed));
         gguf_set_val_str(file.get(), "tidal.weight_type", name.c_str());
-        gguf_set_val_str(file.get(), "general.description", config.ple.layers.empty()
+        gguf_set_val_str(file.get(), "general.description", config.experts ? "Random synthetic Qwen-derived MoE; not trained, no tokenizer/MTP" : config.ple.layers.empty()
             ? "Random tiny Dense derivative; not trained, no tokenizer, no MoE/PLE/MTP"
             : "Random tiny Dense derivative with PLE; not trained, no tokenizer, no MoE/MTP");
         std::vector<std::vector<uint8_t>> storage;
@@ -124,9 +132,9 @@ int main(int argc, char ** argv) {
             if (spec.kind == tidal::TensorSpec::Embedding) type = GGML_TYPE_BF16;
             if (spec.kind == tidal::TensorSpec::Lookup) type = types.at(ple_type);
             if (spec.columns % ggml_blck_size(type)) throw std::runtime_error("Tensor width is not quantization aligned");
-            auto * tensor = ggml_new_tensor_2d(ctx.get(), type, spec.columns, spec.rows);
+            auto * tensor = ggml_new_tensor_3d(ctx.get(), type, spec.columns, spec.rows, spec.slices);
             ggml_set_name(tensor, spec.name.c_str());
-            const auto count = size_t(spec.columns * spec.rows);
+            const auto count = size_t(spec.columns * spec.rows * spec.slices);
             std::vector<float> source(count);
             for (float & value : source) {
                 float r = 2 * rng.uniform() - 1;
@@ -142,7 +150,7 @@ int main(int argc, char ** argv) {
             }
             storage.emplace_back(ggml_nbytes(tensor));
             auto & encoded = storage.back();
-            const auto written = ggml_quantize_chunk(type, source.data(), encoded.data(), 0, spec.rows, spec.columns, nullptr);
+            const auto written = ggml_quantize_chunk(type, source.data(), encoded.data(), 0, spec.rows * spec.slices, spec.columns, nullptr);
             if (written != encoded.size()) throw std::runtime_error("Unexpected quantized tensor length");
             tensor->data = encoded.data();
             gguf_add_tensor(file.get(), tensor);

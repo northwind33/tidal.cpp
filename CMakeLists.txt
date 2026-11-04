@@ -98,6 +98,9 @@ if(BUILD_TESTING)
         execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy"
             RESULT_VARIABLE TIDAL_NUMPY_STATUS OUTPUT_QUIET ERROR_QUIET)
         if(TIDAL_NUMPY_STATUS EQUAL 0)
+            add_test(NAME moe-reference COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_moe.py --bin-dir $<TARGET_FILE_DIR:tidal-cli>)
+            set_tests_properties(moe-reference PROPERTIES TIMEOUT 180)
             add_test(NAME numerical-reference COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_reference.py
                 --bin-dir $<TARGET_FILE_DIR:tidal-cli>)

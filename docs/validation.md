@@ -10,6 +10,7 @@ hardware/software inventories and local test logs are not stored in this file.
 cmake --build --preset dev-cuda
 ctest --preset dev-cuda
 python3 tests/test_reference.py --bin-dir build/dev-cuda/bin --backend cuda
+python3 tests/test_moe.py --bin-dir build/dev-cuda/bin --backend cuda
 ```
 
 CTest's numerical reference suite uses CPU execution, including in a CUDA build.
@@ -83,6 +84,19 @@ advance state. Malformed PLE metadata tests cover missing/unknown keys, wrong
 array types, overflow, invalid EOS/dimensions/layers, duplicate layers, invalid
 head ranges and missing tensors. Old files with no PLE metadata remain supported.
 Profiling regression tests check the PLE graph, host hash events and replay.
+
+## MoE coverage
+
+`moe-reference` (CPU in CTest) and the explicit CUDA MoE suite compare logits,
+greedy decisions and QSA selection against an independent router/expert oracle.
+Cases cover top-1, top-2, all experts, normalized/unnormalized probabilities,
+absent/present shared experts and PLE plus MoE in F32. All original five formats
+also exercise isolated native expert matvecs against independently decoded weights,
+finite generation and reset/chunked state. Low-precision MoE trajectories are not
+required to match oracle expert selection near tied router scores; CUDA F16 expert
+kernels also use their native default accumulation rather than the Dense F32 hint.
+Invalid metadata and graph-node profiling are checked.
+Exact transfer accounting ensures routing does not introduce host round-trips.
 
 ## Backend-specific reference arithmetic
 

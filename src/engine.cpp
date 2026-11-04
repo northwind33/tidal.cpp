@@ -263,9 +263,40 @@ struct Engine::Impl {
     }
     ggml_tensor * ffn(Graph & g, ggml_tensor * h, const std::string & p) {
         auto mixed = mix(g, h, p + "hc_ffn");
+        if (c.experts) return combine(g, h, moe(g, mixed.value, p + "ffn."), mixed.inject);
         auto * v = ggml_mul(g.c(), ggml_silu(g.c(), mm(g, p + "ffn.gate", mixed.value)),
                            mm(g, p + "ffn.up", mixed.value));
         return combine(g, h, mm(g, p + "ffn.down", v), mixed.inject);
+    }
+    ggml_tensor * moe(Graph & g, ggml_tensor * x, const std::string & p) {
+        auto * probabilities = ggml_soft_max(g.c(), mm(g, p + "router", x));
+        auto * ids = ggml_cont(g.c(), ggml_top_k(g.c(), probabilities, c.experts_used));
+        ggml_set_name(ids, (p + "expert_ids").c_str());
+        auto * selected = ggml_reshape_1d(g.c(), ggml_get_rows(g.c(),
+            ggml_reshape_2d(g.c(), probabilities, 1, c.experts), ids), c.experts_used);
+        if (c.norm_topk) selected = ggml_div(g.c(), selected, ggml_sum_rows(g.c(), selected));
+        ggml_set_name(selected, (p + "routing_weights").c_str());
+        auto expert_mm = [&](const char * name, ggml_tensor * input) {
+            auto * out = ggml_mul_mat_id(g.c(), weight(p + name), input, ids);
+            // The pinned CUDA MUL_MAT_ID rejects GGML_PREC_F32 overrides;
+            // leave the backend's native expert accumulation policy intact.
+            ggml_set_name(out, (p + name).c_str());
+            return out;
+        };
+        x = ggml_reshape_3d(g.c(), x, c.hidden, 1, 1);
+        auto * active = ggml_mul(g.c(), ggml_silu(g.c(), expert_mm("gate_exps", x)), expert_mm("up_exps", x));
+        auto * outputs = expert_mm("down_exps", active);
+        auto * weighted = ggml_mul(g.c(), outputs, ggml_reshape_3d(g.c(), selected, 1, c.experts_used, 1));
+        auto * result = ggml_view_1d(g.c(), weighted, c.hidden, 0);
+        for (int i = 1; i < c.experts_used; ++i)
+            result = ggml_add(g.c(), result, ggml_view_1d(g.c(), weighted, c.hidden, size_t(i) * weighted->nb[1]));
+        if (c.shared_ffn) {
+            auto * shared = ggml_mul(g.c(), ggml_silu(g.c(), mm(g, p + "shared.gate", x)), mm(g, p + "shared.up", x));
+            shared = mm(g, p + "shared.down", shared);
+            auto * gate = ggml_sigmoid(g.c(), mm(g, p + "shared_gate", x));
+            result = ggml_add(g.c(), result, ggml_mul(g.c(), shared, gate));
+        }
+        return result;
     }
     ggml_tensor * repeat_gdn_heads(Graph & g, ggml_tensor * x) {
         // ggml's fused GDN broadcasts by tiling; Qwen requires repeat_interleave.

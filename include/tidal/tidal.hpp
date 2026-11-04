@@ -23,7 +23,7 @@ struct PLEConfig {
     int heads() const { return (ngram_size - 1) * heads_per_ngram; }
 };
 
-// A deliberately small Dense derivative, not the released MoE checkpoint schema.
+// Qwen-derived synthetic Dense/MoE schema; no released-checkpoint converter.
 struct Config {
     int hidden = 128;
     int ffn = 256;
@@ -46,6 +46,11 @@ struct Config {
     int top_blocks = 2;
     float eps = 1e-6f;
     float rope_base = 10000.0f;
+    int experts = 0;
+    int experts_used = 0;
+    int expert_ffn = 0;
+    int shared_ffn = 0;
+    bool norm_topk = true;
     PLEConfig ple;
     void validate() const;
 };

@@ -32,8 +32,12 @@ int main(int argc, char ** argv) {
         std::cout << std::setprecision(9);
         for (std::string name; std::cin >> name;) {
             const bool gather = name == "@rows";
-            if (gather && !(std::cin >> name)) throw std::invalid_argument("Missing table name");
+            const bool expert = name == "@expert";
+            if ((gather || expert) && !(std::cin >> name)) throw std::invalid_argument("Missing tensor name");
             auto * weight = model.at(name);
+            int32_t expert_id = 0;
+            if (expert && (!(std::cin >> expert_id) || expert_id < 0 || expert_id >= weight->ne[2]))
+                throw std::invalid_argument("Invalid expert ID");
             std::vector<float> input;
             std::vector<int32_t> rows;
             if (gather) {
@@ -51,8 +55,10 @@ int main(int argc, char ** argv) {
             if (!ctx) throw std::runtime_error("Context allocation failed");
             auto * x = ggml_new_tensor_1d(ctx.get(), gather ? GGML_TYPE_I32 : GGML_TYPE_F32,
                                           int64_t(gather ? rows.size() : input.size()));
-            auto * y = gather ? ggml_get_rows(ctx.get(), weight, x) : ggml_mul_mat(ctx.get(), weight, x);
-            if (!gather) ggml_prec_set_acc(y, GGML_PREC_F32); // Same contract as Engine::mm.
+            auto * ids = expert ? ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, 1) : nullptr;
+            auto * y = expert ? ggml_mul_mat_id(ctx.get(), weight, x, ids) :
+                gather ? ggml_get_rows(ctx.get(), weight, x) : ggml_mul_mat(ctx.get(), weight, x);
+            if (!gather && !expert) ggml_prec_set_acc(y, GGML_PREC_F32); // Same contract as Engine::mm.
             if (!ggml_backend_supports_op(backend.get(), y))
                 throw std::runtime_error("Backend does not support this matvec");
             auto * graph = ggml_new_graph(ctx.get());
@@ -62,6 +68,7 @@ int main(int argc, char ** argv) {
             if (!buffer) throw std::runtime_error("Buffer allocation failed");
             if (gather) ggml_backend_tensor_set(x, rows.data(), 0, rows.size() * sizeof(int32_t));
             else ggml_backend_tensor_set(x, input.data(), 0, input.size() * sizeof(float));
+            if (ids) ggml_backend_tensor_set(ids, &expert_id, 0, sizeof(expert_id));
             if (ggml_backend_graph_compute(backend.get(), graph) != GGML_STATUS_SUCCESS)
                 throw std::runtime_error("Matvec execution failed");
             std::vector<float> output(size_t(ggml_nelements(y)));

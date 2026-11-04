@@ -51,6 +51,9 @@ inline void config(std::ostream & out, const tidal::Config & c) {
     FIELD(index_heads); FIELD(index_dim); FIELD(block_size); FIELD(top_blocks); FIELD(eps);
 #undef FIELD
     out << "\"rope_base\":" << c.rope_base;
+    if (c.experts) out << ",\"experts\":" << c.experts << ",\"experts_used\":" << c.experts_used
+        << ",\"expert_ffn\":" << c.expert_ffn << ",\"shared_ffn\":" << c.shared_ffn
+        << ",\"norm_topk\":" << (c.norm_topk ? "true" : "false");
     if (!c.ple.layers.empty()) {
         const auto & p = c.ple;
         out << ",\"ple\":{\"ngram_size\":" << p.ngram_size << ",\"heads_per_ngram\":" << p.heads_per_ngram
