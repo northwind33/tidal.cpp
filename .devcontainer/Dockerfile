@@ -15,6 +15,7 @@ RUN apt-get update \
         python3-numpy \
         python3-venv \
         sudo \
+        tmux \
     && rm -rf /var/lib/apt/lists/*
 
 # Login shells can replace the image's PATH. Keep nvcc available in VS Code's
