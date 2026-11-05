@@ -46,11 +46,20 @@ inline void config(std::ostream & out, const tidal::Config & c) {
     out << '{';
 #define FIELD(f) out << "\"" #f "\":" << c.f << ','
     FIELD(hidden); FIELD(ffn); FIELD(vocab); FIELD(layers); FIELD(context); FIELD(branches);
-    FIELD(rank); FIELD(q_heads); FIELD(kv_heads); FIELD(head_dim); FIELD(rope_dim);
+    FIELD(q_heads); FIELD(kv_heads); FIELD(head_dim); FIELD(rope_dim);
     FIELD(gdn_key_heads); FIELD(gdn_value_heads); FIELD(gdn_dim); FIELD(conv_kernel);
-    FIELD(index_heads); FIELD(index_dim); FIELD(block_size); FIELD(top_blocks); FIELD(eps);
+    if (c.architecture == tidal::Architecture::Qwen4Exp) {
+        FIELD(rank); FIELD(index_heads); FIELD(index_dim); FIELD(block_size); FIELD(top_blocks);
+    }
+    FIELD(eps);
 #undef FIELD
     out << "\"rope_base\":" << c.rope_base;
+    out << ",\"architecture\":\"" << (c.architecture == tidal::Architecture::Qwen35 ? "qwen35" : "tidal-qwen4exp") << '"';
+    if (c.architecture == tidal::Architecture::Qwen35) {
+        out << ",\"tied_embeddings\":" << (c.tied_embeddings ? "true" : "false")
+            << ",\"mtp_layers\":" << c.mtp_layers << ",\"eos_token\":" << c.eos_token << ",\"recurrent_layers\":";
+        array(out, c.recurrent_layers);
+    }
     if (c.experts) out << ",\"experts\":" << c.experts << ",\"experts_used\":" << c.experts_used
         << ",\"expert_ffn\":" << c.expert_ffn << ",\"shared_ffn\":" << c.shared_ffn
         << ",\"norm_topk\":" << (c.norm_topk ? "true" : "false");
@@ -75,12 +84,13 @@ inline void stats(std::ostream & out, const tidal::Statistics & s) {
         << ",\"sparse_attention_calls\":" << s.sparse_attention_calls
         << ",\"d2h_bytes\":" << s.device_to_host_bytes << ",\"h2d_bytes\":" << s.host_to_device_bytes
         << ",\"graph_ms\":" << s.graph_ms << ",\"cpu_attention_ms\":" << s.attention_ms
-        << ",\"transfer_ms\":" << s.transfer_ms << '}';
+        << ",\"transfer_ms\":" << s.transfer_ms << ",\"full_attention_calls\":" << s.full_attention_calls << '}';
 }
 inline void model_info(std::ostream & out, const tidal::ModelInfo & m) {
     out << "{\"parameters\":" << m.parameters << ",\"stored_weight_bytes\":" << m.stored_weight_bytes
         << ",\"resident_weight_bytes\":" << m.resident_weight_bytes << ",\"weight_buffer_bytes\":" << m.weight_buffer_bytes
-        << ",\"converted_tensors\":" << m.converted_tensors << '}';
+        << ",\"converted_tensors\":" << m.converted_tensors
+        << ",\"skipped_tensors\":" << m.skipped_tensors << ",\"skipped_weight_bytes\":" << m.skipped_weight_bytes << '}';
 }
 inline void event_args(std::ostream & out, const tidal::ProfileEvent & e) {
     out << "{\"phase\":"; string(out, e.phase);

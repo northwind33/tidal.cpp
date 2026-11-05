@@ -26,7 +26,7 @@ else()
     set(TIDAL_GGML_BUILD_SOURCE "${ggml_SOURCE_DIR}")
 endif()
 
-add_library(tidal src/model.cpp src/quant.cpp src/ple.cpp src/engine.cpp src/sparse_attention.cpp)
+add_library(tidal src/model.cpp src/qwen35.cpp src/quant.cpp src/ple.cpp src/engine.cpp src/sparse_attention.cpp)
 target_include_directories(tidal PUBLIC include PRIVATE src)
 target_link_libraries(tidal PUBLIC ggml ggml-cpu)
 if(TIDAL_CUDA)
@@ -107,6 +107,9 @@ if(BUILD_TESTING)
         execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy"
             RESULT_VARIABLE TIDAL_NUMPY_STATUS OUTPUT_QUIET ERROR_QUIET)
         if(TIDAL_NUMPY_STATUS EQUAL 0)
+            add_test(NAME qwen35-reference COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_qwen35.py --bin-dir $<TARGET_FILE_DIR:tidal-cli>)
+            set_tests_properties(qwen35-reference PROPERTIES TIMEOUT 180)
             add_test(NAME quantization COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_quant.py --bin-dir $<TARGET_FILE_DIR:tidal-cli>)
             set_tests_properties(quantization PROPERTIES TIMEOUT 600)

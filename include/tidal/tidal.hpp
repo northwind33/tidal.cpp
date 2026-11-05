@@ -23,8 +23,10 @@ struct PLEConfig {
     int heads() const { return (ngram_size - 1) * heads_per_ngram; }
 };
 
-// Qwen-derived synthetic Dense/MoE schema; no released-checkpoint converter.
+enum class Architecture { Qwen4Exp, Qwen35 };
+
 struct Config {
+    Architecture architecture = Architecture::Qwen4Exp;
     int hidden = 128;
     int ffn = 256;
     int vocab = 256;
@@ -52,6 +54,14 @@ struct Config {
     int shared_ffn = 0;
     bool norm_topk = true;
     PLEConfig ple;
+    // Native qwen35 files may declare a recurrent-layer mask and an MTP tail.
+    std::vector<bool> recurrent_layers;
+    bool tied_embeddings = false;
+    int mtp_layers = 0;
+    int eos_token = -1;
+    bool is_recurrent(int layer) const {
+        return recurrent_layers.empty() ? (layer + 1) % 4 != 0 : recurrent_layers.at(layer);
+    }
     void validate() const;
 };
 
@@ -74,6 +84,7 @@ struct Options {
     ProfileMode profile = ProfileMode::Off;
     bool nvtx = false;
     uint64_t profile_event_limit = 500000;
+    int context = 0; // 0 uses GGUF capacity; otherwise bounded by the model capacity.
 };
 
 struct Selection {
@@ -90,6 +101,7 @@ struct Step {
 struct Statistics {
     uint64_t device_graph_nodes = 0;
     uint64_t sparse_attention_calls = 0;
+    uint64_t full_attention_calls = 0;
     uint64_t device_to_host_bytes = 0;
     uint64_t host_to_device_bytes = 0;
     double graph_ms = 0;
@@ -103,6 +115,8 @@ struct ModelInfo {
     uint64_t resident_weight_bytes = 0;
     uint64_t weight_buffer_bytes = 0;
     uint64_t converted_tensors = 0;
+    uint64_t skipped_tensors = 0; // Unused, explicitly declared MTP tensors.
+    uint64_t skipped_weight_bytes = 0;
 };
 
 class Engine {

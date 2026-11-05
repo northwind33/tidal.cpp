@@ -30,6 +30,7 @@ int64_t key(const gguf_context * f, const std::string & name, gguf_type type) {
 }
 
 void Config::validate() const {
+    if (architecture == Architecture::Qwen35) { validate_qwen35(*this); return; }
     for (auto f : fields) {
         if (this->*(f.value) <= 0)
             throw std::invalid_argument(std::string(f.name) + " must be positive");
@@ -58,9 +59,10 @@ void Config::validate() const {
 
 std::vector<TensorSpec> tensor_specs(const Config & c) {
     c.validate();
+    if (c.architecture == Architecture::Qwen35) return qwen35_tensor_specs(c);
     std::vector<TensorSpec> specs;
     auto add = [&](std::string n, int64_t in, int64_t out, TensorSpec::Kind k = TensorSpec::Matrix) {
-        specs.push_back({std::move(n), in, out, k});
+        specs.push_back({std::move(n), in, out, k, 1, {}});
     };
     auto hc = [&](const std::string & p, bool inject) {
         add(p + ".norm", c.hidden, c.branches, TensorSpec::Norm);
@@ -132,6 +134,7 @@ std::vector<TensorSpec> tensor_specs(const Config & c) {
 
 void write_config(gguf_context * f, const Config & c) {
     c.validate();
+    if (c.architecture != Architecture::Qwen4Exp) throw std::invalid_argument("Dummy writer requires the tidal schema");
     gguf_set_val_str(f, "general.architecture", c.experts ? moe_architecture : architecture);
     gguf_set_val_u32(f, "tidal.version", format_version);
     for (auto field : fields)
@@ -150,8 +153,9 @@ void write_config(gguf_context * f, const Config & c) {
 
 Config read_config(const gguf_context * f) {
     const std::string arch = gguf_get_val_str(f, key(f, "general.architecture", GGUF_TYPE_STRING));
+    if (arch == "qwen35") return read_qwen35_config(f);
     if (arch != architecture && arch != moe_architecture)
-        throw std::runtime_error("Expected tidal-qwen4exp-dense or tidal-qwen4exp-moe; convert external checkpoints first");
+        throw std::runtime_error("Expected tidal-qwen4exp-dense, tidal-qwen4exp-moe or native qwen35 GGUF");
     if (gguf_get_val_u32(f, key(f, "tidal.version", GGUF_TYPE_UINT32)) != format_version)
         throw std::runtime_error("Unsupported tidal GGUF schema version");
     Config c;
@@ -188,28 +192,34 @@ Model::Model(const std::string & path, ggml_backend_t backend) {
     if (!file || !source) throw std::runtime_error("Cannot read GGUF: " + path);
     config = read_config(file.get());
     const auto specs = tensor_specs(config);
-    if (gguf_get_n_tensors(file.get()) != int64_t(specs.size()))
+    if (config.architecture == Architecture::Qwen4Exp && gguf_get_n_tensors(file.get()) != int64_t(specs.size()))
         throw std::runtime_error("Unexpected number of model tensors");
     std::ifstream input(path, std::ios::binary);
     input.seekg(0, std::ios::end);
     const auto length = input.tellg();
     if (length < 0) throw std::runtime_error("Cannot determine model file length");
+    const uint64_t data_offset = gguf_get_data_offset(file.get());
+    for (int64_t id = 0; id < gguf_get_n_tensors(file.get()); ++id) {
+        const uint64_t offset = gguf_get_tensor_offset(file.get(), id);
+        if (data_offset > uint64_t(length) || offset > uint64_t(length) - data_offset ||
+            gguf_get_tensor_size(file.get(), id) > uint64_t(length) - data_offset - offset)
+            throw std::runtime_error(std::string("Truncated GGUF tensor: ") + gguf_get_tensor_name(file.get(), id));
+    }
     ctx.reset(ggml_init({specs.size() * ggml_tensor_overhead() + 4096, nullptr, true}));
     if (!ctx) throw std::runtime_error("Cannot allocate weight metadata");
+    std::map<std::string, ggml_tensor *> source_weights;
     for (const auto & spec : specs) {
-        auto * t = ggml_get_tensor(source.get(), spec.name.c_str());
+        const auto & source_name = spec.source_name.empty() ? spec.name : spec.source_name;
+        auto * t = ggml_get_tensor(source.get(), source_name.c_str());
         if (!t || t->ne[0] != spec.columns || t->ne[1] != spec.rows || t->ne[2] != spec.slices || t->ne[3] != 1)
             throw std::runtime_error("Missing or invalid tensor shape: " + spec.name);
         if (!storage_type(t->type))
             throw std::runtime_error("Unsupported tensor type: " + spec.name);
-        const auto id = gguf_find_tensor(file.get(), spec.name.c_str());
-        const uint64_t offset = gguf_get_data_offset(file.get()) + gguf_get_tensor_offset(file.get(), id);
-        if (offset > uint64_t(length) || ggml_nbytes(t) > uint64_t(length) - offset)
-            throw std::runtime_error("Truncated GGUF tensor: " + spec.name);
         auto type = t->type;
         const bool lookup = spec.kind == TensorSpec::Lookup || spec.kind == TensorSpec::Embedding;
         const bool expert = spec.kind == TensorSpec::Expert;
-        const bool matrix = expert || spec.kind == TensorSpec::Matrix || spec.kind == TensorSpec::Router;
+        const bool tied_head = config.tied_embeddings && spec.name == "token_embd.weight";
+        const bool matrix = tied_head || expert || spec.kind == TensorSpec::Matrix || spec.kind == TensorSpec::Router;
         if (!matrix && !lookup) type = GGML_TYPE_F32;
         else {
             Context probe(ggml_init({65536, nullptr, true}), ggml_free);
@@ -219,13 +229,19 @@ Model::Model(const std::string & path, ggml_backend_t backend) {
             auto * op = lookup ? ggml_get_rows(probe.get(), t, x) : expert
                 ? ggml_mul_mat_id(probe.get(), t, x, ggml_new_tensor_2d(probe.get(), GGML_TYPE_I32, 1, 1))
                 : ggml_mul_mat(probe.get(), t, x);
-            if (matrix && !expert) ggml_prec_set_acc(op, GGML_PREC_F32);
+            if (matrix && !expert && !lookup) ggml_prec_set_acc(op, GGML_PREC_F32);
             const bool cpu_dot = !matrix || !ggml_backend_is_cpu(backend) || ggml_get_type_traits_cpu(type)->vec_dot;
             if (!cpu_dot || !ggml_backend_supports_op(backend, op)) type = GGML_TYPE_F32;
+            if (tied_head) {
+                auto * head = ggml_mul_mat(probe.get(), t, ggml_new_tensor_1d(probe.get(), GGML_TYPE_F32, spec.columns));
+                ggml_prec_set_acc(head, GGML_PREC_F32);
+                if (!ggml_backend_supports_op(backend, head)) type = GGML_TYPE_F32;
+            }
         }
         auto * tensor = ggml_new_tensor_3d(ctx.get(), type, spec.columns, spec.rows, spec.slices);
         ggml_set_name(tensor, spec.name.c_str());
         weights.emplace(spec.name, tensor);
+        source_weights.emplace(source_name, tensor);
         info.parameters += uint64_t(ggml_nelements(t));
         info.stored_weight_bytes += ggml_nbytes(t);
         info.resident_weight_bytes += ggml_nbytes(tensor);
@@ -235,6 +251,14 @@ Model::Model(const std::string & path, ggml_backend_t backend) {
                       << " -> " << ggml_type_name(type) << " on " << ggml_backend_name(backend) << '\n';
         }
     }
+    for (int64_t id = 0; id < gguf_get_n_tensors(file.get()); ++id) {
+        const std::string name = gguf_get_tensor_name(file.get(), id);
+        if (source_weights.contains(name)) continue;
+        if (!qwen35_mtp_tensor(config, name)) throw std::runtime_error("Unexpected model tensor: " + name);
+        ++info.skipped_tensors;
+        info.skipped_weight_bytes += gguf_get_tensor_size(file.get(), id);
+    }
+    if (config.tied_embeddings) weights.emplace("output.weight", weights.at("token_embd.weight"));
     std::cerr << "model weight bytes: stored=" << info.stored_weight_bytes << " resident="
               << info.resident_weight_bytes << " converted_tensors=" << info.converted_tensors << '\n';
     buffer.reset(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
@@ -244,7 +268,9 @@ Model::Model(const std::string & path, ggml_backend_t backend) {
     // Read in file order with bounded staging memory, including converted tensors.
     for (int64_t id = 0; id < gguf_get_n_tensors(file.get()); ++id) {
         const std::string name = gguf_get_tensor_name(file.get(), id);
-        auto * tensor = weights.at(name);
+        const auto found = source_weights.find(name);
+        if (found == source_weights.end()) continue;
+        auto * tensor = found->second;
         auto * encoded = ggml_get_tensor(source.get(), name.c_str());
         const uint64_t offset = gguf_get_data_offset(file.get()) + gguf_get_tensor_offset(file.get(), id);
         const size_t row_bytes = ggml_row_size(encoded->type, encoded->ne[0]);

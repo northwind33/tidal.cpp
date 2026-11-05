@@ -106,10 +106,10 @@ void write_file(const std::string & path, const std::string & contents) {
 int main(int argc, char ** argv) {
     try {
         Args args(argc, argv, {"--help", "--model", "--backend", "--device", "--threads", "--prompt", "--tokens",
-                              "--steps", "--warmup", "--repetitions", "--profile", "--profile-limit", "--nvtx", "--json", "--trace", "--label"});
+                              "--steps", "--warmup", "--repetitions", "--profile", "--profile-limit", "--nvtx", "--json", "--trace", "--label", "--context"});
         if (!args.get("--help").empty()) {
             std::cout << "tidal-bench --model MODEL [--backend cuda|cpu] [--prompt 24 | --tokens 1,2,3]\n"
-                         "  [--steps 32] [--warmup 1] [--repetitions 5] [--threads 4] [--device 0]\n"
+                         "  [--steps 32] [--warmup 1] [--repetitions 5] [--threads 4] [--device 0] [--context N]\n"
                          "  [--profile off|phases|nodes] [--profile-limit 500000] [--nvtx 0|1] [--json result.json] [--trace trace.json] [--label NAME]\n"
                          "Throughput excludes model load/reset/warmup. Profiling uses a separate replay.\n"
                          "Nodes mode disables fusion and synchronizes each ggml op; timings are host wall time, not CUDA event time.\n";
@@ -134,6 +134,7 @@ int main(int argc, char ** argv) {
             (!json_path.empty() && !trace_path.empty() && normalized(json_path) == normalized(trace_path)))
             throw std::invalid_argument("Model, JSON and trace paths must differ");
         tidal::Options options{args.get("--backend", "cuda"), args.integer("--device", 0), args.integer("--threads", 4)};
+        options.context = args.integer("--context", 0);
         options.nvtx = nvtx != 0;
         const int event_limit = args.integer("--profile-limit", 500000);
         if (event_limit < 1) throw std::invalid_argument("--profile-limit must be positive");

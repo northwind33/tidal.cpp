@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <numeric>
 
 namespace tidal {
 namespace {
@@ -187,21 +188,25 @@ struct Engine::Impl {
     Impl(const std::string & path, Options opts)
         : options(std::move(opts)), backend(make_backend(options)), model(path, backend.get()), c(model.config),
           profiler(options.profile, options.nvtx, options.profile_event_limit), state_context(context(1024 * 1024)), states(c.layers) {
+        if (options.context < 0 || options.context > c.context) throw std::invalid_argument("Invalid runtime context capacity");
+        if (options.context) c.context = options.context;
         auto * ctx = state_context.get();
         hidden = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.hidden, c.branches);
         for (int i = 0; i < c.layers; ++i) {
             auto & s = states[i];
-            if ((i + 1) % 4) {
+            if (c.is_recurrent(i)) {
                 const int channels = (2 * c.gdn_key_heads + c.gdn_value_heads) * c.gdn_dim;
                 s.conv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.conv_kernel - 1, channels);
                 s.recurrent = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
                     c.gdn_dim, c.gdn_dim, c.gdn_value_heads, 1);
             } else {
-                s.raw_index = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.index_dim, c.block_size);
-                s.index_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, c.index_dim,
+                if (c.architecture == Architecture::Qwen4Exp) {
+                    s.raw_index = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.index_dim, c.block_size);
+                    s.index_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, c.index_dim,
                                                   std::max(1, c.context / c.block_size));
+                    s.inject = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c.branches);
+                }
                 s.gate = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c.q_heads * c.head_dim);
-                s.inject = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c.branches);
                 s.attention = std::make_unique<SparseAttention>(c.q_heads, c.kv_heads, c.head_dim,
                                                                c.context, options.threads);
             }
@@ -262,6 +267,11 @@ struct Engine::Impl {
         return ggml_add(g.c(), h, ggml_mul(g.c(), repeated, gates));
     }
     ggml_tensor * ffn(Graph & g, ggml_tensor * h, const std::string & p) {
+        if (c.architecture == Architecture::Qwen35) {
+            auto * x = norm(g, h, p + "ffn_norm");
+            auto * active = ggml_mul(g.c(), ggml_silu(g.c(), mm(g, p + "ffn.gate", x)), mm(g, p + "ffn.up", x));
+            return ggml_add(g.c(), h, mm(g, p + "ffn.down", active));
+        }
         auto mixed = mix(g, h, p + "hc_ffn");
         if (c.experts) return combine(g, h, moe(g, mixed.value, p + "ffn."), mixed.inject);
         auto * v = ggml_mul(g.c(), ggml_silu(g.c(), mm(g, p + "ffn.gate", mixed.value)),
@@ -299,6 +309,9 @@ struct Engine::Impl {
         return result;
     }
     ggml_tensor * repeat_gdn_heads(Graph & g, ggml_tensor * x) {
+        // Native qwen35 GGUFs reorder V heads to ggml's tiled broadcast order.
+        if (c.architecture == Architecture::Qwen35)
+            return ggml_repeat_4d(g.c(), x, c.gdn_dim, c.gdn_value_heads, 1, 1);
         // ggml's fused GDN broadcasts by tiling; Qwen requires repeat_interleave.
         ggml_tensor * expanded = nullptr;
         const int repeat = c.gdn_value_heads / c.gdn_key_heads;
@@ -355,7 +368,8 @@ struct Engine::Impl {
         auto g = graph("gdn", layer);
         auto & s = states[layer];
         const std::string p = "blk." + std::to_string(layer) + ".";
-        auto mixed = mix(g, hidden, p + "hc_attn");
+        auto mixed = c.architecture == Architecture::Qwen35
+            ? Mixed{norm(g, hidden, p + "attn_norm"), nullptr} : mix(g, hidden, p + "hc_attn");
         auto * qkv = mm(g, p + "gdn.qkv", mixed.value);
         const int kd = c.gdn_key_heads * c.gdn_dim, vd = c.gdn_value_heads * c.gdn_dim;
         const int channels = 2 * kd + vd;
@@ -372,10 +386,13 @@ struct Engine::Impl {
         // Qwen uses x / sqrt(sum(x*x) + eps), whereas ggml_l2_norm clamps
         // sqrt(sum) to eps. RMSNorm with eps/d followed by 1/sqrt(d) is exact.
         const float scale = 1.0f / std::sqrt(float(c.gdn_dim));
-        q = repeat_gdn_heads(g, ggml_scale(g.c(), ggml_rms_norm(g.c(), q, c.eps / c.gdn_dim), scale));
-        k = repeat_gdn_heads(g, ggml_scale(g.c(), ggml_rms_norm(g.c(), k, c.eps / c.gdn_dim), scale));
+        const float l2_eps = c.architecture == Architecture::Qwen35 ? 1e-6f : c.eps;
+        q = repeat_gdn_heads(g, ggml_scale(g.c(), ggml_rms_norm(g.c(), q, l2_eps / c.gdn_dim), scale));
+        k = repeat_gdn_heads(g, ggml_scale(g.c(), ggml_rms_norm(g.c(), k, l2_eps / c.gdn_dim), scale));
         auto * a = ggml_softplus(g.c(), ggml_add(g.c(), mm(g, p + "gdn.a", mixed.value), weight(p + "gdn.dt_bias")));
-        auto * decay = ggml_neg(g.c(), ggml_mul(g.c(), ggml_exp(g.c(), weight(p + "gdn.a_log")), a));
+        // qwen35 GGUF stores -exp(A_log), while the tidal schema stores A_log.
+        auto * decay = c.architecture == Architecture::Qwen35 ? ggml_mul(g.c(), weight(p + "gdn.a_log"), a)
+            : ggml_neg(g.c(), ggml_mul(g.c(), ggml_exp(g.c(), weight(p + "gdn.a_log")), a));
         auto * beta = ggml_sigmoid(g.c(), mm(g, p + "gdn.b", mixed.value));
         decay = ggml_reshape_4d(g.c(), decay, 1, c.gdn_value_heads, 1, 1);
         beta = ggml_reshape_4d(g.c(), beta, 1, c.gdn_value_heads, 1, 1);
@@ -385,7 +402,8 @@ struct Engine::Impl {
         auto * z = ggml_reshape_2d(g.c(), mm(g, p + "gdn.z", mixed.value), c.gdn_dim, c.gdn_value_heads);
         output = ggml_mul(g.c(), norm(g, output, p + "gdn.norm"), ggml_silu(g.c(), z));
         output = mm(g, p + "gdn.out", ggml_reshape_1d(g.c(), output, vd));
-        auto * h = combine(g, hidden, output, mixed.inject);
+        auto * h = c.architecture == Architecture::Qwen35 ? ggml_add(g.c(), hidden, output)
+                                                        : combine(g, hidden, output, mixed.inject);
         g.add(ggml_cpy(g.c(), ffn(g, h, p), hidden));
         auto * tail = ggml_view_2d(g.c(), history, c.conv_kernel - 1, channels, history->nb[1], sizeof(float));
         g.add(ggml_cpy(g.c(), tail, s.conv));
@@ -471,6 +489,43 @@ struct Engine::Impl {
         post.run();
         return {layer, std::move(selected)};
     }
+    Selection full_layer(int layer) {
+        ProfileScope scope(&profiler, "layer", "full_attention", "full", position, layer, ggml_backend_name(backend.get()));
+        auto & s = states[layer];
+        const auto p = "blk." + std::to_string(layer) + ".";
+        auto g = graph("full.prepare", layer);
+        auto * x = norm(g, hidden, p + "attn_norm");
+        auto * qg = mm(g, p + "attn.qg", x);
+        auto * q = ggml_cont(g.c(), ggml_view_2d(g.c(), qg, c.head_dim, c.q_heads,
+                                               size_t(2*c.head_dim)*sizeof(float), 0));
+        auto * gate = ggml_cont(g.c(), ggml_view_2d(g.c(), qg, c.head_dim, c.q_heads,
+            size_t(2*c.head_dim)*sizeof(float), size_t(c.head_dim)*sizeof(float)));
+        q = rope(g, norm(g, q, p + "attn.q_norm"), c.head_dim, c.q_heads, position);
+        auto * k = ggml_reshape_2d(g.c(), mm(g, p + "attn.k", x), c.head_dim, c.kv_heads);
+        k = rope(g, norm(g, k, p + "attn.k_norm"), c.head_dim, c.kv_heads, position);
+        auto * v = mm(g, p + "attn.v", x);
+        g.add(q); g.add(k); g.add(v); g.add(ggml_cpy(g.c(), gate, s.gate));
+        g.run();
+        auto queries = g.get<float>(q), keys = g.get<float>(k), values = g.get<float>(v);
+        std::vector<int32_t> visible(position + 1);
+        std::iota(visible.begin(), visible.end(), 0);
+        auto start = Clock::now();
+        ProfileScope append(&profiler, "cpu", "kv_append_bf16", "full.attention", position, layer, "CPU");
+        append.event.bytes = (keys.size() + values.size()) * sizeof(ggml_bf16_t);
+        s.attention->append(keys, values);
+        append.finish();
+        ProfileScope attention_scope(&profiler, "cpu", "full_attention", "full.attention", position, layer, "CPU");
+        auto output = s.attention->attend(queries, visible, &profiler, position, layer, "full.attention");
+        attention_scope.finish();
+        stats.attention_ms += elapsed(start);
+        ++stats.full_attention_calls;
+        auto post = graph("full.finish", layer);
+        auto * attended = ggml_mul(post.c(), post.floats(output), ggml_sigmoid(post.c(), s.gate));
+        auto * h = ggml_add(post.c(), hidden, mm(post, p + "attn.out", attended));
+        post.add(ggml_cpy(post.c(), ffn(post, h, p), hidden));
+        post.run();
+        return {layer, std::move(visible)};
+    }
     Step decode(int32_t token) {
         if (failed) throw std::runtime_error("Previous decode failed; call reset() before reusing the engine");
         if (token < 0 || token >= c.vocab) throw std::out_of_range("Token ID outside vocabulary");
@@ -484,11 +539,12 @@ struct Engine::Impl {
             Step step{position, {}, {}};
             for (int layer = 0; layer < c.layers; ++layer) {
                 if (states[layer].ple) ple_layer(layer, token);
-                if ((layer + 1) % 4) linear_layer(layer);
-                else step.selections.push_back(sparse_layer(layer));
+                if (c.is_recurrent(layer)) linear_layer(layer);
+                else step.selections.push_back(c.architecture == Architecture::Qwen35 ? full_layer(layer) : sparse_layer(layer));
             }
             auto head = graph("head");
-            auto mixed = mix(head, hidden, "head", false);
+            auto mixed = c.architecture == Architecture::Qwen35
+                ? Mixed{norm(head, hidden, "output_norm.weight"), nullptr} : mix(head, hidden, "head", false);
             auto * logits = mm(head, "output.weight", mixed.value);
             head.add(logits);
             head.run();

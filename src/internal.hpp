@@ -25,6 +25,7 @@ struct TensorSpec {
     int64_t rows;
     enum Kind { Matrix, Norm, Conv, ALog, Bias, Embedding, Lookup, Router, Expert } kind;
     int64_t slices = 1;
+    std::string source_name; // Empty means the engine name is also the GGUF name.
 };
 std::vector<TensorSpec> tensor_specs(const Config & c);
 bool storage_type(ggml_type type);
@@ -33,6 +34,10 @@ ggml_type parse_storage_type(const std::string & name);
 void dequantize(ggml_type type, const void * data, float * values, int64_t count);
 void write_config(gguf_context * file, const Config & config);
 Config read_config(const gguf_context * file);
+Config read_qwen35_config(const gguf_context * file);
+void validate_qwen35(const Config & config);
+std::vector<TensorSpec> qwen35_tensor_specs(const Config & config);
+bool qwen35_mtp_tensor(const Config & config, const std::string & name);
 void validate_ple(const Config & config);
 void write_ple(gguf_context * file, const PLEConfig & config);
 void read_ple(const gguf_context * file, Config & config);
@@ -57,7 +62,8 @@ public:
     void append(const std::vector<float> & key, const std::vector<float> & value);
     std::vector<float> attend(const std::vector<float> & query,
                               const std::vector<int32_t> & selected, Profiler * profiler = nullptr,
-                              int position = -1, int layer = -1) const;
+                              int position = -1, int layer = -1,
+                              const std::string & phase = "qsa.attention") const;
     void reset() { size_ = 0; }
     int size() const { return size_; }
 private:
