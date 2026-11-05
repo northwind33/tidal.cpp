@@ -1,7 +1,7 @@
 # Validation contract
 
-The numerical suites compare the tiny Dense decoder against an independent
-NumPy GGUF reader and model implementation. Machine-specific measurements,
+The numerical suites compare synthetic decoders and native Qwen3.5 against
+independent NumPy GGUF readers and model implementations. Machine-specific measurements,
 hardware/software inventories and local test logs are not stored in this file.
 
 ## Reproduce
@@ -12,11 +12,12 @@ ctest --preset dev-cuda
 python3 tests/test_reference.py --bin-dir build/dev-cuda/bin --backend cuda
 python3 tests/test_moe.py --bin-dir build/dev-cuda/bin --backend cuda
 python3 tests/test_quant.py --bin-dir build/dev-cuda/bin --backend cuda
+python3 tests/test_qwen35.py --bin-dir build/dev-cuda/bin --backend cuda
 ```
 
 CTest's numerical reference suite uses CPU execution, including in a CUDA build.
-The explicit Python command exercises CUDA model/indexer graphs with CPU sparse
-attention. A CUDA compile alone does not establish GPU runtime correctness.
+The explicit Python commands exercise CUDA model/indexer graphs with CPU attention.
+A CUDA compile alone does not establish GPU runtime correctness.
 
 A CPU-only build can use:
 
@@ -27,6 +28,24 @@ ctest --test-dir build-cpu --output-on-failure
 ```
 
 ## Numerical coverage
+
+### Native Qwen3.5
+
+`qwen35-reference` uses independently written F32 GGUF fixtures and a separate
+NumPy decoder. It compares full vocabulary logits with atol/rtol 4e-4 and per-token
+NRMSE below 0.2%, greedy decisions, every full-attention prefix, exact transfer
+bytes, reset and chunked state. Cases include tied/untied output embeddings,
+implicit/explicit recurrent masks, unequal GDN key/value head counts (tiled GGUF
+ordering), MTP tail exclusion, EOS stopping and malformed metadata/payloads.
+Node profiling verifies all neural graphs on the requested backend and QK,
+softmax and weighted V on CPU, with no QSA stages.
+
+The opt-in public BF16/Q8_0 integration suite also validates native kernels,
+generation and placement using the actual Qwen3.5-0.8B GGUFs. It is not part of
+CTest and does not download weights automatically. Its numerical bounds and
+independent llama.cpp comparison are described in [the real-model guide](qwen35.md).
+
+### Synthetic qwen4exp Dense
 
 Each format uses seed 42, hidden 128, three GDN layers plus one QSA layer,
 24 fixed prompt tokens and six greedily generated tokens. Every step's entire
@@ -140,11 +159,13 @@ not establish GPU correctness.
 
 All model/indexer graphs use exactly one backend and check every node with
 `ggml_backend_supports_op`; CUDA requests have no automatic CPU fallback. CPU
-sparse attention owns the main BF16 KV cache. Tests check backend identity,
+attention owns the main BF16 KV cache. Tests check backend identity,
 attention calls and the exact transfer-byte budget derived from model dimensions.
 Only current Q/K/V, selected block IDs and logits download; token/RoPE positions,
 PLE row IDs and attention outputs upload. PLE tables, projections and convolution
 state stay on the backend. Full main KV caches remain in CPU RAM.
+Native Qwen3.5 has no selected-block download or index cache; its attention reads
+the complete causal prefix, and its GDN state remains on the backend.
 
 The GitHub CUDA job builds SM 7.5 and runs numerical tests in CPU mode on GPU-less
 runners. It uses `GGML_CUDA_NO_VMM=ON` to avoid a host-driver linking dependency.

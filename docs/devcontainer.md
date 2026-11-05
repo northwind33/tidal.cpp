@@ -70,8 +70,9 @@ Inside the container terminal:
 cmake --build --preset dev-cuda
 ctest --preset dev-cuda
 
-# This explicitly exercises the GPU/CPU split, across every supported weight format.
+# Explicit GPU/CPU numerical checks for synthetic and native architectures.
 python3 tests/test_reference.py --bin-dir build/dev-cuda/bin --backend cuda
+python3 tests/test_qwen35.py --bin-dir build/dev-cuda/bin --backend cuda
 
 mkdir -p models
 build/dev-cuda/bin/tidal-dummy --output models/dev-q4.gguf --type q4_0
@@ -80,13 +81,16 @@ build/dev-cuda/bin/tidal-cli --model models/dev-q4.gguf --backend cuda \
 ```
 
 CTest runs the CPU reference tests, even in a CUDA build. The separate Python
-command is the GPU numerical/placement check. The generator refuses to overwrite
+commands are GPU numerical/placement checks. The generator refuses to overwrite
 existing model files; reuse the generated file or choose a new filename on a repeat.
 Rebuild after updating tests: the numerical suite also uses `tidal-matvec-test`
 to verify the oracle against isolated backend operations. Add `--formats q4_0`
 to the Python command to focus on one format; multi-layer and invalid-input
 checks still run. See [the validation contract](validation.md) for test coverage
 and backend-specific precision rules.
+For public Qwen3.5-0.8B GGUF downloads and text generation with the same CPU/GPU
+split, follow [the real-model guide](qwen35.md). Keep its model files and local
+validation reports in the ignored directories shown there.
 
 The numerical command also includes PLE fixtures and state/placement checks.
 To generate one manually, add `--ple-layers 0,2` to `tidal-dummy` (zero-based GDN

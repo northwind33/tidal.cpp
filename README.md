@@ -1,15 +1,19 @@
 # tidal.cpp
 
-A C++20 / ggml inference prototype for **random-weight Dense/MoE derivatives
-of Qwen3.8-Flash-Next (`qwen4exp`)**. It implements stateful autoregressive decoding
-with GPU Gated DeltaNet and QSA indexing, and CPU sparse attention over a BF16 KV cache.
+A C++20 / ggml inference prototype supporting **public Qwen3.5-0.8B GGUF text
+inference** and **random-weight Dense/MoE derivatives of Qwen3.8-Flash-Next
+(`qwen4exp`)**. Gated DeltaNet runs on GPU. Ordinary full attention for Qwen3.5,
+or QSA-selected sparse attention for the synthetic model, reads a BF16 KV cache
+in CPU RAM and computes QK/softmax/V on CPU.
 
-This is an initial correctness milestone, not a trained language model or a loader
-for the released MoE checkpoint. Token IDs are synthetic; generated IDs have no
-linguistic meaning. Optional PLE follows the original n-gram embedding, gating and
-dilated convolution equations. Optional MoE implements top-k routing, sparse
-SwiGLU experts and a gated shared expert. Vision, MTP and batched prefill are outside this
-version. Prompt ingestion uses the same one-token state transitions as decoding.
+Qwen3.5 loads native `qwen35` GGUFs without conversion to the synthetic schema.
+See [the real-model guide](docs/qwen35.md) for downloads, text generation and
+independent verification. The `tidal-dummy` models still have random weights and
+synthetic token IDs. Their optional PLE implements n-gram embedding, gating and
+dilated convolution; optional MoE implements top-k routing, sparse SwiGLU experts
+and a gated shared expert. Released `qwen4exp` checkpoints, vision, MTP execution
+and batched prefill remain outside this version. Prompt ingestion uses the same
+one-token state transitions as decoding.
 
 | Work / storage | `--backend cuda` | `--backend cpu` |
 |---|---|---|
@@ -20,12 +24,13 @@ version. Prompt ingestion uses the same one-token state transitions as decoding.
 | Gated Residual, Q/K/V projections, RoPE, Dense FFN, output head | GPU | CPU |
 | MoE routing, selected experts and gated shared expert | GPU | CPU |
 | QSA raw-key pooling, compressed BF16 index cache, scores and top-k | GPU | CPU |
-| Main BF16 KV cache, selected QK, stable softmax, weighted V | **CPU** | CPU |
+| Main BF16 KV cache, full-prefix or selected QK, stable softmax, weighted V | **CPU** | CPU |
 
 CUDA is the default execution request. Missing CUDA or an unsupported operation
 causes an error; there is no automatic CPU fallback. The CPU mode is an explicit
-reference/testing mode. Only selected block IDs and the current Q/K/V cross to the
-host; the attention output returns to the GPU. The full main KV cache stays in RAM.
+reference/testing mode. Current Q/K/V cross to the host; QSA additionally downloads
+selected block IDs. The attention output returns to the GPU. The full main KV cache
+stays in RAM. Tokenization, greedy token selection and host orchestration use CPU.
 
 ## Build
 
@@ -55,7 +60,7 @@ For another NVIDIA GPU, use its compute capability instead of `75`. The graph us
 F32 activations/recurrent state and ggml conversions for BF16 storage, so it does
 not require native BF16 tensor cores.
 
-## Generate and run
+## Generate and run synthetic models
 
 The generator streams a complete GGUF directly, with the same seeded source tensors
 for every weight type. Embeddings default to BF16; normalization, convolution and
@@ -156,10 +161,11 @@ ctest --test-dir build --output-on-failure
 
 # Run the same numerical and placement checks on a real CUDA device.
 python tests/test_reference.py --bin-dir build-cuda/bin --backend cuda
+python tests/test_qwen35.py --bin-dir build-cuda/bin --backend cuda
 ```
 
 Tests compare complete multi-token logits and QSA selections against an independent
-NumPy GGUF reader/dequantizer and model implementation. They cover all five formats,
+NumPy GGUF reader/dequantizer and model implementation. The original numerical suite covers five representative formats,
 complete/incomplete blocks, generation, reset, two superblocks, stable sparse GQA,
 invalid input, truncated files, and strict backend rejection. Low-precision tests
 allow documented activation-rounding error; F32 has a much tighter tolerance.
@@ -167,6 +173,8 @@ The oracle models CPU and CUDA operand conversions separately, checked against
 isolated native matvecs. Generated tokens, reset/replay QSA selections and exact
 transfer-byte budgets are also verified. Test coverage and per-format error
 bounds are documented in [the validation contract](docs/validation.md).
+Native Qwen3.5 has separate fixture and opt-in public-model tests, including full
+causal attention, tied embeddings, MTP exclusion and CUDA/CPU placement checks.
 
 CI builds and tests the CPU implementation and compiles/links the CUDA path for
 SM 7.5. The CUDA CI job's numerical tests use **CPU mode** because hosted runners

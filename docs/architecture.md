@@ -1,13 +1,35 @@
 # Hybrid decoder
 
-## Reference and deliberate reductions
+## Architectures
+
+The engine dispatches on the GGUF architecture. Native `qwen35` supports the
+public Qwen3.5-0.8B text decoder; `tidal-qwen4exp-dense` and `tidal-qwen4exp-moe`
+retain the synthetic model contract below. Both use GPU model graphs with CPU
+BF16 KV storage and CPU QK/softmax/V. The explicit CPU backend remains available
+for reference tests.
+
+For Qwen3.5, the ordinary attention layers attend to every cached position through
+the current token, without QSA indexing or top-k. Q/K/V projections, per-head
+normalization, partial text RoPE, sigmoid output gates, residual additions, Dense
+FFNs and the tied output head run on GPU. GDN convolution and recurrent state also
+stay on GPU. There is one residual stream, and no Gated Residual mixing or PLE.
+Native GGUF stores negative exponentiated GDN decay and tiled value-head ordering;
+the synthetic schema's A-log and repeated head layout remain unchanged.
+
+Declared MTP tail tensors are validated for payload bounds and skipped during
+standard autoregressive inference. The tied embedding/output tensor is uploaded
+once. [The Qwen3.5 guide](qwen35.md) specifies native metadata, source references,
+text generation and validation limits.
+
+## Synthetic qwen4exp reference and deliberate reductions
 
 The user's Qwen3-Flash-Next refers here to Qwen3.8-Flash-Next, exposed as
 `qwen4_exp` in Transformers and `qwen4exp` in llama.cpp. The released model is MoE;
 this fixture follows the earlier Dense-engine plan. It retains the decoder's
 GDN/QSA rhythm, Gated Residual reads/writes, Q/K normalization, partial NeoX RoPE,
 gated attention output and SwiGLU. The FFN can be Dense or MoE. PLE is optional;
-vision and MTP are disabled. There is no tokenizer or claim of released-checkpoint compatibility.
+vision and MTP are disabled. These synthetic models have no tokenizer or claim of
+released `qwen4exp` checkpoint compatibility.
 
 Sources inspected on 2026-11-04:
 
@@ -23,7 +45,7 @@ The project implements the model equations independently. It does not vendor the
 Transformers or llama.cpp source files. The separate NumPy oracle is test code;
 the engine and dummy-model generator are C++.
 
-## One decoding step
+## One synthetic qwen4exp decoding step
 
 1. Gather the BF16 embedding on the selected backend and duplicate it across the
    residual streams for this token.
@@ -112,7 +134,7 @@ accumulation policy; pinned CUDA rejects forced-F32 accumulation on MUL_MAT_ID.
 | Norm gamma, convolution weights, A-log and dt bias | F32 |
 | Graph activations, GDN recurrent/conv state, PLE conv state, raw index ring | F32 |
 | Compressed index cache, host main KV cache | BF16 |
-| Sparse attention scores, softmax, weighted values | F32 |
+| Full or sparse attention scores, softmax, weighted values | F32 |
 
 GGUF norm tensors contain the effective gamma, i.e. the reference's `(1 + weight)`
 is already folded, except GDN's gated RMSNorm which directly uses its gamma. Qwen
@@ -137,7 +159,7 @@ can therefore differ; see [the validation contract](validation.md).
 
 ## GGUF contract and API
 
-Architecture tags are `tidal-qwen4exp-dense` and `tidal-qwen4exp-moe`, with schema `tidal.version = 1`.
+Synthetic architecture tags are `tidal-qwen4exp-dense` and `tidal-qwen4exp-moe`, with schema `tidal.version = 1`.
 All configuration keys use `tidal.*`. Tensor names and shapes are centralized in
 `src/model.cpp`; ggml dimensions are `[input, output]`, reversed relative to the
 usual row-major matrix shape. Unknown architectures, metadata versions, missing
@@ -187,6 +209,8 @@ statistics. Exceeding the configured capacity raises an error; no sliding-window
 eviction occurs. Failed graph execution poisons the sequence until `reset`, so a
 partially updated state cannot silently be reused. Independent Engines may run
 independently; an individual Engine is not thread-safe.
+`Options.context` / `--context` can reduce allocated sequence capacity from the
+GGUF value; zero preserves that value, and larger or negative capacities fail.
 
 ## Current performance limits
 
