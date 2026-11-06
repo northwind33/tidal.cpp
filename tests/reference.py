@@ -103,6 +103,7 @@ class Reference:
         if backend not in ("cpu", "cuda"):
             raise ValueError(f"Unknown reference backend: {backend}")
         self.backend = backend
+        self.prefill_columns = 0
         self.quantized = {}
         self.c, self.w, self.types, _ = read_gguf(path, self.quantized)
         # GGUF omits trailing dimensions of length one. Preserve the logical
@@ -143,10 +144,23 @@ class Reference:
             blocks = x.reshape(-1, 32)
             maximum = np.max(np.abs(blocks), axis=-1)
             scale = maximum / 127
+            columns = self.prefill_columns
+            if name.startswith("head.") or name == "output.weight":
+                columns = getattr(self, "prefill_head_columns", columns)
+            mmq = self.backend == "cuda" and columns > 8
             if self.backend == "cpu":
                 # AVX2 Q8_0 activation quantization: nearest-even, 127/max.
                 inv = np.divide(127, maximum, out=np.zeros_like(maximum), where=maximum != 0)
                 quant = np.rint(blocks * inv[:, None])
+            elif mmq:
+                # CUDA batch MMQ computes 127/amax directly. Q8_0 uses
+                # F32 scales (D4); Q4_0 uses FP16 scale/original-sum (DS4).
+                inverse = np.divide(127, maximum, out=np.zeros_like(maximum), where=maximum != 0)
+                scaled = blocks * inverse[:, None]
+                magnitude = np.abs(scaled)
+                integral = np.floor(magnitude)
+                quant = np.copysign(integral + (magnitude - integral >= .5), scaled)
+                scale = np.divide(1, inverse, out=np.zeros_like(inverse), where=inverse != 0)
             else:
                 # CUDA Q8_1 uses roundf(x/d), with halfway cases away from zero.
                 # ggml enables fast math: division becomes reciprocal multiply.
@@ -158,13 +172,14 @@ class Reference:
                 integral = np.floor(magnitude)
                 # Adding 0.5 in F32 can round a value just BELOW a tie upward.
                 quant = np.copysign(integral + (magnitude - integral >= 0.5), scaled)
-            scale = scale.astype(np.float16).astype(np.float32)
+            if not (mmq and kind == 8):
+                scale = scale.astype(np.float16).astype(np.float32)
             weight_scale, codes = self.quantized[name]
             if expert is not None:
                 rows = self.w[name].shape[1]
                 weight_scale = weight_scale[expert * rows:(expert + 1) * rows]
                 codes = codes[expert * rows:(expert + 1) * rows]
-            if kind == 2 and self.backend == "cuda":
+            if kind == 2 and self.backend == "cuda" and not mmq:
                 # Q4_0 stores unsigned nibbles. CUDA subtracts their zero point
                 # using Q8_1's FP16 sum of ORIGINAL activations, not sum(q)*d.
                 # These differ even when no quantization tie is involved.
@@ -298,6 +313,11 @@ class Reference:
         selected.sort()
         keys = np.stack(state["keys"])[selected]
         values = np.stack(state["values"])[selected]
+        if self.backend == "cuda" and self.prefill_columns > 8:
+            # FP16 MMA attention operands, with the canonical cache still BF16.
+            q = q.astype(np.float16).astype(np.float32)
+            keys = keys.astype(np.float16).astype(np.float32)
+            values = values.astype(np.float16).astype(np.float32)
         keys, values = np.repeat(keys, h // hk, axis=1), np.repeat(values, h // hk, axis=1)
         scores = np.einsum("hd,thd->ht", q, keys) / np.sqrt(np.float32(d))
         output = np.einsum("ht,thd->hd", softmax(scores), values)

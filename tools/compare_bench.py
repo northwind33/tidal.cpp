@@ -22,6 +22,8 @@ def compare(before, after, allow_sampler_change=False):
                 raise ValueError(f"Incompatible reports: {section}.{key} differs")
     if before["workload"].get("capture_logits", True) != after["workload"].get("capture_logits", True):
         raise ValueError("Incompatible reports: logit capture differs")
+    if before["workload"].get("prefill") != after["workload"].get("prefill"):
+        raise ValueError("Incompatible prefill execution, precision, tile or memory settings")
     a, b = dict(before["workload"].get("sampling", {})), dict(after["workload"].get("sampling", {}))
     if allow_sampler_change:
         a.pop("backend", None); b.pop("backend", None)
@@ -43,8 +45,8 @@ def compare(before, after, allow_sampler_change=False):
             raise ValueError(f"Invalid throughput for {phase}")
         rows.append({"phase": phase, "before_tokens_per_second": old, "after_tokens_per_second": new,
                      "throughput_change_percent": 100 * (new / old - 1),
-                     "before_p95_ms": a["token_latency_ms"]["p95"],
-                     "after_p95_ms": b["token_latency_ms"]["p95"]})
+                     "before_p95_ms": (a["token_latency_ms"] or {}).get("p95"),
+                     "after_p95_ms": (b["token_latency_ms"] or {}).get("p95")})
     hotspots = []
     p, q = before.get("profile"), after.get("profile")
     if p and q and p["mode"] == q["mode"] and not p["dropped_events"] and not q["dropped_events"]:
@@ -79,8 +81,10 @@ def main():
     try:
         result = compare(json.loads(args.baseline.read_text()), json.loads(args.candidate.read_text()), args.allow_sampler_change)
         for row in result["metrics"]:
+            latency = (f"; token p95 {row['before_p95_ms']:.3f} -> {row['after_p95_ms']:.3f} ms"
+                       if row['before_p95_ms'] is not None and row['after_p95_ms'] is not None else "")
             print(f"{row['phase']}: {row['before_tokens_per_second']:.3f} -> {row['after_tokens_per_second']:.3f} tokens/s "
-                  f"({row['throughput_change_percent']:+.2f}%); p95 {row['before_p95_ms']:.3f} -> {row['after_p95_ms']:.3f} ms")
+                  f"({row['throughput_change_percent']:+.2f}%)" + latency)
         if not result["output_checksums_match"]:
             print("Output checksums differ; run numerical validation to assess accuracy.")
         for row in result["profile_changes"][:15]:

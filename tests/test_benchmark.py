@@ -30,6 +30,7 @@ def main():
         base = [bench, "--model", model, "--backend", args.backend, "--prompt", 8, "--steps", 4,
                 "--warmup", 1, "--repetitions", 2, "--threads", 2, "--logits", 1]
         reports = {}
+        cpu_tokens = 4 if args.backend == "cuda" else 12
         for mode in ["off", "phases", "nodes"]:
             path, trace = root / f"{mode}.json", root / f"{mode}-trace.json"
             extra = [] if mode == "off" else ["--trace", trace]
@@ -40,15 +41,16 @@ def main():
             assert r["label"] == 'test "json"\nlabel' and r["model"]["path"] == str(model)
             assert len(r["runs"]) == 2
             for item in r["runs"]:
-                assert len(item["prefill_latency_ms"]) == 8 and len(item["decode_latency_ms"]) == 4
-                assert item["statistics"]["sparse_attention_calls"] == 12
+                assert item["prefill_latency_ms"] == [] and len(item["decode_latency_ms"]) == 4
+                assert item["statistics"]["sparse_attention_calls"] == cpu_tokens
                 assert len(item["generated"]) == 4
             for phase, tokens in [("prefill", 8), ("decode", 4), ("total", 12)]:
                 times = [x["prefill_ms"] if phase == "prefill" else x["decode_ms"] if phase == "decode"
                          else x["prefill_ms"] + x["decode_ms"] for x in r["runs"]]
                 summary = r["summary"][phase]
                 assert math.isclose(summary["tokens_per_second"], 1000 * tokens * 2 / sum(times), rel_tol=1e-9)
-                assert summary["token_latency_ms"]["count"] == tokens * 2
+                if phase == "decode": assert summary["token_latency_ms"]["count"] == tokens * 2
+                else: assert summary["token_latency_ms"] is None
             if mode == "off":
                 assert r["profile"] is None
                 continue
@@ -57,16 +59,20 @@ def main():
             assert p["dropped_events"] == 0
             assert p["qsa_matches_baseline"] and p["sampled_matches_baseline"]
             assert p["logits_max_abs_vs_baseline"] < 5e-4
-            assert p["statistics"]["sparse_attention_calls"] == 12
+            assert p["statistics"]["sparse_attention_calls"] == cpu_tokens
             events = p["events"]
-            assert len([e for e in events if e["cat"] == "token"]) == 12  # No warmup/repetition leakage.
-            assert {e["args"]["position"] for e in events} == set(range(12))
+            assert len([e for e in events if e["cat"] == "token"]) == cpu_tokens  # No warmup/repetition leakage.
+            if args.backend == "cpu": assert {e["args"]["position"] for e in events} == set(range(12))
+            else:
+                assert {e["args"]["position"] for e in events if e["cat"] == "token"} == set(range(8,12))
+                assert len([e for e in events if e["name"] == "layer_major"]) == 1
+                assert p["statistics"]["prefill_tokens"] == 8
             names = {e["name"] for e in events}
             assert {"qk", "softmax", "weighted_v", "kv_append_bf16", "worker_launch", "worker_join"} <= names
             for event in events:
                 assert math.isfinite(event["dur"]) and event["dur"] >= 0 and event["ts"] >= 0
             for name in ["qk", "softmax", "weighted_v"]:
-                assert len([e for e in events if e["cat"] == "cpu_head" and e["name"] == name]) == 12 * 4
+                assert len([e for e in events if e["cat"] == "cpu_head" and e["name"] == name]) == cpu_tokens * 4
             nodes = [e for e in events if e["cat"] == "node"]
             if mode == "nodes":
                 assert len(nodes) == p["statistics"]["graph_nodes"]
@@ -76,7 +82,7 @@ def main():
                 assert not nodes and p["logits_max_abs_vs_baseline"] == 0
             if args.backend == "cuda":
                 for name, field in [("D2H", "d2h_bytes"), ("H2D", "h2d_bytes")]:
-                    assert sum(e["args"]["bytes"] for e in events if e["cat"] == "transfer" and e["name"] == name) == p["statistics"][field]
+                    assert sum(e["args"]["bytes"] for e in events if e["cat"] == "transfer" and e["name"] in (name, name+"_async")) == p["statistics"][field]
             timeline = json.loads(trace.read_text())["traceEvents"]
             assert len(timeline) == len(events) and all(e["ph"] == "X" for e in timeline)
         checksum = reports["off"]["runs"][0]["output_checksum"]
@@ -108,8 +114,8 @@ def main():
         profile = report["profile"]
         assert profile["qsa_matches_baseline"] and profile["sampled_matches_baseline"]
         assert profile["logits_max_abs_vs_baseline"] < 5e-4 and profile["dropped_events"] == 0
-        events = [e for e in profile["events"] if e["args"]["phase"] == "ple"]
-        assert len([e for e in events if e["name"] == "ngram_hash"]) == 24
+        events = [e for e in profile["events"] if e["args"]["phase"] in ("ple", "prefill.ple")]
+        assert len([e for e in events if e["name"] == "ngram_hash"]) == (10 if args.backend == "cuda" else 24)
         for layer in [0, 2]:
             nodes = [e for e in events if e["cat"] == "node" and e["args"]["layer"] == layer]
             assert all(e["args"]["backend"].startswith("CUDA" if args.backend == "cuda" else "CPU") for e in nodes)

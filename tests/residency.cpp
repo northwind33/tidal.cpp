@@ -1,11 +1,14 @@
 #include "residency.hpp"
 #include "prefill_memory.hpp"
+#include "prefill_tensor.hpp"
+#include "kv_export.hpp"
 #include "ggml-cpu.h"
 #ifdef TIDAL_CUDA
 #include "ggml-cuda.h"
 #endif
 #include <iostream>
 #include <set>
+#include <cstring>
 
 int main(int argc, char ** argv) {
     try {
@@ -102,6 +105,49 @@ int main(int argc, char ** argv) {
         for (const auto & [name, tensor] : model.weights) {
             std::vector<char> bytes(ggml_nbytes(tensor)); ggml_backend_tensor_get(tensor, bytes.data(), 0, bytes.size());
             if (bytes != originals.at(name)) throw std::runtime_error("Restoration after OOM changed weights");
+        }
+        // A multi-group prefetch must preserve requested groups already resident.
+        // Constrain the budget to exactly the two requested future groups.
+        const int future_ffn = model.group(3, tidal::WeightPart::FeedForward);
+        options.prefill_memory_limit = model.groups[next].allocation_bytes + model.groups[future_ffn].allocation_bytes;
+        tidal::PrefillMemory paired(model, backend.get(), stats, profile, options);
+        model.evict(next);
+        paired.prefetch({next, future_ffn});
+        model.wait_all();
+        if (!model.resident(next) || !model.resident(future_ffn) || model.resident_bytes() > options.prefill_memory_limit)
+            throw std::runtime_error("Prefetch evicted a requested group or exceeded the reserved budget");
+        paired.restore();
+        if (std::string(argv[2]) == "cuda") {
+            options.prefill_memory_limit = 0;
+            tidal::PrefillMemory export_memory(model, backend.get(), stats, profile, options);
+            auto source = std::make_shared<tidal::PrefillTensorStorage>(export_memory, backend.get());
+            // More than one 32-MiB K/V staging chunk, with an existing prefix.
+            constexpr int width=1024, count=17000, prefix=3;
+            auto * keys=source->tensor(GGML_TYPE_BF16,width,count);
+            auto * values=source->tensor(GGML_TYPE_BF16,width,count);
+            source->allocate();
+            std::vector<ggml_bf16_t> original_keys(size_t(width)*count), original_values(size_t(width)*count);
+            for (size_t i=0;i<original_keys.size();++i) {
+                original_keys[i].bits=uint16_t(0x3f00+i%128);
+                original_values[i].bits=uint16_t(0xbf80+i%128);
+            }
+            ggml_backend_tensor_set(keys,original_keys.data(),0,ggml_nbytes(keys));
+            ggml_backend_tensor_set(values,original_values.data(),0,ggml_nbytes(values));
+            tidal::SparseAttention destination(1,1,width,count,1);
+            destination.append_bf16(original_keys.data(),original_values.data(),prefix);
+            const auto before=stats.prefill_kv_to_host_bytes;
+            std::weak_ptr<tidal::PrefillTensorStorage> lifetime=source;
+            tidal::KVExporter exporter(0,stats,profile);
+            exporter.enqueue(source,keys,values,destination,prefix,count-prefix,3);
+            source.reset();
+            if (lifetime.expired() || !export_memory.workspace_bytes())
+                throw std::runtime_error("KV transfer lost its GPU source ownership");
+            exporter.finish();
+            if (!lifetime.expired() || export_memory.workspace_bytes() || destination.size()!=count ||
+                stats.prefill_kv_to_host_bytes-before!=uint64_t(count-prefix)*width*4 ||
+                std::memcmp(destination.keys(),original_keys.data(),original_keys.size()*sizeof(ggml_bf16_t)) ||
+                std::memcmp(destination.values(),original_values.data(),original_values.size()*sizeof(ggml_bf16_t)))
+                throw std::runtime_error("Chunked asynchronous KV export changed bytes, prefix or lifetime");
         }
         std::cout << "Residency priority, release/reload bytes, pending-copy lifetime and aliases passed\n";
     } catch (const std::exception & e) { std::cerr << e.what() << '\n'; return 1; }

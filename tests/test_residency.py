@@ -15,7 +15,8 @@ def main():
     with tempfile.TemporaryDirectory(prefix='tidal-residency-') as directory:
         root = Path(directory)
         for label, flags in [('f32', []), ('bf16', ['--type','bf16']), ('q4', ['--type','q4_0']),
-                             ('moe-ple', ['--type','q8_0','--experts',4,'--experts-used',2,'--ple-layers','0,2'])]:
+                             ('moe-ple', ['--type','q8_0','--experts',4,'--experts-used',2,'--ple-layers','0,2']),
+                             ('converted', ['--preset','quant-test','--type','tq1_0'])]:
             model = root / (label+'.gguf')
             run(a.bin_dir/'tidal-dummy','--output',model,'--context',32,*flags)
             run(a.bin_dir/'tidal-residency-test', model, a.backend)

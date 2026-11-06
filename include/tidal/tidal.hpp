@@ -163,7 +163,10 @@ public:
     Engine & operator=(const Engine &) = delete;
     // Disable capture to keep the full vocabulary vector on the device.
     Step decode(int32_t token, bool capture_logits = true);
-    // Correctness-first prompt ingestion: exactly the same transitions as decode.
+    // CUDA: all prompt tokens complete one layer before the next layer starts.
+    // CPU: explicit sequential reference. Batched reductions can round differently.
+    // Capture includes every position's logits and attention selections; disabling
+    // it keeps vocabulary vectors and diagnostic selection lists off the host.
     std::vector<Step> prefill(const std::vector<int32_t> & tokens, bool capture_logits = true);
     // Draw from the last decoded position; consumes RNG but no context token.
     int32_t sample();

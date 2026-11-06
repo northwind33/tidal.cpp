@@ -87,6 +87,8 @@ def main():
         matrices = isolated_matrices(ref, args.bin_dir/'tidal-matvec-test', model, out/f'{kind}-matvec.log')
         max_nrmse=max_abs=0.
         for i,token in enumerate(tokens):
+            ref.prefill_columns = len(PROMPT) if i<len(PROMPT) else 0
+            ref.prefill_head_columns = ref.prefill_columns if i!=len(PROMPT)-1 else 0
             expected,selected=ref.decode(token);actual=np.asarray(data['trace'][i]['logits'])
             assert np.isfinite(actual).all() and selected==data['trace'][i]['selections']
             nrmse=float(np.linalg.norm(actual-expected)/np.linalg.norm(expected))

@@ -1,5 +1,6 @@
 #include "tidal/tidal.hpp"
 #include "args.hpp"
+#include "prefill_options.hpp"
 #include "report.hpp"
 #include "tidal-build-info.hpp"
 #ifdef TIDAL_BENCH_CUDA
@@ -53,11 +54,7 @@ Run execute(tidal::Engine & engine, const std::vector<int32_t> & prompt, int ste
     r.generated.reserve(steps); r.prefill_latencies.reserve(prompt.size()); r.decode_latencies.reserve(steps);
     auto start = Clock::now(); engine.reset(); r.reset_ms = ms(start);
     start = Clock::now();
-    for (int32_t token : prompt) {
-        const auto tick = Clock::now();
-        r.trace.push_back(engine.decode(token, capture));
-        r.prefill_latencies.push_back(ms(tick));
-    }
+    r.trace = engine.prefill(prompt, capture);
     r.prefill_ms = ms(start);
     start = Clock::now();
     for (int i = 0; i < steps; ++i) {
@@ -105,8 +102,8 @@ void write_file(const std::string & path, const std::string & contents) {
 
 int main(int argc, char ** argv) {
     try {
-        Args args(argc, argv, sampling_options({"--help", "--model", "--backend", "--device", "--threads", "--prompt", "--tokens",
-                              "--steps", "--warmup", "--repetitions", "--profile", "--profile-limit", "--nvtx", "--json", "--trace", "--label", "--context"}));
+        Args args(argc, argv, prefill_options(sampling_options({"--help", "--model", "--backend", "--device", "--threads", "--prompt", "--tokens",
+                              "--steps", "--warmup", "--repetitions", "--profile", "--profile-limit", "--nvtx", "--json", "--trace", "--label", "--context"})));
         if (!args.get("--help").empty()) {
             std::cout << "tidal-bench --model MODEL [--backend cuda|cpu] [--prompt 24 | --tokens 1,2,3]\n"
                          "  [--steps 32] [--warmup 1] [--repetitions 5] [--threads 4] [--device 0] [--context N]\n"
@@ -114,6 +111,7 @@ int main(int argc, char ** argv) {
                          "Throughput excludes model load/reset/warmup. Profiling uses a separate replay.\n"
                          "Nodes mode disables fusion and synchronizes each ggml op; timings are host wall time, not CUDA event time.\n";
             sampling_help(std::cout);
+            prefill_help(std::cout);
             return 0;
         }
         const auto path = args.get("--model"), mode_name = args.get("--profile", "off");
@@ -136,6 +134,7 @@ int main(int argc, char ** argv) {
             throw std::invalid_argument("Model, JSON and trace paths must differ");
         tidal::Options options{args.get("--backend", "cuda"), args.integer("--device", 0), args.integer("--threads", 4)};
         options.sampling = sampling_config(args);
+        configure_prefill(args, options);
         const bool capture = capture_logits(args, false);
         options.context = args.integer("--context", 0);
         options.nvtx = nvtx != 0;
@@ -176,7 +175,8 @@ int main(int argc, char ** argv) {
             decode_latencies.insert(decode_latencies.end(), r.decode_latencies.begin(), r.decode_latencies.end());
             runs.push_back(std::move(r));
         }
-        total_latencies = prefill_latencies; total_latencies.insert(total_latencies.end(), decode_latencies.begin(), decode_latencies.end());
+        // A batch prefill has no independently measured per-token completion times.
+        // Do not mix its amortized time with measured decode latency samples.
         Run diagnostic;
         double profile_error = 0, profile_nrmse = 0;
         bool selection_match = true;
@@ -227,9 +227,10 @@ int main(int argc, char ** argv) {
         out << ",\"steps\":" << steps << ",\"warmup\":" << warmup << ",\"repetitions\":" << repetitions
             << ",\"capture_logits\":" << (capture ? "true" : "false") << ",\"sampling\":";
         sampling_json(out, options.sampling);
+        out << ",\"prefill\":"; prefill_json(out, options);
         out << ",\"sampling_backend\":"; report::string(out, engine.sampling_backend_name()); out << '}'
-            << ",\"timing\":{\"clock\":\"steady_clock\",\"unit\":\"milliseconds\",\"includes\":\"decode API, transfers, CPU attention, configured sampling; prefill is sequential\","
-               "\"excludes\":\"model load, reset, warmup, checksum, serialization, diagnostic replay\"}"
+            << ",\"timing\":{\"clock\":\"steady_clock\",\"unit\":\"milliseconds\",\"includes\":\"prefill API including KV export and weight restoration; decode API including transfers, CPU attention and sampling\","
+               "\"prefill_latency_semantics\":\"batch completion in run_ms; no per-token samples\",\"excludes\":\"model load, reset, warmup, checksum, serialization, diagnostic replay\"}"
             << ",\"model_load_ms\":" << load_ms << ",\"summary\":{\"prefill\":";
         metric(out, prefill_times, int(prompt.size()), prefill_latencies);
         out << ",\"decode\":"; metric(out, decode_times, steps, decode_latencies);

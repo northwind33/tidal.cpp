@@ -71,11 +71,15 @@ void PrefillMemory::release(uint64_t bytes) {
 }
 void PrefillMemory::prefetch(std::vector<int> groups) {
     auto saved = protected_;
-    for (int id : groups) if (id >= 0 && !model_.resident(id)) protected_.push_back(id);
+    // Protect requested resident groups too: evicting one while making room for
+    // another would invalidate the missing-byte estimate and undo the prefetch.
+    for (int id : groups) if (id >= 0) protected_.push_back(id);
     uint64_t needed = 0;
     for (int id : groups) if (id >= 0 && !model_.resident(id)) needed += model_.groups[id].allocation_bytes;
-    if (needed && make_room(needed, false))
-        for (int id : groups) if (id >= 0 && !model_.resident(id)) upload(id, true, "prefill.weights");
+    try {
+        if (needed && make_room(needed, false))
+            for (int id : groups) if (id >= 0 && !model_.resident(id)) upload(id, true, "prefill.weights");
+    } catch (...) { protected_ = std::move(saved); throw; }
     protected_ = std::move(saved);
 }
 void PrefillMemory::restore() {

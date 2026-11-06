@@ -78,11 +78,16 @@ def placement(data, c, count, backend, recurrent):
     assert data['attention_backend']=='CPU' and data['kv_type']=='BF16'
     assert data['backend'].startswith('CUDA' if backend=='cuda' else 'CPU')
     attn = sum(not x for x in recurrent); s=data['statistics']
-    assert s['full_attention_calls']==attn*count and s['sparse_attention_calls']==0
+    prefill=s.get('prefill_tokens',0) if backend=='cuda' else 0
+    assert s['full_attention_calls']==attn*(count-prefill) and s['sparse_attention_calls']==0
     q=c['attention.head_count']*c['attention.key_length'];kv=c['attention.head_count_kv']*c['attention.key_length']
     down=4*count*(c['vocab']+attn*(q+2*kv)) if backend=='cuda' else 0
     up=4*count*(1+attn*(2+q)) if backend=='cuda' else 0
     if backend=='cuda': down += 12*len(data['generated'])
+    if prefill:
+        down=4*((count+1)*c['vocab']+1+attn*(count-prefill)*(q+2*kv)) + 4*prefill*kv*attn + 12*len(data['generated'])
+        up=4*(count+attn*(2*count+(count-prefill)*q))
+        assert s['prefill_kv_to_host_bytes']==4*prefill*kv*attn
     assert s['device_to_host_bytes']==down and s['host_to_device_bytes']==up, (s,down,up)
     for pos,step in enumerate(data['trace']):
         assert step['selections']==[dict(layer=i,tokens=list(range(pos+1))) for i,r in enumerate(recurrent) if not r]
@@ -115,7 +120,8 @@ def main():
             assert data['model']['parameters']==expected_params
             for i,token in enumerate(PROMPT+data['generated']):
                 expected,selected=ref.decode(token);actual=np.asarray(data['trace'][i]['logits'])
-                np.testing.assert_allclose(actual,expected,atol=4e-4,rtol=4e-4,err_msg=f'{label} token {i}')
+                tolerance=2e-3 if args.backend=='cuda' else 4e-4
+                np.testing.assert_allclose(actual,expected,atol=tolerance,rtol=tolerance,err_msg=f'{label} token {i}')
                 assert np.linalg.norm(actual-expected)/np.linalg.norm(expected)<.002
                 if len(PROMPT)-1<=i<27:assert int(expected.argmax())==data['generated'][i-len(PROMPT)+1]
             run(b/'tidal-state-test',model,args.backend)

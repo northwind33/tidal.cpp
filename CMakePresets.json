@@ -22,7 +22,7 @@
         "TIDAL_CUDA": true,
         "BUILD_TESTING": true,
         "GGML_NATIVE": false,
-        "GGML_CUDA_FA": false
+        "GGML_CUDA_FA": true
       }
     }
   ],

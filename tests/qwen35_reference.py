@@ -16,6 +16,7 @@ class Qwen35Reference:
         assert self.meta["general.architecture"] == "qwen35"
         self.c = {k[7:]: v for k, v in self.meta.items() if k.startswith("qwen35.")}
         self.backend = backend
+        self.prefill_columns = 0
         self.data = np.memmap(path, dtype=np.uint8, mode="r")
         self.weights = {}
         self.layers = self.c["block_count"] - self.c.get("nextn_predict_layers", 0)
@@ -64,12 +65,23 @@ class Qwen35Reference:
         if kind == 30 and self.backend == "cpu": x = bf16(x)
         if kind == 1 and self.backend == "cpu": x = x.astype(np.float16).astype(np.float32)
         if kind == 8:
+            columns = self.prefill_columns
+            if name in ("output.weight", "token_embd.weight"):
+                columns = getattr(self, "prefill_head_columns", columns)
+            mmq = self.backend == "cuda" and columns > 8
             blocks = x.reshape(-1, 32)
             maximum = np.max(np.abs(blocks), axis=1)
             if self.backend == "cpu":
                 scale = maximum / np.float32(127)
                 inv = np.divide(127, maximum, out=np.zeros_like(maximum), where=maximum != 0)
                 quant = np.rint(blocks * inv[:, None])
+            elif mmq:
+                inv = np.divide(127, maximum, out=np.zeros_like(maximum), where=maximum != 0)
+                value = blocks * inv[:, None]
+                magnitude = np.abs(value)
+                lower = np.floor(magnitude)
+                quant = np.copysign(lower + (magnitude-lower >= .5), value)
+                scale = np.divide(1, inv, out=np.zeros_like(inv), where=inv != 0)
             else:
                 scale = maximum * np.float32(1/127)
                 inv = np.divide(1, scale, out=np.zeros_like(scale), where=scale != 0)
@@ -79,7 +91,8 @@ class Qwen35Reference:
                 quant = np.copysign(lower + (magnitude-lower >= .5), value)
             scales, codes = self.q8(name)
             dot = np.einsum("obd,bd->ob", codes, quant)
-            return (dot * scales * scale.astype(np.float16).astype(np.float32)).sum(axis=1)
+            if not mmq: scale = scale.astype(np.float16).astype(np.float32)
+            return (dot * scales * scale).sum(axis=1)
         return self.weight(name) @ x
 
     def norm(self, x, name):
@@ -126,6 +139,10 @@ class Qwen35Reference:
         state["values"].append(bf16(self.mm(p+"attn_v.weight", x).reshape(hk, d)))
         keys = np.repeat(np.stack(state["keys"]), h//hk, axis=1)
         values = np.repeat(np.stack(state["values"]), h//hk, axis=1)
+        if self.backend == "cuda" and self.prefill_columns > 8:
+            q = q.astype(np.float16).astype(np.float32)
+            keys = keys.astype(np.float16).astype(np.float32)
+            values = values.astype(np.float16).astype(np.float32)
         scores = np.einsum("hd,thd->ht", q, keys) / np.sqrt(np.float32(d))
         attended = np.einsum("ht,thd->hd", softmax(scores), values) * sigmoid(qg[:, d:])
         return self.mm(p+"attn_output.weight", attended.reshape(-1))

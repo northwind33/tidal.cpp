@@ -1,5 +1,6 @@
 #pragma once
 #include "sampling_options.hpp"
+#include "prefill_options.hpp"
 #include "tidal/tidal.hpp"
 #include <algorithm>
 #include <cmath>
@@ -86,7 +87,7 @@ inline void stats(std::ostream & out, const tidal::Statistics & s) {
         << ",\"d2h_bytes\":" << s.device_to_host_bytes << ",\"h2d_bytes\":" << s.host_to_device_bytes
         << ",\"graph_ms\":" << s.graph_ms << ",\"cpu_attention_ms\":" << s.attention_ms
         << ",\"transfer_ms\":" << s.transfer_ms << ",\"full_attention_calls\":" << s.full_attention_calls;
-    sampling_stats(out, s); out << '}';
+    sampling_stats(out, s); prefill_stats(out, s); out << '}';
 }
 inline void model_info(std::ostream & out, const tidal::ModelInfo & m) {
     out << "{\"parameters\":" << m.parameters << ",\"stored_weight_bytes\":" << m.stored_weight_bytes
@@ -114,7 +115,7 @@ inline void events(std::ostream & out, const std::vector<tidal::ProfileEvent> & 
         const auto & e = events[i];
         out << "{\"name\":"; string(out, e.name);
         out << ",\"cat\":"; string(out, e.category);
-        if (chrome) out << ",\"ph\":\"X\",\"pid\":1,\"tid\":" << (e.head < 0 ? 0 : e.head + 1);
+        if (chrome) out << ",\"ph\":\"X\",\"pid\":1,\"tid\":" << (e.phase == "prefill.kv" && e.category != "host" ? 1000 : e.name == "kv_commit_bf16" ? 1000 : e.head < 0 ? 0 : e.head + 1);
         out << ",\"ts\":" << e.start_us << ",\"dur\":" << e.wall_us << ",\"args\":";
         event_args(out, e); out << '}';
     }

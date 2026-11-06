@@ -1,5 +1,6 @@
 #include "tidal/tidal.hpp"
 #include "args.hpp"
+#include "prefill_options.hpp"
 #include "sampling_options.hpp"
 #include "report.hpp"
 
@@ -17,11 +18,12 @@ template<class T> void array(std::ostream & out, const std::vector<T> & values) 
 }
 int main(int argc, char ** argv) {
     try {
-        Args args(argc, argv, sampling_options({"--help", "--model", "--backend", "--device", "--threads", "--tokens", "--steps", "--json", "--repeat", "--context", "--stop-at-eos"}));
+        Args args(argc, argv, prefill_options(sampling_options({"--help", "--model", "--backend", "--device", "--threads", "--tokens", "--steps", "--json", "--repeat", "--context", "--stop-at-eos"})));
         if (!args.get("--help").empty()) {
             std::cout << "tidal-cli --model tiny.gguf [--backend cuda|cpu] [--device 0] [--threads 4] "
                          "[--tokens 1,2,3] [--steps 8] [--json trace.json] [--repeat 1] [--context N] [--stop-at-eos 0|1]\n";
             sampling_help(std::cout);
+            prefill_help(std::cout);
             return 0;
         }
         auto path = args.get("--model");
@@ -35,6 +37,7 @@ int main(int argc, char ** argv) {
         if (steps < 0 || repeat < 1 || repeat > 1000) throw std::invalid_argument("Invalid steps or repeat count");
         tidal::Options options{args.get("--backend", "cuda"), args.integer("--device", 0), args.integer("--threads", 4)};
         options.sampling = sampling_config(args);
+        configure_prefill(args, options);
         const bool capture = capture_logits(args, args.contains("--json"));
         options.context = args.integer("--context", 0);
         tidal::Engine engine(path, options);
@@ -78,7 +81,7 @@ int main(int argc, char ** argv) {
         std::cout << "model="; report::model_info(std::cout, engine.model_info()); std::cout << '\n';
         const bool full = engine.config().architecture == tidal::Architecture::Qwen35;
         std::cout << "backend=" << engine.backend_name() << (full ? "; full_attention=CPU; KV=BF16; " : "; sparse_attention=CPU; KV=BF16; ")
-                  << "tokens=" << trace.size() << "; repeats=" << repeat << '\n';
+                  << "prefill_attention=" << (options.backend == "cuda" ? "CUDA" : "CPU") << "; tokens=" << trace.size() << "; repeats=" << repeat << '\n';
         std::cout << "sampler=" << engine.sampling_backend_name() << "; sampling_ms=" << s.sampling_ms << '\n';
         std::cout << "generated="; array(std::cout, generated); std::cout << '\n';
         std::cout << "wall_seconds=" << seconds << "; graph_ms=" << s.graph_ms << "; cpu_attention_ms=" << s.attention_ms
@@ -94,6 +97,7 @@ int main(int argc, char ** argv) {
             if (!full) out << ",\"sparse_attention_backend\":\"CPU\"";
             out << ",\"architecture\":\"" << (full ? "qwen35" : "tidal-qwen4exp")
                 << "\",\"attention_kind\":\"" << (full ? "full" : "sparse") << "\",\"attention_backend\":\"CPU\"";
+            out << ",\"prefill\":"; prefill_json(out, options);
             out << ",\"sampling\":"; sampling_json(out, options.sampling);
             out << ",\"sampling_backend\":"; report::string(out, engine.sampling_backend_name());
             out << ",\"capture_logits\":" << (capture ? "true" : "false");
@@ -105,7 +109,7 @@ int main(int argc, char ** argv) {
                 << ",\"host_to_device_bytes\":" << s.host_to_device_bytes
                 << ",\"graph_ms\":" << s.graph_ms << ",\"attention_ms\":" << s.attention_ms
                 << ",\"transfer_ms\":" << s.transfer_ms;
-            sampling_stats(out, s); out << "},\"trace\":[";
+            sampling_stats(out, s); prefill_stats(out, s); out << "},\"trace\":[";
             for (size_t i = 0; i < trace.size(); ++i) {
                 if (i) out << ',';
                 out << "{\"position\":" << trace[i].position << ",\"logits\":";

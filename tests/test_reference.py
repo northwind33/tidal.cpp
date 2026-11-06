@@ -21,9 +21,10 @@ FORMATS = ["f32", "f16", "bf16", "q8_0", "q4_0"]
 PROMPT = [1, 7, 23, 9, 42, 5, 6, 2, 77, 13, 84, 11, 90, 3, 42, 28, 61, 7, 0, 93, 34, 22, 1, 255]
 TOLERANCES = {
     "cpu": dict(zip(FORMATS, [2e-4, 3e-3, 1.2e-2, 2.5e-2, 2.5e-2])),
-    # F32 differences can cross BF16 cache rounding boundaries. CUDA floating
-    # matvecs keep F32 inputs, so F16/BF16 need much tighter bounds than on CPU.
-    "cuda": dict(zip(FORMATS, [4e-4, 1e-3, 4e-4, 2.5e-2, 2.5e-2])),
+    # Batch attention rounds MMA operands to FP16; recurrent propagation and
+    # BF16 cache boundaries add error beyond the single-token F32 path. Native
+    # matrix tests retain their tighter, separate arithmetic tolerances.
+    "cuda": dict(zip(FORMATS, [8e-4, 1e-3, 8e-4, 2.5e-2, 2.5e-2])),
 }
 
 
@@ -84,7 +85,9 @@ def check_placement(result, config, backend, steps):
     assert result["kv_type"] == "BF16"
     stats = result["statistics"]
     qsa_layers = config["layers"] // 4
-    assert stats["sparse_attention_calls"] == steps * qsa_layers
+    prefill = stats.get("prefill_tokens", 0) if backend == "cuda" else 0
+    decode = steps - prefill
+    assert stats["sparse_attention_calls"] == decode * qsa_layers
     assert stats["backend_graph_nodes"] > 0
     # Only current Q/K/V, selected IDs and final logits leave the device.
     # Account for every byte, including RoPE positions and token IDs on upload.
@@ -97,6 +100,23 @@ def check_placement(result, config, backend, steps):
     if config.get("ple.layers"):
         h2d += 4 * steps * len(config["ple.layers"]) * (config["ple.ngram_size"] - 1) * config["ple.heads_per_ngram"]
     d2h += 12 * len(result["generated"]) # GPU sampler token/error/candidate count.
+    if prefill:
+        blocks = prefill // config["block_size"]
+        tile = result["prefill"]["attention_tile"]
+        prefill_ids = prefill * min(config["top_blocks"], blocks)
+        decode_ids = sum(min(config["top_blocks"], visible // config["block_size"])
+                         for visible in range(prefill+1,steps+1))
+        # Captured prompt logits use a batched diagnostic head plus the same
+        # final single-position head as compact inference, and one finite flag.
+        d2h = 4*((steps+1)*config["vocab"] + 1 + qsa_layers*(
+            decode*(q_width+2*kv_width)+prefill_ids+decode_ids))
+        d2h += 4*prefill*kv_width*qsa_layers + 12*len(result["generated"])
+        mask_inputs = prefill + prefill*config["block_size"] + ((prefill+tile-1)//tile)*blocks*config["block_size"] if blocks else 0
+        h2d = 4*(steps+qsa_layers*(3*steps+steps//config["block_size"]+decode*q_width+mask_inputs))
+        if config.get("ple.layers"):
+            h2d += 4*steps*len(config["ple.layers"])*(config["ple.ngram_size"]-1)*config["ple.heads_per_ngram"]
+        assert stats["prefill_layers"] == config["layers"]
+        assert stats["prefill_kv_to_host_bytes"] == 4*prefill*kv_width*qsa_layers
     assert stats["device_to_host_bytes"] == (d2h if backend == "cuda" else 0), stats
     assert stats["host_to_device_bytes"] == (h2d if backend == "cuda" else 0), stats
 
@@ -106,6 +126,8 @@ def check_trace(result, reference, tolerance, label, prompt=PROMPT):
     assert len(result["trace"]) == len(sequence)
     max_error, max_nrmse = 0, 0
     for i, token in enumerate(sequence):
+        reference.prefill_columns = len(prompt) if result.get("prefill",{}).get("execution")=="layer_major" and i<len(prompt) else 0
+        reference.prefill_head_columns = reference.prefill_columns if i!=len(prompt)-1 else 0
         expected, selected = reference.decode(token)
         step = result["trace"][i]
         actual = np.array(step["logits"])
@@ -149,7 +171,7 @@ def check_multi(root, bins, backend):
     result, reference = json.loads(trace.read_text()), Reference(model, backend)
     assert result["generated"] == []
     check_placement(result, reference.c, backend, len(PROMPT))
-    check_trace(result, reference, 3e-4, "8 layers / hidden 256")
+    check_trace(result, reference, 8e-4 if backend=="cuda" else 3e-4, "8 layers / hidden 256")
     print("8 layers / hidden 256: two independent QSA caches + reset passed", flush=True)
 
 

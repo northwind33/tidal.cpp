@@ -10,6 +10,9 @@ option(TIDAL_SANITIZE "Enable address and undefined-behavior sanitizers" OFF)
 set(TIDAL_GGML_SOURCE_DIR "" CACHE PATH "Use an existing checkout of the pinned ggml revision")
 
 set(GGML_CUDA ${TIDAL_CUDA} CACHE BOOL "" FORCE)
+if(TIDAL_CUDA)
+    set(GGML_CUDA_FA ON CACHE BOOL "Required by GPU layer prefill" FORCE)
+endif()
 set(GGML_METAL OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -26,7 +29,7 @@ else()
     set(TIDAL_GGML_BUILD_SOURCE "${ggml_SOURCE_DIR}")
 endif()
 
-add_library(tidal src/model.cpp src/qwen35.cpp src/quant.cpp src/ple.cpp src/engine.cpp src/sparse_attention.cpp src/sampling.cpp src/prefill_memory.cpp)
+add_library(tidal src/model.cpp src/qwen35.cpp src/quant.cpp src/ple.cpp src/engine.cpp src/sparse_attention.cpp src/sampling.cpp src/prefill_memory.cpp src/kv_export.cpp)
 target_include_directories(tidal PUBLIC include PRIVATE src)
 target_link_libraries(tidal PUBLIC ggml ggml-cpu)
 if(TIDAL_CUDA)
@@ -80,6 +83,8 @@ target_compile_definitions(tidal-bench PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(tidal-prefill-test tests/prefill.cpp)
+    target_link_libraries(tidal-prefill-test PRIVATE tidal)
     add_executable(tidal-residency-test tests/residency.cpp)
     target_link_libraries(tidal-residency-test PRIVATE tidal)
     target_include_directories(tidal-residency-test PRIVATE src)
@@ -133,6 +138,9 @@ if(BUILD_TESTING)
         execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy"
             RESULT_VARIABLE TIDAL_NUMPY_STATUS OUTPUT_QUIET ERROR_QUIET)
         if(TIDAL_NUMPY_STATUS EQUAL 0)
+            add_test(NAME prefill COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_prefill.py --bin-dir $<TARGET_FILE_DIR:tidal-cli>)
+            set_tests_properties(prefill PROPERTIES TIMEOUT 240)
             add_test(NAME residency COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_residency.py --bin-dir $<TARGET_FILE_DIR:tidal-cli>)
             set_tests_properties(residency PROPERTIES TIMEOUT 180)

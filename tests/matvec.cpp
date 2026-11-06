@@ -33,8 +33,12 @@ int main(int argc, char ** argv) {
         for (std::string name; std::cin >> name;) {
             const bool gather = name == "@rows";
             const bool expert = name == "@expert";
-            if ((gather || expert) && !(std::cin >> name)) throw std::invalid_argument("Missing tensor name");
+            const bool batch = name == "@batch";
+            if ((gather || expert || batch) && !(std::cin >> name)) throw std::invalid_argument("Missing tensor name");
             auto * weight = model.at(name);
+            int columns = 1;
+            if (batch && (!(std::cin >> columns) || columns < 1 || columns > 4096))
+                throw std::invalid_argument("Invalid batch columns");
             int32_t expert_id = 0;
             if (expert && (!(std::cin >> expert_id) || expert_id < 0 || expert_id >= weight->ne[2]))
                 throw std::invalid_argument("Invalid expert ID");
@@ -47,14 +51,14 @@ int main(int argc, char ** argv) {
                 for (auto & row : rows)
                     if (!(std::cin >> row) || row < 0 || row >= weight->ne[1]) throw std::invalid_argument("Invalid row index");
             } else {
-                input.resize(size_t(weight->ne[0]));
+                input.resize(size_t(weight->ne[0])*columns);
                 for (auto & value : input)
                     if (!(std::cin >> value)) throw std::invalid_argument("Truncated input vector");
             }
             tidal::Context ctx(ggml_init({1024 * 1024, nullptr, true}), ggml_free);
             if (!ctx) throw std::runtime_error("Context allocation failed");
-            auto * x = ggml_new_tensor_1d(ctx.get(), gather ? GGML_TYPE_I32 : GGML_TYPE_F32,
-                                          int64_t(gather ? rows.size() : input.size()));
+            auto * x = ggml_new_tensor_2d(ctx.get(), gather ? GGML_TYPE_I32 : GGML_TYPE_F32,
+                                          int64_t(gather ? rows.size() : weight->ne[0]), columns);
             auto * ids = expert ? ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, 1) : nullptr;
             auto * y = expert ? ggml_mul_mat_id(ctx.get(), weight, x, ids) :
                 gather ? ggml_get_rows(ctx.get(), weight, x) : ggml_mul_mat(ctx.get(), weight, x);
