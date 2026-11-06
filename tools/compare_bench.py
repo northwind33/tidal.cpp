@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 
-def compare(before, after):
+def compare(before, after, allow_sampler_change=False):
     for value in (before, after):
         if value.get("schema_version") != 1 or value.get("kind") != "tidal-benchmark":
             raise ValueError("Expected tidal-benchmark schema_version 1")
@@ -20,6 +20,13 @@ def compare(before, after):
         for key in keys:
             if before[section][key] != after[section][key]:
                 raise ValueError(f"Incompatible reports: {section}.{key} differs")
+    if before["workload"].get("capture_logits", True) != after["workload"].get("capture_logits", True):
+        raise ValueError("Incompatible reports: logit capture differs")
+    a, b = dict(before["workload"].get("sampling", {})), dict(after["workload"].get("sampling", {}))
+    if allow_sampler_change:
+        a.pop("backend", None); b.pop("backend", None)
+    if a != b:
+        raise ValueError("Incompatible sampling settings; use --allow-sampler-change only to compare CPU/device execution")
     if not before["runs"] or not after["runs"]:
         raise ValueError("Empty measured runs")
     expected = before["runs"][0]["generated"]
@@ -63,13 +70,14 @@ def main():
     parser.add_argument("candidate", type=Path)
     parser.add_argument("--max-regression", type=float, help="Fail if any measured throughput decreases by more than this percent")
     parser.add_argument("--json", type=Path)
+    parser.add_argument("--allow-sampler-change", action="store_true", help="Allow CPU/device sampler differences; all sampling parameters and generated tokens must still match")
     args = parser.parse_args()
     if args.max_regression is not None and (not math.isfinite(args.max_regression) or args.max_regression < 0):
         parser.error("--max-regression must be finite and nonnegative")
     if args.json and args.json.resolve() in (args.baseline.resolve(), args.candidate.resolve()):
         parser.error("Comparison output must differ from both input reports")
     try:
-        result = compare(json.loads(args.baseline.read_text()), json.loads(args.candidate.read_text()))
+        result = compare(json.loads(args.baseline.read_text()), json.loads(args.candidate.read_text()), args.allow_sampler_change)
         for row in result["metrics"]:
             print(f"{row['phase']}: {row['before_tokens_per_second']:.3f} -> {row['after_tokens_per_second']:.3f} tokens/s "
                   f"({row['throughput_change_percent']:+.2f}%); p95 {row['before_p95_ms']:.3f} -> {row['after_p95_ms']:.3f} ms")

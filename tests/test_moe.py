@@ -73,7 +73,7 @@ def main():
             run(b / "tidal-dummy", "--output", root / "bad.gguf", *extra, ok=False)
         profile_path = root / "profile.json"
         run(b / "tidal-bench", "--model", model, "--backend", args.backend, "--prompt", 3, "--steps", 1,
-            "--warmup", 0, "--repetitions", 1, "--profile", "nodes", "--json", profile_path)
+            "--warmup", 0, "--repetitions", 1, "--profile", "nodes", "--logits", 1, "--json", profile_path)
         profile = json.loads(profile_path.read_text())["profile"]
         nodes = [e for e in profile["events"] if e["cat"] == "node"]
         assert any(e["args"]["op"] == "MUL_MAT_ID" for e in nodes)

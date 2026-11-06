@@ -42,6 +42,31 @@ int main(int argc, char ** argv) {
                 }
             }
         }
+        // Compact decode retains the GPU logits until sample(), and reset must
+        // discard both consumed-token history and random state.
+        tidal::Options options{argv[2], 0, 2};
+        options.sampling.temperature = .8f;
+        options.sampling.top_k = 31;
+        options.sampling.top_p = .9f;
+        options.sampling.repeat_penalty = 1.2f;
+        options.sampling.penalty_last_n = 4;
+        options.sampling.seed = 71;
+        tidal::Engine sampled(argv[1], options);
+        bool rejected = false;
+        try { sampled.sample(); } catch (const std::logic_error &) { rejected = true; }
+        if (!rejected) throw std::runtime_error("Sampling before decode succeeded");
+        std::vector<int32_t> draws;
+        for (int pass = 0; pass < 2; ++pass) {
+            sampled.reset();
+            if (!pass) sampled.prefill({1,2,3,2}, true);
+            else { sampled.decode(1, false); sampled.prefill({2,3,2}, false); }
+            for (int i = 0; i < 5; ++i) {
+                const auto token = sampled.sample();
+                if (!pass) draws.push_back(token);
+                else if (draws[i] != token) throw std::runtime_error("Capture/chunk/reset changed sampling");
+                sampled.decode(token, !pass);
+            }
+        }
         std::cout << "Chunked prefill/decode, rejected input and partial reset passed\n";
     } catch (const std::exception & e) { std::cerr << e.what() << '\n'; return 1; }
 }

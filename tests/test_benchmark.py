@@ -28,7 +28,7 @@ def main():
         model = root / 'model-"quoted.gguf'
         run(dummy, "--output", model, "--context", 32)
         base = [bench, "--model", model, "--backend", args.backend, "--prompt", 8, "--steps", 4,
-                "--warmup", 1, "--repetitions", 2, "--threads", 2]
+                "--warmup", 1, "--repetitions", 2, "--threads", 2, "--logits", 1]
         reports = {}
         for mode in ["off", "phases", "nodes"]:
             path, trace = root / f"{mode}.json", root / f"{mode}-trace.json"
@@ -55,7 +55,7 @@ def main():
             p = r["profile"]
             assert p["separate_replay"] and p["fixed_generated_tokens"]
             assert p["dropped_events"] == 0
-            assert p["qsa_matches_baseline"] and p["greedy_matches_baseline"]
+            assert p["qsa_matches_baseline"] and p["sampled_matches_baseline"]
             assert p["logits_max_abs_vs_baseline"] < 5e-4
             assert p["statistics"]["sparse_attention_calls"] == 12
             events = p["events"]
@@ -93,7 +93,7 @@ def main():
             quantized, output = root / f"{kind}.gguf", root / f"{kind}.json"
             run(dummy, "--output", quantized, "--type", kind, "--context", 32)
             run(bench, "--model", quantized, "--backend", args.backend, "--prompt", 8, "--steps", 4,
-                "--warmup", 0, "--repetitions", 1, "--profile", "nodes", "--json", output)
+                "--warmup", 0, "--repetitions", 1, "--profile", "nodes", "--logits", 1, "--json", output)
             profile = json.loads(output.read_text())["profile"]
             assert profile["dropped_events"] == 0 and profile["qsa_matches_baseline"]
             assert profile["logits_max_nrmse_vs_baseline"] < .025, (kind, profile["logits_max_nrmse_vs_baseline"])
@@ -102,11 +102,11 @@ def main():
         ple, output = root / "ple.gguf", root / "ple.json"
         run(dummy, "--output", ple, "--ple-layers", "0,2", "--context", 32)
         run(bench, "--model", ple, "--backend", args.backend, "--prompt", 8, "--steps", 4,
-            "--warmup", 0, "--repetitions", 1, "--profile", "nodes", "--json", output)
+            "--warmup", 0, "--repetitions", 1, "--profile", "nodes", "--logits", 1, "--json", output)
         report = json.loads(output.read_text())
         assert [l["layer"] for l in report["model"]["config"]["ple"]["layers"]] == [0, 2]
         profile = report["profile"]
-        assert profile["qsa_matches_baseline"] and profile["greedy_matches_baseline"]
+        assert profile["qsa_matches_baseline"] and profile["sampled_matches_baseline"]
         assert profile["logits_max_abs_vs_baseline"] < 5e-4 and profile["dropped_events"] == 0
         events = [e for e in profile["events"] if e["args"]["phase"] == "ple"]
         assert len([e for e in events if e["name"] == "ngram_hash"]) == 24
@@ -127,6 +127,19 @@ def main():
         candidate["environment"]["threads"] += 1
         changed.write_text(json.dumps(candidate))
         run(sys.executable, compare, baseline, changed, code=2)
+        # Explicit sampler comparison may relax execution placement only.
+        candidate = copy.deepcopy(reports["off"])
+        candidate["workload"]["sampling"]["backend"] = "cpu"
+        changed.write_text(json.dumps(candidate))
+        run(sys.executable, compare, baseline, changed, code=2)
+        run(sys.executable, compare, baseline, changed, "--allow-sampler-change")
+        candidate["workload"]["sampling"]["seed"] += 1
+        changed.write_text(json.dumps(candidate))
+        run(sys.executable, compare, baseline, changed, "--allow-sampler-change", code=2)
+        candidate = copy.deepcopy(reports["off"])
+        candidate["workload"]["capture_logits"] = False
+        changed.write_text(json.dumps(candidate))
+        run(sys.executable, compare, baseline, changed, "--allow-sampler-change", code=2)
         # Zero generated tokens and bad requests have explicit behavior.
         zero = root / "zero.json"
         run(bench, "--model", model, "--backend", args.backend, "--tokens", "1,2", "--steps", 0,

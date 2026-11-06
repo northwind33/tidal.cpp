@@ -96,6 +96,7 @@ def check_placement(result, config, backend, steps):
     h2d = 4 * (steps + qsa_layers * (steps * (3 + q_width) + steps // config["block_size"]))
     if config.get("ple.layers"):
         h2d += 4 * steps * len(config["ple.layers"]) * (config["ple.ngram_size"] - 1) * config["ple.heads_per_ngram"]
+    d2h += 12 * len(result["generated"]) # GPU sampler token/error/candidate count.
     assert stats["device_to_host_bytes"] == (d2h if backend == "cuda" else 0), stats
     assert stats["host_to_device_bytes"] == (h2d if backend == "cuda" else 0), stats
 

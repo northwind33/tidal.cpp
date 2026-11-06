@@ -82,6 +82,7 @@ def placement(data, c, count, backend, recurrent):
     q=c['attention.head_count']*c['attention.key_length'];kv=c['attention.head_count_kv']*c['attention.key_length']
     down=4*count*(c['vocab']+attn*(q+2*kv)) if backend=='cuda' else 0
     up=4*count*(1+attn*(2+q)) if backend=='cuda' else 0
+    if backend=='cuda': down += 12*len(data['generated'])
     assert s['device_to_host_bytes']==down and s['host_to_device_bytes']==up, (s,down,up)
     for pos,step in enumerate(data['trace']):
         assert step['selections']==[dict(layer=i,tokens=list(range(pos+1))) for i,r in enumerate(recurrent) if not r]

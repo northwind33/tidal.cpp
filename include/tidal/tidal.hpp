@@ -67,6 +67,25 @@ struct Config {
 
 enum class ProfileMode { Off, Phases, Nodes };
 
+enum class SamplingBackend { Device, CPU };
+
+struct SamplingConfig {
+    SamplingBackend backend = SamplingBackend::Device;
+    float temperature = 0; // Zero preserves greedy generation.
+    int top_k = 0;         // Zero or -1 disables top-k.
+    float top_p = 1;
+    float min_p = 0;
+    float repeat_penalty = 1;
+    float frequency_penalty = 0;
+    float presence_penalty = 0;
+    int penalty_last_n = 64; // -1: entire consumed sequence; 0: no penalties.
+    uint64_t seed = 0;
+    void validate() const;
+    bool penalties() const {
+        return penalty_last_n != 0 && (repeat_penalty != 1 || frequency_penalty != 0 || presence_penalty != 0);
+    }
+};
+
 struct ProfileEvent {
     std::string category, name, phase, backend, op, dtype;
     std::vector<int64_t> shape;
@@ -85,6 +104,7 @@ struct Options {
     bool nvtx = false;
     uint64_t profile_event_limit = 500000;
     int context = 0; // 0 uses GGUF capacity; otherwise bounded by the model capacity.
+    SamplingConfig sampling;
 };
 
 struct Selection {
@@ -107,6 +127,10 @@ struct Statistics {
     double graph_ms = 0;
     double attention_ms = 0;
     double transfer_ms = 0;
+    uint64_t sampling_calls = 0;
+    uint64_t sampling_device_to_host_bytes = 0;
+    uint64_t sampling_host_to_device_bytes = 0;
+    double sampling_ms = 0; // Inclusive of sampler transfers; overlaps transfer_ms.
 };
 
 struct ModelInfo {
@@ -125,9 +149,13 @@ public:
     ~Engine();
     Engine(const Engine &) = delete;
     Engine & operator=(const Engine &) = delete;
-    Step decode(int32_t token);
+    // Disable capture to keep the full vocabulary vector on the device.
+    Step decode(int32_t token, bool capture_logits = true);
     // Correctness-first prompt ingestion: exactly the same transitions as decode.
-    std::vector<Step> prefill(const std::vector<int32_t> & tokens);
+    std::vector<Step> prefill(const std::vector<int32_t> & tokens, bool capture_logits = true);
+    // Draw from the last decoded position; consumes RNG but no context token.
+    int32_t sample();
+    std::string sampling_backend_name() const;
     void reset();
     const Config & config() const;
     const Statistics & statistics() const;

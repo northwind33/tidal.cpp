@@ -1,4 +1,5 @@
 #pragma once
+#include "sampling_options.hpp"
 #include "tidal/tidal.hpp"
 #include <algorithm>
 #include <cmath>
@@ -84,7 +85,8 @@ inline void stats(std::ostream & out, const tidal::Statistics & s) {
         << ",\"sparse_attention_calls\":" << s.sparse_attention_calls
         << ",\"d2h_bytes\":" << s.device_to_host_bytes << ",\"h2d_bytes\":" << s.host_to_device_bytes
         << ",\"graph_ms\":" << s.graph_ms << ",\"cpu_attention_ms\":" << s.attention_ms
-        << ",\"transfer_ms\":" << s.transfer_ms << ",\"full_attention_calls\":" << s.full_attention_calls << '}';
+        << ",\"transfer_ms\":" << s.transfer_ms << ",\"full_attention_calls\":" << s.full_attention_calls;
+    sampling_stats(out, s); out << '}';
 }
 inline void model_info(std::ostream & out, const tidal::ModelInfo & m) {
     out << "{\"parameters\":" << m.parameters << ",\"stored_weight_bytes\":" << m.stored_weight_bytes

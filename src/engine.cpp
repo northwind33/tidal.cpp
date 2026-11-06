@@ -1,4 +1,5 @@
 #include "internal.hpp"
+#include "sampling.hpp"
 #include "profiler.hpp"
 #include "ggml-cpu.h"
 #ifdef TIDAL_CUDA
@@ -180,6 +181,9 @@ struct Engine::Impl {
     Context state_context;
     Buffer state_buffer{nullptr, ggml_backend_buffer_free};
     ggml_tensor * hidden;
+    ggml_tensor * last_logits;
+    std::vector<float> captured_logits;
+    std::unique_ptr<Sampler> sampler;
     std::vector<LayerState> states;
     std::vector<int32_t> previous_tokens;
     int position = 0;
@@ -192,6 +196,7 @@ struct Engine::Impl {
         if (options.context) c.context = options.context;
         auto * ctx = state_context.get();
         hidden = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.hidden, c.branches);
+        last_logits = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c.vocab);
         for (int i = 0; i < c.layers; ++i) {
             auto & s = states[i];
             if (c.is_recurrent(i)) {
@@ -220,6 +225,7 @@ struct Engine::Impl {
         }
         state_buffer.reset(ggml_backend_alloc_ctx_tensors(ctx, backend.get()));
         if (!state_buffer) throw std::runtime_error("State allocation failed");
+        sampler = std::make_unique<Sampler>(c.vocab, options.sampling, backend.get(), options.device, stats, profiler);
         reset();
     }
     Graph graph(const std::string & phase, int layer = -1) {
@@ -526,7 +532,7 @@ struct Engine::Impl {
         post.run();
         return {layer, std::move(visible)};
     }
-    Step decode(int32_t token) {
+    Step decode(int32_t token, bool capture_logits) {
         if (failed) throw std::runtime_error("Previous decode failed; call reset() before reusing the engine");
         if (token < 0 || token >= c.vocab) throw std::out_of_range("Token ID outside vocabulary");
         if (position >= c.context) throw std::out_of_range("Context capacity exceeded; reset before decoding a new sequence");
@@ -546,24 +552,40 @@ struct Engine::Impl {
             auto mixed = c.architecture == Architecture::Qwen35
                 ? Mixed{norm(head, hidden, "output_norm.weight"), nullptr} : mix(head, hidden, "head", false);
             auto * logits = mm(head, "output.weight", mixed.value);
-            head.add(logits);
+            head.add(ggml_cpy(head.c(), logits, last_logits));
+            // x-x is zero for finite x, NaN for NaN/Inf. Validate every prompt
+            // position without downloading its full vocabulary vector.
+            auto * finite = capture_logits ? nullptr : ggml_sum(head.c(), ggml_sub(head.c(), logits, logits));
+            if (finite) head.add(finite);
             head.run();
-            step.logits = head.get<float>(logits);
-            if (!std::all_of(step.logits.begin(), step.logits.end(), [](float f) { return std::isfinite(f); }))
+            captured_logits.clear();
+            if (capture_logits) step.logits = head.get<float>(last_logits);
+            if ((finite && !std::isfinite(head.get<float>(finite)[0])) ||
+                !std::all_of(step.logits.begin(), step.logits.end(), [](float f) { return std::isfinite(f); }))
                 throw std::runtime_error("Non-finite logits");
+            captured_logits = step.logits;
             if (!c.ple.layers.empty()) {
                 previous_tokens.push_back(token);
                 if (previous_tokens.size() >= size_t(c.ple.ngram_size)) previous_tokens.erase(previous_tokens.begin());
             }
+            sampler->accept(token);
             ++position;
             return step;
         } catch (...) { failed = true; throw; }
+    }
+    int32_t sample() {
+        if (failed) throw std::runtime_error("Previous execution failed; call reset() before sampling");
+        if (!position) throw std::logic_error("Decode at least one token before sampling");
+        try { return sampler->sample(last_logits, captured_logits.empty() ? nullptr : &captured_logits, position - 1); }
+        catch (...) { failed = true; throw; }
     }
     void reset() {
         ggml_backend_synchronize(backend.get());
         ggml_backend_buffer_clear(state_buffer.get(), 0);
         for (auto & s : states) if (s.attention) s.attention->reset();
         previous_tokens.clear();
+        captured_logits.clear();
+        sampler->reset();
         position = 0;
         failed = false;
         stats = {};
@@ -573,13 +595,15 @@ struct Engine::Impl {
 
 Engine::Engine(const std::string & path, Options options) : impl_(std::make_unique<Impl>(path, std::move(options))) {}
 Engine::~Engine() = default;
-Step Engine::decode(int32_t token) { return impl_->decode(token); }
-std::vector<Step> Engine::prefill(const std::vector<int32_t> & tokens) {
+Step Engine::decode(int32_t token, bool capture_logits) { return impl_->decode(token, capture_logits); }
+int32_t Engine::sample() { return impl_->sample(); }
+std::string Engine::sampling_backend_name() const { return impl_->sampler->backend_name(); }
+std::vector<Step> Engine::prefill(const std::vector<int32_t> & tokens, bool capture_logits) {
     if (tokens.size() > size_t(impl_->c.context - impl_->position)) throw std::out_of_range("Prompt exceeds context capacity");
     for (auto t : tokens) if (t < 0 || t >= impl_->c.vocab) throw std::out_of_range("Prompt token outside vocabulary");
     std::vector<Step> result;
     result.reserve(tokens.size());
-    for (int32_t t : tokens) result.push_back(decode(t));
+    for (int32_t t : tokens) result.push_back(decode(t, capture_logits));
     return result;
 }
 void Engine::reset() { impl_->reset(); }

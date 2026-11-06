@@ -44,10 +44,10 @@ struct Run {
     std::vector<tidal::Step> trace;
     tidal::Statistics stats;
     std::string checksum;
-    bool replay_greedy_matches = true;
+    bool replay_sampled_matches = true;
 };
 Run execute(tidal::Engine & engine, const std::vector<int32_t> & prompt, int steps,
-            const std::vector<int32_t> * replay = nullptr) {
+            bool capture, const std::vector<int32_t> * replay = nullptr) {
     Run r;
     r.trace.reserve(prompt.size() + size_t(steps));
     r.generated.reserve(steps); r.prefill_latencies.reserve(prompt.size()); r.decode_latencies.reserve(steps);
@@ -55,19 +55,18 @@ Run execute(tidal::Engine & engine, const std::vector<int32_t> & prompt, int ste
     start = Clock::now();
     for (int32_t token : prompt) {
         const auto tick = Clock::now();
-        r.trace.push_back(engine.decode(token));
+        r.trace.push_back(engine.decode(token, capture));
         r.prefill_latencies.push_back(ms(tick));
     }
     r.prefill_ms = ms(start);
     start = Clock::now();
     for (int i = 0; i < steps; ++i) {
         const auto tick = Clock::now();
-        const auto & logits = r.trace.back().logits;
-        const int32_t greedy = int32_t(std::max_element(logits.begin(), logits.end()) - logits.begin());
-        const int32_t token = replay ? replay->at(size_t(i)) : greedy;
-        r.replay_greedy_matches &= token == greedy;
+        const int32_t sampled = engine.sample();
+        const int32_t token = replay ? replay->at(size_t(i)) : sampled;
+        r.replay_sampled_matches &= token == sampled;
         r.generated.push_back(token);
-        r.trace.push_back(engine.decode(token));
+        r.trace.push_back(engine.decode(token, capture));
         r.decode_latencies.push_back(ms(tick));
     }
     r.decode_ms = steps ? ms(start) : 0;
@@ -82,6 +81,7 @@ Run execute(tidal::Engine & engine, const std::vector<int32_t> & prompt, int ste
             hash_bytes(hash, selection.tokens.data(), selection.tokens.size() * sizeof(int32_t));
         }
     }
+    hash_bytes(hash, r.generated.data(), r.generated.size() * sizeof(int32_t));
     r.checksum = hex(hash);
     return r;
 }
@@ -105,14 +105,15 @@ void write_file(const std::string & path, const std::string & contents) {
 
 int main(int argc, char ** argv) {
     try {
-        Args args(argc, argv, {"--help", "--model", "--backend", "--device", "--threads", "--prompt", "--tokens",
-                              "--steps", "--warmup", "--repetitions", "--profile", "--profile-limit", "--nvtx", "--json", "--trace", "--label", "--context"});
+        Args args(argc, argv, sampling_options({"--help", "--model", "--backend", "--device", "--threads", "--prompt", "--tokens",
+                              "--steps", "--warmup", "--repetitions", "--profile", "--profile-limit", "--nvtx", "--json", "--trace", "--label", "--context"}));
         if (!args.get("--help").empty()) {
             std::cout << "tidal-bench --model MODEL [--backend cuda|cpu] [--prompt 24 | --tokens 1,2,3]\n"
                          "  [--steps 32] [--warmup 1] [--repetitions 5] [--threads 4] [--device 0] [--context N]\n"
                          "  [--profile off|phases|nodes] [--profile-limit 500000] [--nvtx 0|1] [--json result.json] [--trace trace.json] [--label NAME]\n"
                          "Throughput excludes model load/reset/warmup. Profiling uses a separate replay.\n"
                          "Nodes mode disables fusion and synchronizes each ggml op; timings are host wall time, not CUDA event time.\n";
+            sampling_help(std::cout);
             return 0;
         }
         const auto path = args.get("--model"), mode_name = args.get("--profile", "off");
@@ -134,6 +135,8 @@ int main(int argc, char ** argv) {
             (!json_path.empty() && !trace_path.empty() && normalized(json_path) == normalized(trace_path)))
             throw std::invalid_argument("Model, JSON and trace paths must differ");
         tidal::Options options{args.get("--backend", "cuda"), args.integer("--device", 0), args.integer("--threads", 4)};
+        options.sampling = sampling_config(args);
+        const bool capture = capture_logits(args, false);
         options.context = args.integer("--context", 0);
         options.nvtx = nvtx != 0;
         const int event_limit = args.integer("--profile-limit", 500000);
@@ -157,12 +160,12 @@ int main(int argc, char ** argv) {
         }
         if (prompt.size() + size_t(steps) > size_t(engine.config().context)) throw std::invalid_argument("Prompt plus steps exceeds context");
         for (auto token : prompt) if (token < 0 || token >= engine.config().vocab) throw std::invalid_argument("Prompt token outside vocabulary");
-        for (int i = 0; i < warmup; ++i) execute(engine, prompt, steps);
+        for (int i = 0; i < warmup; ++i) execute(engine, prompt, steps, capture);
         std::vector<Run> runs;
         std::vector<tidal::Step> baseline;
         std::vector<double> prefill_times, decode_times, total_times, prefill_latencies, decode_latencies, total_latencies;
         for (int i = 0; i < repetitions; ++i) {
-            auto r = execute(engine, prompt, steps);
+            auto r = execute(engine, prompt, steps, capture);
             if (!runs.empty() && (r.checksum != runs[0].checksum || r.generated != runs[0].generated))
                 throw std::runtime_error("Measured repetitions produced different outputs");
             if (i == 0) baseline = std::move(r.trace);
@@ -179,7 +182,7 @@ int main(int argc, char ** argv) {
         bool selection_match = true;
         if (mode != tidal::ProfileMode::Off) {
             engine.set_profile(mode);
-            diagnostic = execute(engine, prompt, steps, &runs[0].generated);
+            diagnostic = execute(engine, prompt, steps, capture, &runs[0].generated);
             for (size_t i = 0; i < baseline.size(); ++i) {
                 double squared = 0, energy = 0;
                 for (size_t j = 0; j < baseline[i].logits.size(); ++j) {
@@ -192,7 +195,7 @@ int main(int argc, char ** argv) {
                 for (size_t j = 0; j < std::min(a.size(), b.size()); ++j)
                     selection_match &= a[j].layer == b[j].layer && a[j].tokens == b[j].tokens;
             }
-            if (mode == tidal::ProfileMode::Phases && diagnostic.checksum != runs[0].checksum)
+            if (mode == tidal::ProfileMode::Phases && (diagnostic.checksum != runs[0].checksum || !diagnostic.replay_sampled_matches))
                 throw std::runtime_error("Phase profiling changed inference output");
         }
         const auto groups = report::aggregate(engine.profile_events());
@@ -221,8 +224,11 @@ int main(int argc, char ** argv) {
         out << ",\"weights\":"; report::model_info(out, engine.model_info());
         out << ",\"config\":"; report::config(out, engine.config()); out << '}'
             << ",\"workload\":{\"prompt\":"; report::array(out, prompt);
-        out << ",\"steps\":" << steps << ",\"warmup\":" << warmup << ",\"repetitions\":" << repetitions << '}'
-            << ",\"timing\":{\"clock\":\"steady_clock\",\"unit\":\"milliseconds\",\"includes\":\"decode API, transfers, CPU attention, greedy selection; prefill is sequential\","
+        out << ",\"steps\":" << steps << ",\"warmup\":" << warmup << ",\"repetitions\":" << repetitions
+            << ",\"capture_logits\":" << (capture ? "true" : "false") << ",\"sampling\":";
+        sampling_json(out, options.sampling);
+        out << ",\"sampling_backend\":"; report::string(out, engine.sampling_backend_name()); out << '}'
+            << ",\"timing\":{\"clock\":\"steady_clock\",\"unit\":\"milliseconds\",\"includes\":\"decode API, transfers, CPU attention, configured sampling; prefill is sequential\","
                "\"excludes\":\"model load, reset, warmup, checksum, serialization, diagnostic replay\"}"
             << ",\"model_load_ms\":" << load_ms << ",\"summary\":{\"prefill\":";
         metric(out, prefill_times, int(prompt.size()), prefill_latencies);
@@ -247,9 +253,15 @@ int main(int argc, char ** argv) {
                    "\"byte_semantics\":\"transfer payload, node logical output, CPU logical KV traffic; not measured DRAM traffic\","
                    "\"separate_replay\":true,\"fixed_generated_tokens\":true,\"inclusive_overlapping_totals\":true,\"fusion_disabled\":"
                 << (mode == tidal::ProfileMode::Nodes ? "true" : "false")
-                << ",\"logits_max_abs_vs_baseline\":" << profile_error << ",\"logits_max_nrmse_vs_baseline\":" << profile_nrmse
-                << ",\"qsa_matches_baseline\":" << (selection_match ? "true" : "false")
-                << ",\"greedy_matches_baseline\":" << (diagnostic.replay_greedy_matches ? "true" : "false")
+                << ",\"logits_max_abs_vs_baseline\":";
+            if (capture) out << profile_error; else out << "null";
+            out << ",\"logits_max_nrmse_vs_baseline\":";
+            if (capture) out << profile_nrmse; else out << "null";
+            out << ",\"greedy_matches_baseline\":"; // Legacy field only describes greedy configurations.
+            if (options.sampling.temperature == 0) out << (diagnostic.replay_sampled_matches ? "true" : "false");
+            else out << "null";
+            out << ",\"qsa_matches_baseline\":" << (selection_match ? "true" : "false")
+                << ",\"sampled_matches_baseline\":" << (diagnostic.replay_sampled_matches ? "true" : "false")
                 << ",\"statistics\":"; report::stats(out, diagnostic.stats);
             out << ",\"aggregates\":"; report::aggregates(out, groups);
             out << ",\"events\":"; report::events(out, engine.profile_events(), false); out << '}';
@@ -272,7 +284,7 @@ int main(int argc, char ** argv) {
                   << "; decode_p95_ms=" << report::percentile(decode_latencies, .95) << '\n';
         if (mode != tidal::ProfileMode::Off) {
             std::cout << "profile=" << mode_name << "; dropped_events=" << engine.profile_dropped_events() << "; events=" << engine.profile_events().size()
-                      << "; logits_max_abs_vs_baseline=" << profile_error << "; qsa_matches=" << selection_match
+                      << "; logits_max_abs_vs_baseline=" << (capture ? std::to_string(profile_error) : "not captured") << "; qsa_matches=" << selection_match
                       << " (separate replay; inclusive synchronized wall times)\n";
             size_t shown = 0;
             for (const auto & a : groups) {

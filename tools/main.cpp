@@ -1,5 +1,6 @@
 #include "tidal/tidal.hpp"
 #include "args.hpp"
+#include "sampling_options.hpp"
 #include "report.hpp"
 
 #include <algorithm>
@@ -16,10 +17,11 @@ template<class T> void array(std::ostream & out, const std::vector<T> & values) 
 }
 int main(int argc, char ** argv) {
     try {
-        Args args(argc, argv, {"--help", "--model", "--backend", "--device", "--threads", "--tokens", "--steps", "--json", "--repeat", "--context", "--stop-at-eos"});
+        Args args(argc, argv, sampling_options({"--help", "--model", "--backend", "--device", "--threads", "--tokens", "--steps", "--json", "--repeat", "--context", "--stop-at-eos"}));
         if (!args.get("--help").empty()) {
             std::cout << "tidal-cli --model tiny.gguf [--backend cuda|cpu] [--device 0] [--threads 4] "
                          "[--tokens 1,2,3] [--steps 8] [--json trace.json] [--repeat 1] [--context N] [--stop-at-eos 0|1]\n";
+            sampling_help(std::cout);
             return 0;
         }
         auto path = args.get("--model");
@@ -32,6 +34,8 @@ int main(int argc, char ** argv) {
         const int steps = args.integer("--steps", 8), repeat = args.integer("--repeat", 1);
         if (steps < 0 || repeat < 1 || repeat > 1000) throw std::invalid_argument("Invalid steps or repeat count");
         tidal::Options options{args.get("--backend", "cuda"), args.integer("--device", 0), args.integer("--threads", 4)};
+        options.sampling = sampling_config(args);
+        const bool capture = capture_logits(args, args.contains("--json"));
         options.context = args.integer("--context", 0);
         tidal::Engine engine(path, options);
         const int stop_at_eos = args.integer("--stop-at-eos", engine.config().eos_token >= 0 ? 1 : 0);
@@ -39,20 +43,20 @@ int main(int argc, char ** argv) {
         if (prompt.size() + size_t(steps) > size_t(engine.config().context))
             throw std::invalid_argument("Prompt and generated tokens exceed context capacity");
         std::vector<tidal::Step> trace, initial_trace;
-        std::vector<int32_t> generated;
+        std::vector<int32_t> generated, initial_generated;
         auto start = std::chrono::steady_clock::now();
         for (int run = 0; run < repeat; ++run) {
             engine.reset(); generated.clear();
-            trace = engine.prefill(prompt);
+            trace = engine.prefill(prompt, capture);
             for (int i = 0; i < steps; ++i) {
-                const auto & logits = trace.back().logits;
-                auto next = int32_t(std::max_element(logits.begin(), logits.end()) - logits.begin());
+                auto next = engine.sample();
                 generated.push_back(next);
-                trace.push_back(engine.decode(next));
+                trace.push_back(engine.decode(next, capture));
                 if (stop_at_eos && next == engine.config().eos_token) break;
             }
-            if (run == 0 && repeat > 1) initial_trace = trace;
+            if (run == 0 && repeat > 1) { initial_trace = trace; initial_generated = generated; }
             if (run > 0) {
+                if (generated != initial_generated) throw std::runtime_error("Reset produced different sampled tokens");
                 if (trace.size() != initial_trace.size())
                     throw std::runtime_error("Reset/replay produced a different trace length");
                 for (size_t i = 0; i < trace.size(); ++i) {
@@ -75,6 +79,7 @@ int main(int argc, char ** argv) {
         const bool full = engine.config().architecture == tidal::Architecture::Qwen35;
         std::cout << "backend=" << engine.backend_name() << (full ? "; full_attention=CPU; KV=BF16; " : "; sparse_attention=CPU; KV=BF16; ")
                   << "tokens=" << trace.size() << "; repeats=" << repeat << '\n';
+        std::cout << "sampler=" << engine.sampling_backend_name() << "; sampling_ms=" << s.sampling_ms << '\n';
         std::cout << "generated="; array(std::cout, generated); std::cout << '\n';
         std::cout << "wall_seconds=" << seconds << "; graph_ms=" << s.graph_ms << "; cpu_attention_ms=" << s.attention_ms
                   << "; transfer_ms=" << s.transfer_ms << "; D2H_bytes=" << s.device_to_host_bytes
@@ -89,6 +94,9 @@ int main(int argc, char ** argv) {
             if (!full) out << ",\"sparse_attention_backend\":\"CPU\"";
             out << ",\"architecture\":\"" << (full ? "qwen35" : "tidal-qwen4exp")
                 << "\",\"attention_kind\":\"" << (full ? "full" : "sparse") << "\",\"attention_backend\":\"CPU\"";
+            out << ",\"sampling\":"; sampling_json(out, options.sampling);
+            out << ",\"sampling_backend\":"; report::string(out, engine.sampling_backend_name());
+            out << ",\"capture_logits\":" << (capture ? "true" : "false");
             out << ",\"model\":"; report::model_info(out, engine.model_info());
             out << ",\"statistics\":{\"backend_graph_nodes\":" << s.device_graph_nodes
                 << ",\"sparse_attention_calls\":" << s.sparse_attention_calls
@@ -96,7 +104,8 @@ int main(int argc, char ** argv) {
                 << ",\"device_to_host_bytes\":" << s.device_to_host_bytes
                 << ",\"host_to_device_bytes\":" << s.host_to_device_bytes
                 << ",\"graph_ms\":" << s.graph_ms << ",\"attention_ms\":" << s.attention_ms
-                << ",\"transfer_ms\":" << s.transfer_ms << "},\"trace\":[";
+                << ",\"transfer_ms\":" << s.transfer_ms;
+            sampling_stats(out, s); out << "},\"trace\":[";
             for (size_t i = 0; i < trace.size(); ++i) {
                 if (i) out << ',';
                 out << "{\"position\":" << trace[i].position << ",\"logits\":";
