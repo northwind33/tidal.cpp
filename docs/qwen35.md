@@ -2,14 +2,15 @@
 
 The engine loads the public model's native `qwen35` GGUF directly. Standard full
 attention QK, softmax and weighted V execute on CPU over a BF16 KV cache in CPU
-RAM. Embedding lookup, all projections, normalization, RoPE, output gates,
+RAM during decoding. CUDA prefill uses [layer-major GPU attention](prefill.md),
+with temporary GPU KV and asynchronous export to CPU RAM. Embedding lookup, all projections, normalization, RoPE, output gates,
 residual additions, Dense FFNs, Gated DeltaNet and the output head execute on the
 requested CUDA backend. Unsupported CUDA operations fail; there is no scheduler
-that moves neural graph operations to CPU. Tokenization, argmax and orchestration
-are host work.
+that moves neural graph operations to CPU. Tokenization and orchestration are host work; token sampling defaults to the
+model backend.
 
 This supports single-sequence text generation. Image/video inputs and vision
-projectors, MTP execution, scaled RoPE, batched prefill and `qwen35moe` are not
+projectors, MTP execution, scaled RoPE and `qwen35moe` are not
 implemented. Other Qwen3.5 sizes are not covered by the public-model validation.
 The existing synthetic `qwen4exp` Dense/MoE/PLE paths remain available.
 
@@ -92,9 +93,10 @@ The existing per-tensor storage policy also applies to native matrices. Supporte
 formats remain encoded on the backend; unsupported types are explicitly widened
 at load time. Public integration coverage is BF16 and Q8_0. Norms, convolution
 weights and decay parameters use F32 at runtime. Activations and GDN state are
-F32. K/V round to BF16 on CPU; queries, scores, softmax and value accumulation
-remain F32. Only current Q/K/V and logits download; attention results and scalar
-token/position inputs upload. The complete main KV cache never resides on GPU.
+F32. During decoding, K/V round to BF16 on CPU, and queries, scores, softmax and
+value accumulation remain F32. Current Q/K/V download and attention results
+upload. During prefill, the active layer’s KV is temporarily on GPU; GPU attention
+uses the selected working format and exports canonical BF16 KV for decoding.
 
 ## Verification
 

@@ -5,7 +5,9 @@
 The engine dispatches on the GGUF architecture. Native `qwen35` supports the
 public Qwen3.5-0.8B text decoder; `tidal-qwen4exp-dense` and `tidal-qwen4exp-moe`
 retain the synthetic model contract below. Both use GPU model graphs with CPU
-BF16 KV storage and CPU QK/softmax/V. The explicit CPU backend remains available
+BF16 KV storage and CPU QK/softmax/V during decoding. CUDA prefill uses a
+[layer-major GPU path](prefill.md) with temporary device KV, asynchronous host
+export and weight eviction/reload. The explicit CPU backend remains available
 for reference tests.
 
 For Qwen3.5, the ordinary attention layers attend to every cached position through
@@ -129,6 +131,9 @@ accumulation policy; pinned CUDA rejects forced-F32 accumulation on MUL_MAT_ID.
 
 ## Precision and storage
 
+This table describes decoding. [GPU prefill](prefill.md) adds temporary device KV
+and FP16/BF16 working storage for FlashAttention.
+
 | Tensor / operation | Precision |
 |---|---|
 | Token/PLE embeddings | Any supported weight storage format (BF16 default) |
@@ -205,19 +210,20 @@ rows and 67,108,864 elements. Quantized table rows also need ggml block alignmen
 These are fixture limits, not support for the released model's large PLE tables
 or native `qwen4exp` GGUF tensor/metadata naming.
 
-One Engine owns one sequence. `decode` advances it once, `prefill` repeats those
-transitions, and `reset` clears all PLE/GDN/index state, logical CPU KV lengths and
-statistics. Exceeding the configured capacity raises an error; no sliding-window
-eviction occurs. Failed graph execution poisons the sequence until `reset`, so a
-partially updated state cannot silently be reused. Independent Engines may run
-independently; an individual Engine is not thread-safe.
-`Options.context` / `--context` can reduce allocated sequence capacity from the
-GGUF value; zero preserves that value, and larger or negative capacities fail.
+One Engine owns one sequence. `decode` advances it once. CUDA `prefill` handles
+all supplied tokens layer by layer and exports their KV asynchronously; CPU
+`prefill` retains sequential reference execution. Floating-point reductions can
+differ across input partitions. `reset` clears PLE/GDN/index state, CPU KV lengths,
+sampling history and statistics, and restores weights after failed prefill.
+Invalid tokens/capacity are rejected before state changes.
+An individual Engine is not thread-safe. `Options.context` / `--context` can
+reduce sequence capacity from the GGUF value; zero retains the model capacity.
 
 ## Current performance limits
 
-Graphs are allocated per phase, transfers synchronize, CPU head workers are created
-per attention call, and top-k materializes a score for every compressed block. There
-is no graph reuse, transfer overlap, batched prefill, server, multi-sequence cache,
+Graphs are allocated per phase and each graph compute synchronizes. Decode
+transfers synchronize, while prefill KV exports and weight prefetch overlap work.
+CPU head workers are created per decode attention call, and top-k materializes a score for every compressed block. There
+is no persistent graph reuse, server, multi-sequence cache,
 checkpoint converter or long-context benchmark claim. These are explicit next
 optimization/integration boundaries after correctness and GPU runtime validation.

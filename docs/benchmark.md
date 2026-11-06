@@ -2,7 +2,7 @@
 
 `tidal-bench` measures single-sequence inference and exports machine-readable
 results for comparisons. It uses the same `Engine` as `tidal-cli`; CUDA mode
-retains GPU model/indexer graphs and CPU sparse attention. Build with the normal
+uses GPU layer-major prefill and CPU attention during decoding. Build with the normal
 CMake preset. No Python dependency is needed to run the benchmark itself.
 
 ## Throughput baseline
@@ -25,19 +25,25 @@ temperature, top-k/top-p/min-p, penalties and an explicit CPU path. `--steps 0`
 measures prompt ingestion alone; decode metrics are then null.
 
 The terminal and JSON report prefill, decode and total tokens/second separately.
-Prefill currently means sequential one-token ingestion, not batched prefill.
+CUDA prefill processes the entire prompt layer by layer using GPU attention;
+CPU prefill is the sequential reference. See [prefill controls](prefill.md).
 Rates are total processed tokens divided by total elapsed time across measured
 repetitions, not the arithmetic mean of per-run rates. The JSON also includes
 per-run rates, mean/median/p95/min/max/population-standard-deviation, individual
-token latencies, generated tokens, output checksums and existing engine counters.
+decode-token latencies, generated tokens, output checksums and engine counters.
+Prefill and total token latency fields are null: batch completion is measured as
+a whole, not presented as individually measured token latencies.
 
 Timed regions include the Engine call, graph construction/allocation, transfers,
 CPU attention, result collection and (during generation) configured token selection.
 Model loading/backend initialization, state reset, warmup, checksum calculation and
 serialization are excluded. Load and reset times are reported separately.
 Each warmup and repetition starts from a reset sequence; measured repetitions
-must produce identical outputs. Prompt and decode latency samples retain their
-order, so context-dependent slowdowns can be analyzed.
+must produce identical outputs. Decode latency samples retain their order.
+Prefill timing includes KV export completion and restoration of evicted weights.
+
+Reports also identify prefill execution, working precision, tile size and memory
+settings; comparisons require them to match.
 
 Reports contain model configuration, file size and FNV-1a content fingerprint,
 backend/device/CPU, thread count, CUDA API driver/runtime versions, compiler,

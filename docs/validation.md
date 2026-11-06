@@ -13,10 +13,13 @@ python3 tests/test_reference.py --bin-dir build/dev-cuda/bin --backend cuda
 python3 tests/test_moe.py --bin-dir build/dev-cuda/bin --backend cuda
 python3 tests/test_quant.py --bin-dir build/dev-cuda/bin --backend cuda
 python3 tests/test_qwen35.py --bin-dir build/dev-cuda/bin --backend cuda
+python3 tests/test_prefill.py --bin-dir build/dev-cuda/bin --backend cuda
+python3 tests/test_residency.py --bin-dir build/dev-cuda/bin --backend cuda
 ```
 
 CTest's numerical reference suite uses CPU execution, including in a CUDA build.
-The explicit Python commands exercise CUDA model/indexer graphs with CPU attention.
+The explicit Python commands exercise GPU batch prefill followed by CUDA
+model/indexer graphs with CPU attention during decoding.
 A CUDA compile alone does not establish GPU runtime correctness.
 
 A CPU-only build can use:
@@ -32,13 +35,15 @@ ctest --test-dir build-cpu --output-on-failure
 ### Native Qwen3.5
 
 `qwen35-reference` uses independently written F32 GGUF fixtures and a separate
-NumPy decoder. It compares full vocabulary logits with atol/rtol 4e-4 and per-token
+NumPy decoder. It compares full vocabulary logits with atol/rtol 4e-4 on CPU
+and 2e-3 for CUDA batch prefill/continuation, and per-token
 NRMSE below 0.2%, greedy decisions, every full-attention prefix, exact transfer
 bytes, reset and chunked state. Cases include tied/untied output embeddings,
 implicit/explicit recurrent masks, unequal GDN key/value head counts (tiled GGUF
 ordering), MTP tail exclusion, EOS stopping and malformed metadata/payloads.
-Node profiling verifies all neural graphs on the requested backend and QK,
-softmax and weighted V on CPU, with no QSA stages.
+Node profiling verifies all neural graphs on the requested backend, GPU
+FlashAttention during CUDA prefill, and QK/softmax/weighted V on CPU during
+decoding, with no QSA stages.
 
 The opt-in public BF16/Q8_0 integration suite also validates native kernels,
 generation and placement using the actual Qwen3.5-0.8B GGUFs. It is not part of
@@ -62,9 +67,9 @@ Absolute and relative tolerances used by `assert_allclose` are:
 
 | Matrix format | CPU atol / rtol | CUDA atol / rtol |
 |---|---:|---:|
-| F32 | 2e-4 | 4e-4 |
+| F32 | 2e-4 | 8e-4 |
 | F16 | 3e-3 | 1e-3 |
-| BF16 | 0.012 | 4e-4 |
+| BF16 | 0.012 | 8e-4 |
 | Q8_0 / Q4_0 | 0.025 | 0.025 |
 
 Every token additionally requires normalized vocabulary RMS error below 2.5%.
@@ -94,7 +99,7 @@ formats. Quantized projection inputs include zeros, mixed values and halfway
 cases; projection comparisons retain atol/rtol 2e-5.
 
 Fully Q4_0/Q8_0 PLE models additionally run finite-logit generation, exact reset,
-chunked-prefill/decode equivalence and placement checks. Their long trajectories
+repeatable chunked-prefill/decode state and placement checks. Their long trajectories
 are **not asserted equal to the independent NumPy oracle**: activation quantization
 thresholds can amplify reduction/reciprocal rounding differences, and near-tied
 QSA top-k or argmax decisions can then diverge. This remains a validation limit;
@@ -161,10 +166,11 @@ All model/indexer graphs use exactly one backend and check every node with
 `ggml_backend_supports_op`; CUDA requests have no automatic CPU fallback. CPU
 attention owns the main BF16 KV cache. Tests check backend identity,
 attention calls and the exact transfer-byte budget derived from model dimensions.
-Diagnostic runs download current Q/K/V, selected block IDs, logits and compact
+Diagnostic decoding downloads current Q/K/V, selected block IDs, logits and compact
 sampler results; token/RoPE positions,
 PLE row IDs and attention outputs upload. PLE tables, projections and convolution
-state stay on the backend. Full main KV caches remain in CPU RAM.
+state stay on the backend. During decoding the full main KV cache remains in
+CPU RAM; CUDA prefill temporarily holds the active layer’s KV on GPU.
 Native Qwen3.5 has no selected-block download or index cache; its attention reads
 the complete causal prefix, and its GDN state remains on the backend.
 
@@ -180,3 +186,27 @@ probabilities, filtering, penalties, seeded draws and generation. See
 [sampling validation](sampling.md) for coverage and commands. Compact generation
 checks finite logits without downloading the full vector; numerical reference
 tests retain full-logit capture.
+
+## Layer-major prefill
+
+`test_prefill.py` checks strict layer order, batched matrix shapes, GPU
+FlashAttention placement, exact BF16 export byte counts and absence of CPU
+attention during CUDA prefill. F32 Dense, MoE, PLE and native qwen35 fixtures
+compare complete trajectories with independent NumPy equations and exercise
+chunked prefixes, subsequent decoding, reset and capture-independent sampling.
+Pressure tests require eviction/reload and compare the resulting logits; an
+impossible managed budget must fail and allow recovery after reset.
+
+F32/F16/BF16/Q8_0/Q4_0 matrices also have isolated 24-column tests. The CUDA
+reference distinguishes batch MMQ from single-token MMVQ: Q8 batch scales use
+F32, and the Q4 MMA path subtracts the integer zero point before multiplication.
+This prevents activation quantization differences being misclassified as state
+or layout errors. Exact reset replay uses the same input partition; independent
+cross-partition checks allow bounded floating-point error. See [prefill](prefill.md).
+
+`test_residency.py` verifies completed-layer-first and farthest-future-first
+eviction, protection of active and requested prefetch groups, delayed restoration,
+exact asynchronous reloads (including runtime-converted formats and tied weights),
+and failure on an impossible budget. CUDA tests also export KV across multiple
+staging chunks, checking the existing prefix, every BF16 byte and GPU source
+lifetime through transfer completion.

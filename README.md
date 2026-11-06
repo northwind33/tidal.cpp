@@ -4,16 +4,21 @@ A C++20 / ggml inference prototype supporting **public Qwen3.5-0.8B GGUF text
 inference** and **random-weight Dense/MoE derivatives of Qwen3.8-Flash-Next
 (`qwen4exp`)**. Gated DeltaNet runs on GPU. Ordinary full attention for Qwen3.5,
 or QSA-selected sparse attention for the synthetic model, reads a BF16 KV cache
-in CPU RAM and computes QK/softmax/V on CPU.
+in CPU RAM and computes QK/softmax/V on CPU during decoding. CUDA prefill instead
+processes the whole prompt layer by layer, with GPU attention and asynchronous
+KV export to CPU RAM; see [prefill](docs/prefill.md).
 
 Qwen3.5 loads native `qwen35` GGUFs without conversion to the synthetic schema.
 See [the real-model guide](docs/qwen35.md) for downloads, text generation and
 independent verification. The `tidal-dummy` models still have random weights and
 synthetic token IDs. Their optional PLE implements n-gram embedding, gating and
 dilated convolution; optional MoE implements top-k routing, sparse SwiGLU experts
-and a gated shared expert. Released `qwen4exp` checkpoints, vision, MTP execution
-and batched prefill remain outside this version. Prompt ingestion uses the same
-one-token state transitions as decoding.
+and a gated shared expert. Released `qwen4exp` checkpoints, vision and MTP execution
+remain outside this version. CUDA prompt ingestion uses a dedicated layer-major
+batch path; the CPU backend retains sequential reference execution.
+
+The following placement table describes **decoding**. CUDA prefill keeps the
+active layer’s KV and attention computation on GPU temporarily.
 
 | Work / storage | `--backend cuda` | `--backend cpu` |
 |---|---|---|
@@ -167,6 +172,7 @@ ctest --test-dir build --output-on-failure
 # Run the same numerical and placement checks on a real CUDA device.
 python tests/test_reference.py --bin-dir build-cuda/bin --backend cuda
 python tests/test_qwen35.py --bin-dir build-cuda/bin --backend cuda
+python tests/test_prefill.py --bin-dir build-cuda/bin --backend cuda
 ```
 
 Tests compare complete multi-token logits and QSA selections against an independent
