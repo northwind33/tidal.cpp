@@ -6,6 +6,7 @@
 #include "ggml-alloc.h"
 #include "gguf.h"
 #include <map>
+#include <future>
 #include <stdexcept>
 #include <utility>
 
@@ -45,14 +46,38 @@ void read_ple(const gguf_context * file, Config & config);
 std::vector<int32_t> ple_rows(const PLEConfig & config, const PLELayer & layer,
                               int32_t token, const std::vector<int32_t> & previous);
 
+enum class WeightPart { Embedding, Attention, FeedForward, PLE, Head };
+struct WeightGroup {
+    int layer = -1;
+    WeightPart part = WeightPart::Embedding;
+    std::string name;
+    std::vector<ggml_tensor *> tensors;
+    Buffer buffer{nullptr, ggml_backend_buffer_free};
+    size_t allocation_bytes = 0, payload_bytes = 0;
+    std::future<void> pending;
+};
+
 struct Model {
     Config config;
     ModelInfo info;
     Context ctx{nullptr, ggml_free};
-    Buffer buffer{nullptr, ggml_backend_buffer_free};
+    std::vector<WeightGroup> groups;
     std::map<std::string, ggml_tensor *> weights;
     Model(const std::string & path, ggml_backend_t backend);
+    ~Model();
+    Model(const Model &) = delete;
+    Model & operator=(const Model &) = delete;
     ggml_tensor * at(const std::string & name) const { return weights.at(name); }
+    int group(int layer, WeightPart part) const;
+    bool resident(int id) const;
+    size_t resident_bytes() const;
+    void load(int id, bool asynchronous = false);
+    void wait(int id);
+    void wait_all();
+    void evict(int id);
+private:
+    struct Backing;
+    std::unique_ptr<Backing> backing;
 };
 
 class Profiler;
@@ -60,6 +85,9 @@ class SparseAttention {
 public:
     SparseAttention(int heads, int kv_heads, int dim, int capacity, int threads);
     void append(const std::vector<float> & key, const std::vector<float> & value);
+    void append_bf16(const ggml_bf16_t * key, const ggml_bf16_t * value, int tokens);
+    const ggml_bf16_t * keys() const { return keys_.data(); }
+    const ggml_bf16_t * values() const { return values_.data(); }
     std::vector<float> attend(const std::vector<float> & query,
                               const std::vector<int32_t> & selected, Profiler * profiler = nullptr,
                               int position = -1, int layer = -1,

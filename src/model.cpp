@@ -1,5 +1,9 @@
 #include "internal.hpp"
 #include "ggml-cpu.h"
+#ifdef TIDAL_CUDA
+#include "ggml-cuda.h"
+#endif
+#include <mutex>
 
 #include <algorithm>
 #include <cmath>
@@ -185,6 +189,71 @@ Config read_config(const gguf_context * f) {
     return c;
 }
 
+struct Model::Backing {
+    struct Source { uint64_t offset; ggml_type type; };
+    std::ifstream input;
+    std::map<ggml_tensor *, Source> sources;
+    ggml_backend_buffer_type_t buft;
+    Backend transfer{nullptr, ggml_backend_free};
+    Buffer staging{nullptr, ggml_backend_buffer_free};
+    std::mutex mutex;
+    static constexpr size_t staging_bytes = 8 * 1024 * 1024;
+    Backing(const std::string & path, ggml_backend_t backend) : input(path, std::ios::binary),
+        buft(ggml_backend_get_default_buffer_type(backend)) {
+        if (!input) throw std::runtime_error("Cannot retain model backing file");
+        auto host_type = ggml_backend_cpu_buffer_type();
+#ifdef TIDAL_CUDA
+        if (ggml_backend_is_cuda(backend)) {
+            const int count = ggml_backend_cuda_get_device_count();
+            int index = -1;
+            for (int i = 0; i < count; ++i)
+                if (ggml_backend_get_device(backend) == ggml_backend_buft_get_device(ggml_backend_cuda_buffer_type(i))) index = i;
+            if (index < 0) throw std::runtime_error("Cannot identify model CUDA device");
+            transfer.reset(ggml_backend_cuda_init(index));
+            host_type = ggml_backend_cuda_host_buffer_type();
+        } else
+#endif
+            transfer.reset(ggml_backend_cpu_init());
+        if (!transfer) throw std::runtime_error("Cannot create weight transfer stream");
+        staging.reset(ggml_backend_buft_alloc_buffer(host_type, staging_bytes));
+        if (!staging || ggml_backend_buffer_get_type(staging.get()) != host_type)
+            throw std::runtime_error("Cannot allocate pinned weight transfer staging memory");
+    }
+    void upload(const WeightGroup & group) {
+        // A dedicated backend stream and bounded host staging permit prefetch to
+        // overlap the execution backend. Serialize file/staging access only.
+        std::lock_guard<std::mutex> lock(mutex);
+        auto * destination = static_cast<char *>(ggml_backend_buffer_get_base(staging.get()));
+        std::vector<char> encoded;
+        try {
+            for (auto * tensor : group.tensors) {
+                const auto source = sources.at(tensor);
+                const size_t encoded_row = ggml_row_size(source.type, tensor->ne[0]);
+                const size_t resident_row = ggml_row_size(tensor->type, tensor->ne[0]);
+                const int64_t rows = ggml_nelements(tensor) / tensor->ne[0];
+                const int64_t chunk = std::max<int64_t>(1, staging_bytes / resident_row);
+                if (resident_row > staging_bytes) throw std::runtime_error("Weight row exceeds staging capacity");
+                input.clear(); input.seekg(std::streamoff(source.offset));
+                for (int64_t row = 0; row < rows; row += chunk) {
+                    ggml_backend_synchronize(transfer.get()); // Previous staging read is complete.
+                    const int64_t count = std::min(chunk, rows - row);
+                    if (source.type == tensor->type) {
+                        input.read(destination, std::streamsize(count * encoded_row));
+                    } else {
+                        encoded.resize(size_t(count) * encoded_row);
+                        input.read(encoded.data(), std::streamsize(encoded.size()));
+                        dequantize(source.type, encoded.data(), reinterpret_cast<float *>(destination), count * tensor->ne[0]);
+                    }
+                    if (!input) throw std::runtime_error("Cannot reload weight: " + std::string(tensor->name));
+                    ggml_backend_tensor_set_async(transfer.get(), tensor, destination,
+                                                  size_t(row) * resident_row, size_t(count) * resident_row);
+                }
+            }
+            ggml_backend_synchronize(transfer.get());
+        } catch (...) { ggml_backend_synchronize(transfer.get()); throw; }
+    }
+};
+
 Model::Model(const std::string & path, ggml_backend_t backend) {
     ggml_context * raw = nullptr;
     Gguf file(gguf_init_from_file(path.c_str(), {true, &raw}), gguf_free);
@@ -261,36 +330,88 @@ Model::Model(const std::string & path, ggml_backend_t backend) {
     if (config.tied_embeddings) weights.emplace("output.weight", weights.at("token_embd.weight"));
     std::cerr << "model weight bytes: stored=" << info.stored_weight_bytes << " resident="
               << info.resident_weight_bytes << " converted_tensors=" << info.converted_tensors << '\n';
-    buffer.reset(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
-    if (!buffer) throw std::runtime_error("Cannot allocate model weights");
-    info.weight_buffer_bytes = ggml_backend_buffer_get_size(buffer.get());
-    ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    // Read in file order with bounded staging memory, including converted tensors.
-    for (int64_t id = 0; id < gguf_get_n_tensors(file.get()); ++id) {
-        const std::string name = gguf_get_tensor_name(file.get(), id);
-        const auto found = source_weights.find(name);
-        if (found == source_weights.end()) continue;
-        auto * tensor = found->second;
+    backing = std::make_unique<Backing>(path, backend);
+    for (const auto & spec : specs) {
+        auto * tensor = at(spec.name);
+        int layer = -1;
+        WeightPart part = WeightPart::Embedding;
+        if (spec.name.starts_with("blk.")) {
+            const auto dot = spec.name.find('.', 4);
+            layer = std::stoi(spec.name.substr(4, dot - 4));
+            const auto suffix = spec.name.substr(dot + 1);
+            part = suffix.starts_with("ple.") ? WeightPart::PLE :
+                (suffix.starts_with("ffn.") || suffix.starts_with("ffn_norm") || suffix.starts_with("hc_ffn"))
+                    ? WeightPart::FeedForward : WeightPart::Attention;
+        } else if (spec.name != "token_embd.weight" || config.tied_embeddings) {
+            layer = config.layers; part = WeightPart::Head;
+        }
+        int id = group(layer, part);
+        if (id < 0) {
+            id = int(groups.size()); groups.emplace_back();
+            auto & g = groups.back(); g.layer = layer; g.part = part;
+            g.name = (layer >= 0 && layer < config.layers ? "blk." + std::to_string(layer) + "." : "") +
+                (part == WeightPart::Attention ? "attention" : part == WeightPart::FeedForward ? "ffn" :
+                 part == WeightPart::PLE ? "ple" : part == WeightPart::Head ? "head" : "embedding");
+        }
+        auto & g = groups[id]; g.tensors.push_back(tensor); g.payload_bytes += ggml_nbytes(tensor);
+        const auto & name = spec.source_name.empty() ? spec.name : spec.source_name;
         auto * encoded = ggml_get_tensor(source.get(), name.c_str());
-        const uint64_t offset = gguf_get_data_offset(file.get()) + gguf_get_tensor_offset(file.get(), id);
-        const size_t row_bytes = ggml_row_size(encoded->type, encoded->ne[0]);
-        const int64_t rows = ggml_nelements(encoded) / encoded->ne[0];
-        const int64_t chunk_rows = std::max<int64_t>(1, (8 * 1024 * 1024) / (encoded->ne[0] * sizeof(float)));
-        std::vector<char> data(size_t(std::min(rows, chunk_rows)) * row_bytes);
-        std::vector<float> converted(encoded->type == tensor->type ? 0 : size_t(std::min(rows, chunk_rows) * encoded->ne[0]));
-        input.seekg(std::streamoff(offset));
-        for (int64_t row = 0; row < rows; row += chunk_rows) {
-            const int64_t count = std::min(chunk_rows, rows - row);
-            const size_t bytes = size_t(count) * row_bytes;
-            input.read(data.data(), std::streamsize(bytes));
-            if (!input) throw std::runtime_error("Failed to read tensor: " + name);
-            if (converted.empty()) ggml_backend_tensor_set(tensor, data.data(), size_t(row) * row_bytes, bytes);
-            else {
-                dequantize(encoded->type, data.data(), converted.data(), count * encoded->ne[0]);
-                ggml_backend_tensor_set(tensor, converted.data(), size_t(row * encoded->ne[0]) * sizeof(float),
-                                          size_t(count * encoded->ne[0]) * sizeof(float));
-            }
+        const int64_t index = gguf_find_tensor(file.get(), name.c_str());
+        backing->sources.emplace(tensor, Backing::Source{
+            gguf_get_data_offset(file.get()) + gguf_get_tensor_offset(file.get(), index), encoded->type});
+    }
+    for (auto & g : groups) {
+        g.allocation_bytes = ggml_backend_buft_get_alloc_size_n(backing->buft, g.tensors.data(), int(g.tensors.size()));
+        info.weight_buffer_bytes += g.allocation_bytes;
+    }
+    for (size_t id = 0; id < groups.size(); ++id) load(int(id));
+}
+Model::~Model() {
+    for (auto & g : groups) if (g.pending.valid()) g.pending.wait();
+}
+int Model::group(int layer, WeightPart part) const {
+    for (size_t i = 0; i < groups.size(); ++i)
+        if (groups[i].layer == layer && groups[i].part == part) return int(i);
+    return -1;
+}
+bool Model::resident(int id) const { return id >= 0 && bool(groups.at(size_t(id)).buffer); }
+size_t Model::resident_bytes() const {
+    size_t bytes = 0;
+    for (const auto & g : groups) if (g.buffer) bytes += ggml_backend_buffer_get_size(g.buffer.get());
+    return bytes;
+}
+void Model::wait(int id) {
+    auto & g = groups.at(size_t(id));
+    if (g.pending.valid()) {
+        try { g.pending.get(); }
+        catch (...) {
+            for (auto * t : g.tensors) { t->data = nullptr; t->buffer = nullptr; t->extra = nullptr; }
+            g.buffer.reset(); throw;
         }
     }
+}
+void Model::wait_all() { for (size_t i = 0; i < groups.size(); ++i) wait(int(i)); }
+void Model::load(int id, bool asynchronous) {
+    auto & g = groups.at(size_t(id));
+    if (g.buffer) { if (!asynchronous) wait(id); return; }
+    g.buffer.reset(ggml_backend_buft_alloc_buffer_n(backing->buft, g.tensors.data(), int(g.tensors.size())));
+    if (!g.buffer) {
+        for (auto * t : g.tensors) { t->data = nullptr; t->buffer = nullptr; t->extra = nullptr; }
+        throw std::runtime_error("Cannot allocate weight group: " + g.name);
+    }
+    ggml_backend_buffer_set_usage(g.buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    try {
+        if (asynchronous) g.pending = std::async(std::launch::async, [this, id] { backing->upload(groups.at(size_t(id))); });
+        else backing->upload(g);
+    } catch (...) {
+        for (auto * t : g.tensors) { t->data = nullptr; t->buffer = nullptr; t->extra = nullptr; }
+        g.buffer.reset(); throw;
+    }
+}
+void Model::evict(int id) {
+    auto & g = groups.at(size_t(id));
+    wait(id);
+    for (auto * t : g.tensors) { t->data = nullptr; t->buffer = nullptr; t->extra = nullptr; }
+    g.buffer.reset();
 }
 } // namespace tidal

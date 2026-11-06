@@ -68,6 +68,7 @@ struct Config {
 enum class ProfileMode { Off, Phases, Nodes };
 
 enum class SamplingBackend { Device, CPU };
+enum class PrefillPrecision { FP16, BF16 };
 
 struct SamplingConfig {
     SamplingBackend backend = SamplingBackend::Device;
@@ -105,6 +106,13 @@ struct Options {
     uint64_t profile_event_limit = 500000;
     int context = 0; // 0 uses GGUF capacity; otherwise bounded by the model capacity.
     SamplingConfig sampling;
+    PrefillPrecision prefill_precision = PrefillPrecision::FP16;
+    // Query tiling stays inside the current layer; it never traverses the model.
+    int prefill_attention_tile = 128;
+    // Zero uses live device availability. A nonzero cap limits resident weights
+    // plus prefill workspace, for controlled memory-pressure experiments.
+    uint64_t prefill_memory_limit = 0;
+    uint64_t prefill_memory_reserve = 64ull * 1024 * 1024;
 };
 
 struct Selection {
@@ -131,6 +139,10 @@ struct Statistics {
     uint64_t sampling_device_to_host_bytes = 0;
     uint64_t sampling_host_to_device_bytes = 0;
     double sampling_ms = 0; // Inclusive of sampler transfers; overlaps transfer_ms.
+    uint64_t prefill_tokens = 0, prefill_layers = 0, prefill_gpu_attention_calls = 0;
+    uint64_t prefill_kv_to_host_bytes = 0;
+    uint64_t prefill_weight_evictions = 0, prefill_weight_reloads = 0, prefill_weight_prefetches = 0;
+    uint64_t prefill_weight_reload_bytes = 0, prefill_peak_workspace_bytes = 0;
 };
 
 struct ModelInfo {

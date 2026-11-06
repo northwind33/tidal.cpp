@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <thread>
 
@@ -22,6 +23,14 @@ void SparseAttention::append(const std::vector<float> & key, const std::vector<f
     ggml_fp32_to_bf16_row_ref(key.data(), keys_.data() + size_t(size_) * width, int64_t(width));
     ggml_fp32_to_bf16_row_ref(value.data(), values_.data() + size_t(size_) * width, int64_t(width));
     ++size_;
+}
+
+void SparseAttention::append_bf16(const ggml_bf16_t * key, const ggml_bf16_t * value, int tokens) {
+    if (tokens < 0 || tokens > capacity_ - size_) throw std::out_of_range("CPU KV cache is full");
+    const size_t width = size_t(kv_heads_) * dim_;
+    std::memcpy(keys_.data() + size_t(size_) * width, key, size_t(tokens) * width * sizeof(ggml_bf16_t));
+    std::memcpy(values_.data() + size_t(size_) * width, value, size_t(tokens) * width * sizeof(ggml_bf16_t));
+    size_ += tokens;
 }
 
 std::vector<float> SparseAttention::attend(const std::vector<float> & query,
