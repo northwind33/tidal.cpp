@@ -76,7 +76,9 @@ Completed blocks are ranked normally; only an *incomplete* tail is unconditional
 included. A token can attend to itself when selected, and no operation can read a
 future token. Selection lists are sorted and checked for duplicates before attention.
 Equal top-k scores can select different tied blocks across backends; fixtures avoid
-ties at the budget boundary. There is no random sampling: generation uses argmax.
+ties at the budget boundary. Generation defaults to greedy device sampling, with
+temperature/top-k/top-p/min-p and history penalties available. The sampler is
+separate from QSA block selection; see [sampling](sampling.md).
 
 ## Optional per-layer embedding (PLE)
 

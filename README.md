@@ -30,7 +30,8 @@ CUDA is the default execution request. Missing CUDA or an unsupported operation
 causes an error; there is no automatic CPU fallback. The CPU mode is an explicit
 reference/testing mode. Current Q/K/V cross to the host; QSA additionally downloads
 selected block IDs. The attention output returns to the GPU. The full main KV cache
-stays in RAM. Tokenization, greedy token selection and host orchestration use CPU.
+stays in RAM. Tokenization and host orchestration use CPU. Token selection defaults
+to the model backend; an explicit CPU sampler remains available for comparison.
 
 ## Build
 
@@ -109,7 +110,8 @@ and `--norm-topk 0|1` configure the experts. Released `qwen4exp` GGUFs still req
 a converter into the engine's tensor and metadata contract.
 
 The CLI reports the backend, CPU attention calls, synchronized graph/transfer times
-and bytes. JSON contains every step's logits and selected token IDs. `--repeat 2`
+and bytes. JSON contains every step's logits and selected token IDs by default;
+`--logits 0` keeps only token IDs and selections. `--repeat 2`
 resets and replays the same sequence to check deterministic state reset. Timing is
 diagnostic; graph allocation and thread creation are intentionally unoptimized.
 
@@ -148,6 +150,9 @@ build/dev-cuda/bin/tidal-bench --model models/tiny-q4.gguf --backend cuda \
 Profiles include per-layer/ggml-node synchronized wall times, tensor shapes/types,
 transfers, graph allocation, and CPU QK/softmax/V stages. NVTX ranges connect to
 Nsight; `tools/compare_bench.py` compares saved reports and can flag regressions.
+See [sampling](docs/sampling.md) for temperature, top-k, top-p, min-p, penalties,
+seeding and `--sampler cpu` comparisons.
+
 See [benchmarking and profiling](docs/benchmark.md) for measurement semantics,
 baseline comparisons, and the distinction between wall timings and CUDA kernel metrics.
 

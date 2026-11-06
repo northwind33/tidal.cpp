@@ -161,7 +161,8 @@ All model/indexer graphs use exactly one backend and check every node with
 `ggml_backend_supports_op`; CUDA requests have no automatic CPU fallback. CPU
 attention owns the main BF16 KV cache. Tests check backend identity,
 attention calls and the exact transfer-byte budget derived from model dimensions.
-Only current Q/K/V, selected block IDs and logits download; token/RoPE positions,
+Diagnostic runs download current Q/K/V, selected block IDs, logits and compact
+sampler results; token/RoPE positions,
 PLE row IDs and attention outputs upload. PLE tables, projections and convolution
 state stay on the backend. Full main KV caches remain in CPU RAM.
 Native Qwen3.5 has no selected-block download or index cache; its attention reads
@@ -171,3 +172,11 @@ The GitHub CUDA job builds SM 7.5 and runs numerical tests in CPU mode on GPU-le
 runners. It uses `GGML_CUDA_NO_VMM=ON` to avoid a host-driver linking dependency.
 The GPU development container uses normal VMM and host drivers supplied by
 NVIDIA Container Toolkit. Real GPU validation is a separate explicit test run.
+
+## Sampling
+
+The `sampling` CTest and explicit CUDA suite use an independent NumPy oracle for
+probabilities, filtering, penalties, seeded draws and generation. See
+[sampling validation](sampling.md) for coverage and commands. Compact generation
+checks finite logits without downloading the full vector; numerical reference
+tests retain full-logit capture.

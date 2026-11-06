@@ -19,8 +19,10 @@ build/dev-cuda/bin/tidal-bench --model models/bench-q4.gguf --backend cuda \
 
 Use `--backend cpu` for the CPU implementation. `--prompt N` creates reproducible
 token IDs `(17*i + 1) % vocab`; `--tokens 1,7,23,9` supplies a specific sequence
-instead. Prompt length plus `--steps` must fit the model's context. Generation is
-greedy. `--steps 0` measures prompt ingestion alone; decode metrics are then null.
+instead. Prompt length plus `--steps` must fit the model's context. Generation
+defaults to greedy device sampling; [sampling options](sampling.md) include
+temperature, top-k/top-p/min-p, penalties and an explicit CPU path. `--steps 0`
+measures prompt ingestion alone; decode metrics are then null.
 
 The terminal and JSON report prefill, decode and total tokens/second separately.
 Prefill currently means sequential one-token ingestion, not batched prefill.
@@ -30,8 +32,8 @@ per-run rates, mean/median/p95/min/max/population-standard-deviation, individual
 token latencies, generated tokens, output checksums and existing engine counters.
 
 Timed regions include the Engine call, graph construction/allocation, transfers,
-CPU attention, result collection and (during generation) argmax selection. Model
-loading/backend initialization, state reset, warmup, checksum calculation and
+CPU attention, result collection and (during generation) configured token selection.
+Model loading/backend initialization, state reset, warmup, checksum calculation and
 serialization are excluded. Load and reset times are reported separately.
 Each warmup and repetition starts from a reset sequence; measured repetitions
 must produce identical outputs. Prompt and decode latency samples retain their
@@ -66,9 +68,10 @@ Modes:
 
 Both profiling modes run **after** the normal throughput repetitions. They replay
 the measured sequence's generated tokens, so profiling cannot change the input
-workload. JSON reports logit max absolute/normalized RMS differences, QSA equality
-and greedy-decision equality against the normal run. Phase profiling requires
-bit-identical outputs. Node profiling deliberately disables cross-node fusion;
+workload. JSON reports selection and sampled-decision equality against the normal run.
+Full-logit capture is disabled by default. With `--logits 1`, it also reports logit
+max absolute/normalized RMS differences; otherwise those error fields are null.
+Phase profiling requires bit-identical captured outputs and sampled decisions. Node profiling deliberately disables cross-node fusion;
 its numerical differences are reported rather than assumed to be zero.
 
 The CPU stages include BF16 KV append, selected-block expansion, worker launch and
@@ -77,7 +80,9 @@ nodes expose matvecs, normalization, convolution, GDN recurrence, RoPE, activati
 QSA scores/top-k, copies and view/layout operations. Named matrices distinguish
 residual gates, attention projections, FFN and the output head.
 
-**All built-in durations are host steady-clock wall times.** Backend compute
+**Profile event durations are host steady-clock wall times.** The CUDA sampler
+uses CUDA events for its contribution to the aggregate `transfer_ms` counter;
+see [sampling measurement semantics](sampling.md). Backend compute
 calls are synchronized. Node durations include submission/synchronization overhead;
 a ggml node may launch several CUDA kernels, while a view node may launch none.
 These are not CUDA-event timings, occupancy measurements or hardware memory
@@ -151,7 +156,9 @@ python3 tools/compare_bench.py build/dev-cuda/baseline.json build/dev-cuda/candi
 The tool reports throughput percentage changes and p95 latency. Compatible,
 complete profiles additionally report the largest changes in inclusive stage
 cost. It rejects mismatched model/workload/backend/device/CPU/thread/CUDA-version/
-NVTX/warmup settings or different generated tokens. Repetition counts can differ.
+NVTX/warmup/sampling/capture settings or different generated tokens.
+`--allow-sampler-change` permits comparing CPU and device sampling with all
+other settings held constant. Repetition counts can differ.
 Different output checksums are reported for numerical follow-up; performance
 comparison does not replace `test_reference.py`.
 
