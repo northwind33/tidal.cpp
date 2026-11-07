@@ -27,7 +27,7 @@ execute on CUDA. Attention uses ggml FlashAttention with bounded query tiles;
 there is no CPU attention fallback. Unsupported head widths are zero-padded to a
 supported width while retaining the original attention scale.
 
-The canonical KV representation remains BF16. New KV is produced on GPU and
+With the default `--kv-placement cpu`, canonical KV remains BF16. New KV is produced on GPU and
 exported through a separate CUDA stream using pinned host staging. The transfer
 owns its source allocation until completion. A bounded queue prevents outstanding
 copies from retaining an unbounded number of GPU caches. Before prefill returns,
@@ -41,6 +41,52 @@ it does not promise native BF16 Tensor Cores on older devices. Norms, residuals,
 GDN state and graph activations remain F32; model weights retain their per-tensor
 GGUF types and use ggml's native matrix kernels. Operand conversion and reduction
 order can differ from the CPU-attention decoder.
+
+## Persistent GPU KV benchmark mode
+
+`--kv-placement gpu` is an opt-in CUDA mode for comparing GPU execution with
+other engines. The default `cpu` preserves hybrid inference. GPU mode allocates
+all attention layers' KV in device memory at initialization, sized by `--context`
+and padded to the FlashAttention head/token alignment. `--prefill-precision`
+selects the persistent format for **prefill and decode**: FP16 by default, or
+BF16. FP16 keys/values are stored directly from projections, without an
+intermediate BF16 round trip. Compressed QSA index keys remain BF16 in both modes.
+
+Prefill appends directly to these buffers, with no temporary full-cache replica,
+CPU KV allocation, KV export or prefix upload. Decode appends the next token and
+runs full attention or causal QSA on CUDA. The QSA mask includes ranked complete
+blocks and the incomplete tail; its finite-entry bound allows ggml to select a
+sparse-gather kernel when supported. Prefix extension, decode-to-prefill and reset
+use the same persistent cache. No implicit switch to CPU occurs on exhaustion.
+
+For example:
+
+```sh
+build/dev-cuda/bin/tidal-bench --model models/model.gguf --backend cuda \
+  --kv-placement gpu --prefill-precision fp16 --context 4096 \
+  --prompt 2048 --steps 32 --json build/gpu-kv.bench.json
+```
+
+The complete model, persistent GPU KV/state and decode workspace must fit at
+once. Automatic prefill chunks only bound temporary work; they cannot reduce the
+allocated KV capacity. Oversized KV/state fails with an allocation error that
+suggests reducing `--context` or explicitly selecting CPU KV. Prefill can still
+evict weights for temporary workspace and restores them before returning.
+The managed prefill cap covers weights and temporary workspace; live device
+availability additionally accounts for persistent KV/state and kernel memory.
+GPU KV with the explicit CPU backend is rejected.
+
+Reports identify KV placement/type and the decode attention backend.
+`gpu_kv_bytes` reports persistent padded K/V storage, `gpu_attention_calls`
+counts decode attention calls, and `prefill_gpu_attention_calls` counts prefill
+tiles. CPU attention counters and `prefill_kv_to_host_bytes` remain zero in GPU
+mode. Disabling diagnostics keeps Q/K/V, attention outputs and selected IDs on
+device; PLE hashing, graph orchestration and tokenization still use the host.
+
+This mode matches the KV placement/precision dimensions of a GPU baseline.
+Batch scheduling, weight placement, ggml version and kernel choices must also
+be recorded when comparing engines; identical FP16 KV does not imply bitwise
+identical logits or identical execution algorithms.
 
 ## Weight residency
 
@@ -103,7 +149,10 @@ The CLI and benchmark accept:
 - `--prefill-chunk auto|N`: temporary tensor/GEMM token range, default `auto`.
   Explicit `N` must be positive; the final range can be shorter.
 - `--prefill-tile auto|N`: attention query tile, default `auto`; explicit 1–4096.
-- `--prefill-precision fp16|bf16`: GPU attention working KV format.
+- `--kv-placement cpu|gpu`: persistent KV placement and decode attention backend;
+  default `cpu`. GPU placement requires CUDA.
+- `--prefill-precision fp16|bf16`: GPU attention working KV format, also used for
+  persistent KV and decoding with `--kv-placement gpu`.
 - `--prefill-memory-mib N`: optional managed weight/workspace cap for pressure
   experiments; zero uses live availability.
 - `--prefill-reserve-mib auto|N`: device headroom, default `auto`.

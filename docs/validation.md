@@ -224,6 +224,25 @@ Keep the model, measurements and machine-specific validation notes under ignored
 directories. Small fixtures do not establish that a particular large model fits;
 validate the actual target model and device before making that claim.
 
+### Persistent GPU KV
+
+CUDA builds register `gpu-kv` in CTest; it requires a usable CUDA device. It can
+also run directly with `python3 tests/test_gpu_kv.py --bin-dir build/dev-cuda/bin`.
+The independent NumPy oracles select direct FP16 or BF16 KV rounding and model
+the pinned CUDA MMA path's half query scaling and half softmax numerators.
+Floating and Q4/Q8 weights, PLE, MoE and native qwen35 are checked against these
+equations without relaxing the existing numerical bounds. Backend reduction
+order and activation quantization can still introduce bounded differences.
+
+C++ state checks compare batch prefill, token-by-token decode, split prefixes,
+decode-to-prefill transitions and reset in each format. Longer cases cross KV
+padding boundaries and the sparse-gather length threshold with wide GQA; the
+latter also compares against CPU selected-only attention. Profile nodes verify
+CUDA FlashAttention and KV dtype. Compact prefill plus decode must read back
+exactly two finiteness scalars, with no CPU attention calls or KV exports.
+Tests also cover allocation failure/poison/reset, persistent-byte accounting,
+CPU-backend rejection, benchmark replay and incompatible placement reports.
+
 F32/F16/BF16/Q8_0/Q4_0 matrices also have isolated 24-column tests. The CUDA
 reference distinguishes batch MMQ from single-token MMVQ: Q8 batch scales use
 F32, and the Q4 MMA path subtracts the integer zero point before multiplication.

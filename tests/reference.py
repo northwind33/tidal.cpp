@@ -98,12 +98,29 @@ def softmax(x):
     return e / e.sum(axis=-1, keepdims=True)
 
 
+def flash_attention_reference(q, keys, values, scale):
+    # Pinned CUDA MMA: half Q times half scale, then a half product. Unnormalized
+    # softmax numerators round to half for V multiplication; the divisor is F32.
+    # This models one small KV tile, not kernel scheduling or online tile merges.
+    q = (q.astype(np.float16) * np.float16(scale)).astype(np.float16).astype(np.float32)
+    keys = keys.astype(np.float16).astype(np.float32)
+    values = values.astype(np.float16).astype(np.float32)
+    scores = np.einsum('hd,thd->ht', q, keys)
+    weights = np.exp(scores - scores.max(axis=-1, keepdims=True) - np.float32(3*.6931))
+    denominator = weights.sum(axis=-1, keepdims=True)
+    output = np.einsum('ht,thd->hd', weights.astype(np.float16).astype(np.float32), values)
+    return output / denominator
+
+
 class Reference:
-    def __init__(self, path, backend="cpu"):
+    def __init__(self, path, backend="cpu", kv_type="bf16"):
+        assert kv_type in ('fp16', 'bf16')
+        self.kv_round = bf16 if kv_type == 'bf16' else lambda x: x.astype(np.float16).astype(np.float32)
         if backend not in ("cpu", "cuda"):
             raise ValueError(f"Unknown reference backend: {backend}")
         self.backend = backend
         self.prefill_columns = 0
+        self.gpu_attention = False
         self.quantized = {}
         self.c, self.w, self.types, _ = read_gguf(path, self.quantized)
         # GGUF omits trailing dimensions of length one. Preserve the logical
@@ -294,8 +311,8 @@ class Reference:
         q = self.rope(self.norm(p + "attn.q_norm", qg[:, :d]), pos)
         k = self.rope(self.norm(p + "attn.k_norm", self.mm(p + "attn.k", x).reshape(hk, d)), pos)
         v = self.mm(p + "attn.v", x).reshape(hk, d)
-        state["keys"].append(bf16(k))
-        state["values"].append(bf16(v))
+        state["keys"].append(self.kv_round(k))
+        state["values"].append(self.kv_round(v))
         iq = self.rope(self.norm(p + "index.q_norm", self.mm(p + "index.q", x).reshape(c["index_heads"], di)), pos)
         state["raw"].append(self.mm(p + "index.k", x))
         block = c["block_size"]
@@ -313,14 +330,16 @@ class Reference:
         selected.sort()
         keys = np.stack(state["keys"])[selected]
         values = np.stack(state["values"])[selected]
-        if self.backend == "cuda" and self.prefill_columns > 8:
-            # FP16 MMA attention operands, with the canonical cache still BF16.
+        if self.backend == "cuda" and self.prefill_columns > 8 and not self.gpu_attention:
             q = q.astype(np.float16).astype(np.float32)
             keys = keys.astype(np.float16).astype(np.float32)
             values = values.astype(np.float16).astype(np.float32)
         keys, values = np.repeat(keys, h // hk, axis=1), np.repeat(values, h // hk, axis=1)
-        scores = np.einsum("hd,thd->ht", q, keys) / np.sqrt(np.float32(d))
-        output = np.einsum("ht,thd->hd", softmax(scores), values)
+        if self.gpu_attention:
+            output = flash_attention_reference(q, keys, values, 1/np.sqrt(np.float32(d)))
+        else:
+            scores = np.einsum("hd,thd->ht", q, keys) / np.sqrt(np.float32(d))
+            output = np.einsum("ht,thd->hd", softmax(scores), values)
         output *= sigmoid(qg[:, d:])
         return self.mm(p + "attn.out", output.reshape(-1)), selected
 

@@ -80,8 +80,9 @@ int main(int argc, char ** argv) {
         const auto & s = engine.statistics();
         std::cout << "model="; report::model_info(std::cout, engine.model_info()); std::cout << '\n';
         const bool full = engine.config().architecture == tidal::Architecture::Qwen35;
-        std::cout << "backend=" << engine.backend_name() << (full ? "; full_attention=CPU; KV=BF16; " : "; sparse_attention=CPU; KV=BF16; ")
-                  << "prefill_attention=" << (options.backend == "cuda" ? "CUDA" : "CPU") << "; tokens=" << trace.size() << "; repeats=" << repeat << '\n';
+        std::cout << "backend=" << engine.backend_name() << (full ? "; full_attention=" : "; sparse_attention=")
+                  << decode_attention_backend(options) << "; KV=" << kv_type_name(options)
+                  << "; prefill_attention=" << (options.backend == "cuda" ? "CUDA" : "CPU") << "; tokens=" << trace.size() << "; repeats=" << repeat << '\n';
         std::cout << "sampler=" << engine.sampling_backend_name() << "; sampling_ms=" << s.sampling_ms << '\n';
         std::cout << "generated="; array(std::cout, generated); std::cout << '\n';
         std::cout << "wall_seconds=" << seconds << "; graph_ms=" << s.graph_ms << "; cpu_attention_ms=" << s.attention_ms
@@ -92,11 +93,12 @@ int main(int argc, char ** argv) {
             std::ofstream out(json_path);
             if (!out) throw std::runtime_error("Cannot open JSON trace: " + json_path);
             out << std::setprecision(9) << "{\"backend\":\"" << engine.backend_name()
-                << "\",\"kv_type\":\"BF16\",\"generated\":";
+                << "\",\"kv_type\":\"" << kv_type_name(options)
+                << "\",\"kv_placement\":\"" << (options.kv_placement == tidal::KVPlacement::GPU ? "gpu" : "cpu") << "\",\"generated\":";
             array(out, generated);
-            if (!full) out << ",\"sparse_attention_backend\":\"CPU\"";
+            if (!full) out << ",\"sparse_attention_backend\":\"" << decode_attention_backend(options) << '"';
             out << ",\"architecture\":\"" << (full ? "qwen35" : "tidal-qwen4exp")
-                << "\",\"attention_kind\":\"" << (full ? "full" : "sparse") << "\",\"attention_backend\":\"CPU\"";
+                << "\",\"attention_kind\":\"" << (full ? "full" : "sparse") << "\",\"attention_backend\":\"" << decode_attention_backend(options) << '"';
             out << ",\"prefill\":"; prefill_json(out, options);
             out << ",\"sampling\":"; sampling_json(out, options.sampling);
             out << ",\"sampling_backend\":"; report::string(out, engine.sampling_backend_name());

@@ -7,16 +7,19 @@ import os
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 import numpy as np
 from gguf_metadata import read_header
-from reference import bf16, sigmoid, silu, softmax
+from reference import bf16, sigmoid, silu, softmax, flash_attention_reference
 
 
 class Qwen35Reference:
-    def __init__(self, path, backend="cuda"):
+    def __init__(self, path, backend="cuda", kv_type="bf16"):
+        assert kv_type in ('fp16', 'bf16')
+        self.kv_round = bf16 if kv_type == 'bf16' else lambda x: x.astype(np.float16).astype(np.float32)
         self.meta, self.tensors, self.offset = read_header(path)
         assert self.meta["general.architecture"] == "qwen35"
         self.c = {k[7:]: v for k, v in self.meta.items() if k.startswith("qwen35.")}
         self.backend = backend
         self.prefill_columns = 0
+        self.gpu_attention = False
         self.data = np.memmap(path, dtype=np.uint8, mode="r")
         self.weights = {}
         self.layers = self.c["block_count"] - self.c.get("nextn_predict_layers", 0)
@@ -135,16 +138,20 @@ class Qwen35Reference:
         qg = self.mm(p+"attn_q.weight", x).reshape(h, 2*d)
         q = self.rope(self.norm(qg[:, :d], p+"attn_q_norm.weight"))
         k = self.rope(self.norm(self.mm(p+"attn_k.weight", x).reshape(hk, d), p+"attn_k_norm.weight"))
-        state["keys"].append(bf16(k))
-        state["values"].append(bf16(self.mm(p+"attn_v.weight", x).reshape(hk, d)))
+        state["keys"].append(self.kv_round(k))
+        state["values"].append(self.kv_round(self.mm(p+"attn_v.weight", x).reshape(hk, d)))
         keys = np.repeat(np.stack(state["keys"]), h//hk, axis=1)
         values = np.repeat(np.stack(state["values"]), h//hk, axis=1)
-        if self.backend == "cuda" and self.prefill_columns > 8:
+        if self.backend == "cuda" and self.prefill_columns > 8 and not self.gpu_attention:
             q = q.astype(np.float16).astype(np.float32)
             keys = keys.astype(np.float16).astype(np.float32)
             values = values.astype(np.float16).astype(np.float32)
-        scores = np.einsum("hd,thd->ht", q, keys) / np.sqrt(np.float32(d))
-        attended = np.einsum("ht,thd->hd", softmax(scores), values) * sigmoid(qg[:, d:])
+        if self.gpu_attention:
+            attended = flash_attention_reference(q, keys, values, 1/np.sqrt(np.float32(d)))
+        else:
+            scores = np.einsum("hd,thd->ht", q, keys) / np.sqrt(np.float32(d))
+            attended = np.einsum("ht,thd->hd", softmax(scores), values)
+        attended *= sigmoid(qg[:, d:])
         return self.mm(p+"attn_output.weight", attended.reshape(-1))
 
     def decode(self, token):

@@ -2,13 +2,17 @@
 
 A C++20 / ggml inference prototype supporting **public Qwen3.5-0.8B GGUF text
 inference** and **random-weight Dense/MoE derivatives of Qwen3.8-Flash-Next
-(`qwen4exp`)**. Gated DeltaNet runs on GPU. Ordinary full attention for Qwen3.5,
+(`qwen4exp`)**. Gated DeltaNet runs on GPU. By default, ordinary full attention for Qwen3.5,
 or QSA-selected sparse attention for the synthetic model, reads a BF16 KV cache
 in CPU RAM and computes QK/softmax/V on CPU during decoding. CUDA prefill instead
 processes the whole prompt layer by layer, with GPU attention and asynchronous
 KV export to CPU RAM; see [prefill](docs/prefill.md).
 Within each layer, automatic memory-aware token ranges bound temporary tensors;
 `--prefill-chunk N` and `--prefill-tile N` select explicit sizes for comparisons.
+For benchmarks, `--kv-placement gpu` retains all KV on CUDA and runs attention
+there during both prefill and decoding. `--prefill-precision fp16|bf16` selects
+the persistent GPU KV format too. Choose a `--context` that fits device memory;
+see the [GPU KV mode](docs/prefill.md#persistent-gpu-kv-benchmark-mode).
 
 Qwen3.5 loads native `qwen35` GGUFs without conversion to the synthetic schema.
 See [the real-model guide](docs/qwen35.md) for downloads, text generation and
@@ -19,7 +23,7 @@ and a gated shared expert. Released `qwen4exp` checkpoints, vision and MTP execu
 remain outside this version. CUDA prompt ingestion uses a dedicated layer-major
 batch path; the CPU backend retains sequential reference execution.
 
-The following placement table describes **decoding**. CUDA prefill keeps the
+The following placement table describes **default decoding**. CUDA prefill keeps the
 active layer’s KV and attention computation on GPU temporarily.
 
 | Work / storage | `--backend cuda` | `--backend cpu` |
@@ -35,7 +39,7 @@ active layer’s KV and attention computation on GPU temporarily.
 
 CUDA is the default execution request. Missing CUDA or an unsupported operation
 causes an error; there is no automatic CPU fallback. The CPU mode is an explicit
-reference/testing mode. Current Q/K/V cross to the host; QSA additionally downloads
+reference/testing mode. In the default CPU KV mode, current Q/K/V cross to the host; QSA additionally downloads
 selected block IDs. The attention output returns to the GPU. The full main KV cache
 stays in RAM. Tokenization and host orchestration use CPU. Token selection defaults
 to the model backend; an explicit CPU sampler remains available for comparison.

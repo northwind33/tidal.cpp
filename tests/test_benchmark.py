@@ -41,6 +41,8 @@ def main():
             assert r["label"] == 'test "json"\nlabel' and r["model"]["path"] == str(model)
             assert len(r["runs"]) == 2
             prefill = r['workload']['prefill']
+            assert prefill['kv_placement'] == 'cpu' and prefill['kv_type'] == 'BF16'
+            assert prefill['decode_attention_backend'] == 'CPU'
             assert prefill['chunk_mode'] == prefill['attention_tile_mode'] == 'auto'
             assert prefill['chunk_tokens'] == prefill['attention_tile'] == 0
             assert prefill['memory_reserve_mode'] == 'auto' and prefill['memory_reserve_bytes'] is None
@@ -128,6 +130,12 @@ def main():
         # Validate performance regression detection deterministically, independent of wall-clock noise.
         baseline = root / "off.json"
         run(sys.executable, compare, baseline, baseline, "--max-regression", 0)
+        legacy = copy.deepcopy(reports['off'])
+        for key in ['kv_placement', 'kv_type', 'decode_attention_backend']:
+            legacy['workload']['prefill'].pop(key)
+        legacy_path = root/'legacy.json'
+        legacy_path.write_text(json.dumps(legacy))
+        run(sys.executable, compare, legacy_path, baseline)
         candidate = copy.deepcopy(reports["off"])
         for phase in ["prefill", "decode", "total"]:
             candidate["summary"][phase]["tokens_per_second"] *= 0.8
@@ -175,7 +183,8 @@ def main():
         for extra in [["--profile", "invalid"], ["--trace", root / "bad.json"], ["--json", model],
                       ["--tokens", "1,"], ["--nvtx", 2], ['--prefill-chunk',0], ['--prefill-chunk',-1],
                       ['--prefill-chunk','automatic'], ['--prefill-tile',0], ['--prefill-tile',4097],
-                      ['--prefill-reserve-mib',-1]]:
+                      ['--prefill-reserve-mib',-1], ['--kv-placement','invalid'],
+                      ['--kv-placement','gpu','--backend','cpu']]:
             run(*base, *extra, code=1)
         run(bench, "--model", model, "--backend", args.backend, "--repetitions", 0, code=1)
         run(bench, "--model", model, "--backend", args.backend, "--prompt", 32, "--steps", 1, code=1)

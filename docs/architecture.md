@@ -4,11 +4,20 @@
 
 The engine dispatches on the GGUF architecture. Native `qwen35` supports the
 public Qwen3.5-0.8B text decoder; `tidal-qwen4exp-dense` and `tidal-qwen4exp-moe`
-retain the synthetic model contract below. Both use GPU model graphs with CPU
+retain the synthetic model contract below. Both default to GPU model graphs with CPU
 BF16 KV storage and CPU QK/softmax/V during decoding. CUDA prefill uses a
 [layer-major GPU path](prefill.md) with temporary device KV, asynchronous host
 export and weight eviction/reload. The explicit CPU backend remains available
 for reference tests.
+
+The optional `--kv-placement gpu` benchmark mode keeps a persistent, padded
+FP16/BF16 KV allocation per attention layer on CUDA, using the selected
+`--prefill-precision` for both phases. It allocates no CPU main KV cache and
+exports no KV after prefill. Full attention and QSA use the same ggml
+FlashAttention primitive as prefill; QSA pooling, ranking and masking stay on
+device. A finite-entry bound enables ggml's sparse KV gather when the backend
+and shape support it. Diagnostic selection IDs may be read back on request;
+compact inference transfers only the existing finiteness/sampling scalars.
 
 For Qwen3.5, the ordinary attention layers attend to every cached position through
 the current token, without QSA indexing or top-k. Q/K/V projections, per-head
@@ -47,7 +56,7 @@ The project implements the model equations independently. It does not vendor the
 Transformers or llama.cpp source files. The separate NumPy oracle is test code;
 the engine and dummy-model generator are C++.
 
-## One synthetic qwen4exp decoding step
+## One synthetic qwen4exp decoding step (default CPU KV)
 
 1. Gather the BF16 embedding on the selected backend and duplicate it across the
    residual streams for this token.
@@ -131,7 +140,7 @@ accumulation policy; pinned CUDA rejects forced-F32 accumulation on MUL_MAT_ID.
 
 ## Precision and storage
 
-This table describes decoding. [GPU prefill](prefill.md) adds temporary device KV
+This table describes default decoding. [GPU prefill](prefill.md) adds temporary device KV
 and FP16/BF16 working storage for FlashAttention.
 
 | Tensor / operation | Precision |

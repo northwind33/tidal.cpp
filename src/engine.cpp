@@ -28,6 +28,10 @@ Context context(size_t bytes) {
     return result;
 }
 Backend make_backend(const Options & opts) {
+    if (opts.kv_placement != KVPlacement::CPU && opts.kv_placement != KVPlacement::GPU)
+        throw std::invalid_argument("Invalid KV placement");
+    if (opts.kv_placement == KVPlacement::GPU && opts.backend != "cuda")
+        throw std::invalid_argument("GPU KV placement requires --backend cuda; no CPU fallback");
     if (opts.threads < 1 || opts.threads > 256 || opts.device < 0)
         throw std::invalid_argument("Invalid thread count or CUDA device index");
     ggml_backend_t raw = nullptr;
@@ -195,6 +199,8 @@ struct LayerState {
     ggml_tensor * gate = nullptr;
     ggml_tensor * inject = nullptr;
     std::unique_ptr<SparseAttention> attention;
+    ggml_tensor * device_keys = nullptr, * device_values = nullptr;
+    int device_kv_size = 0;
 };
 struct Mixed { ggml_tensor * value; ggml_tensor * inject; };
 }
@@ -210,6 +216,8 @@ struct Engine::Impl {
     Buffer state_buffer{nullptr, ggml_backend_buffer_free};
     ggml_tensor * hidden;
     ggml_tensor * last_logits;
+    ggml_tensor * kv_token_ids = nullptr;
+    uint64_t gpu_kv_bytes = 0;
     std::vector<float> captured_logits;
     std::unique_ptr<Sampler> sampler;
     std::vector<LayerState> states;
@@ -245,8 +253,16 @@ struct Engine::Impl {
                     s.inject = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c.branches);
                 }
                 s.gate = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c.q_heads * c.head_dim);
-                s.attention = std::make_unique<SparseAttention>(c.q_heads, c.kv_heads, c.head_dim,
-                                                               c.context, options.threads);
+                if (options.kv_placement == KVPlacement::GPU) {
+                    const auto type = options.prefill_precision == PrefillPrecision::FP16 ? GGML_TYPE_F16 : GGML_TYPE_BF16;
+                    const int dim = attention_dim(), padded = (c.context+255)/256*256;
+                    s.device_keys = ggml_new_tensor_3d(ctx, type, dim, padded, c.kv_heads);
+                    s.device_values = ggml_new_tensor_3d(ctx, type, dim, padded, c.kv_heads);
+                    gpu_kv_bytes += ggml_nbytes(s.device_keys)+ggml_nbytes(s.device_values);
+                } else {
+                    s.attention = std::make_unique<SparseAttention>(c.q_heads, c.kv_heads, c.head_dim,
+                                                                   c.context, options.threads);
+                }
             }
         }
         for (const auto & l : c.ple.layers) {
@@ -256,6 +272,17 @@ struct Engine::Impl {
                 s.ple_conv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.hidden * c.branches,
                                                (c.ple.conv_kernel - 1) * c.ple.ngram_size);
         }
+        if (options.kv_placement == KVPlacement::GPU) {
+            if (c.architecture == Architecture::Qwen4Exp)
+                kv_token_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, c.context);
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(ggml_backend_get_device(backend.get()), &free, &total);
+            const auto bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, ggml_backend_get_default_buffer_type(backend.get()));
+            if (bytes > free)
+                throw std::runtime_error("Insufficient VRAM for persistent GPU KV/state: required " +
+                    std::to_string(bytes) + ", available " + std::to_string(free) +
+                    "; reduce --context or choose --kv-placement cpu; no automatic CPU fallback");
+        }
         state_buffer.reset(ggml_backend_alloc_ctx_tensors(ctx, backend.get()));
         if (!state_buffer) throw std::runtime_error("State allocation failed");
         sampler = std::make_unique<Sampler>(c.vocab, options.sampling, backend.get(), options.device, stats, profiler);
@@ -263,6 +290,73 @@ struct Engine::Impl {
     }
     Graph graph(const std::string & phase, int layer = -1, int token_offset = 0) {
         return Graph(prefill_backend ? prefill_backend.get() : backend.get(), stats, options.backend == "cuda", profiler, phase, position + token_offset, layer, prefill_memory);
+    }
+    int attention_dim() const { return c.head_dim <= 64 ? 64 : c.head_dim <= 128 ? 128 : 256; }
+    // Store directly in the persistent working format: GPU FP16 KV must not
+    // incur the hybrid path's intermediate BF16 rounding or host export.
+    void append_device_kv(Graph & g, LayerState & s, ggml_tensor * k, ggml_tensor * v, int first, int count) {
+        if (s.device_kv_size != first) throw std::logic_error("GPU KV prefix is inconsistent");
+        auto copy = [&](ggml_tensor * source, ggml_tensor * target) {
+            source = ggml_reshape_3d(g.c(), source, c.head_dim, c.kv_heads, count);
+            source = ggml_cont(g.c(), ggml_permute(g.c(), source, 0, 2, 1, 3));
+            source = ggml_pad(g.c(), source, attention_dim()-c.head_dim, 0, 0, 0);
+            auto * destination = ggml_view_3d(g.c(), target, attention_dim(), count, c.kv_heads,
+                target->nb[1], target->nb[2], size_t(first)*target->nb[1]);
+            g.add(ggml_cpy(g.c(), source, destination));
+        };
+        copy(k, s.device_keys); copy(v, s.device_values);
+    }
+    ggml_tensor * flash_attention(Graph & g, ggml_tensor * q, ggml_tensor * keys, ggml_tensor * values,
+                                  ggml_tensor * mask, int count, int visible) {
+        q = ggml_cont(g.c(), ggml_permute(g.c(), q, 0, 2, 1, 3));
+        q = ggml_pad(g.c(), q, attention_dim()-c.head_dim, 0, 0, 0);
+        mask = ggml_cast(g.c(), ggml_pad(g.c(), mask, 0, (64-count%64)%64, 0, 0), GGML_TYPE_F16);
+        auto prefix = [&](ggml_tensor * t) {
+            return ggml_view_3d(g.c(), t, attention_dim(), (visible+255)/256*256, c.kv_heads, t->nb[1], t->nb[2], 0);
+        };
+        auto * result = ggml_flash_attn_ext(g.c(), q, prefix(keys), prefix(values), mask,
+            1.0f/std::sqrt(float(c.head_dim)), 0, 0);
+        if (options.kv_placement == KVPlacement::GPU && c.architecture == Architecture::Qwen4Exp) {
+            // Every causal row has at most top_blocks complete blocks plus its
+            // incomplete tail. This lets capable backends gather sparse KV.
+            const int64_t bound = int64_t(c.top_blocks)*c.block_size+c.block_size-1;
+            ggml_flash_attn_ext_set_n_kv_max(result, int32_t(std::min<int64_t>(visible, bound)));
+        }
+        ggml_prec_set_acc(result, GGML_PREC_F32);
+        ggml_set_name(result, ("blk."+std::to_string(g.layer)+".attention.flash").c_str());
+        return ggml_cont(g.c(), ggml_view_3d(g.c(), result, c.head_dim, c.q_heads, count,
+            result->nb[1], result->nb[2], 0));
+    }
+    Selection finish_device_attention(Graph & g, int layer, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
+                                      ggml_tensor * scores, ggml_tensor * top, bool capture) {
+        auto & s = states[layer];
+        const int visible = position+1, padded = (visible+255)/256*256;
+        const auto p = "blk."+std::to_string(layer)+".";
+        append_device_kv(g, s, k, v, position, 1);
+        auto * mask = ggml_diag_mask_inf(g.c(), ggml_fill(g.c(), ggml_new_tensor_2d(g.c(), GGML_TYPE_F32, padded, 1), 0), position);
+        if (top) {
+            const int blocks = visible/c.block_size;
+            std::vector<int32_t> extra(c.block_size, -1);
+            for (int i=blocks*c.block_size; i<visible; ++i) extra[i-blocks*c.block_size] = i;
+            auto * mapping = ggml_view_2d(g.c(), kv_token_ids, c.block_size, blocks, c.block_size*sizeof(int32_t), 0);
+            mask = ggml_top_k_mask(g.c(), mask, ggml_reshape_2d(g.c(), top, top->ne[0], 1),
+                ggml_reshape_2d(g.c(), scores, blocks, 1), mapping,
+                ggml_reshape_2d(g.c(), g.integers(extra), c.block_size, 1));
+        }
+        auto * attended = flash_attention(g, q, s.device_keys, s.device_values, mask, 1, visible);
+        attended = ggml_mul(g.c(), ggml_reshape_1d(g.c(), attended, c.q_heads*c.head_dim), ggml_sigmoid(g.c(), s.gate));
+        auto * projected = mm(g, p+"attn.out", attended);
+        auto * h = c.architecture == Architecture::Qwen35 ? ggml_add(g.c(), hidden, projected)
+            : combine(g, hidden, projected, s.inject);
+        g.add(ggml_cpy(g.c(), ffn(g, h, p), hidden));
+        g.run(); s.device_kv_size = visible; ++stats.gpu_attention_calls;
+        std::vector<int32_t> selected;
+        if (capture) {
+            if (c.architecture == Architecture::Qwen4Exp)
+                selected = expand_blocks(top ? g.get<int32_t>(top) : std::vector<int32_t>{}, visible, c.block_size);
+            else { selected.resize(visible); std::iota(selected.begin(), selected.end(), 0); }
+        }
+        return {layer, std::move(selected)};
     }
     ggml_tensor * weight(const std::string & n) {
         auto * tensor = model.at(n);
@@ -454,7 +548,7 @@ struct Engine::Impl {
         g.add(ggml_cpy(g.c(), next_state, s.recurrent));
         g.run();
     }
-    Selection sparse_layer(int layer) {
+    Selection sparse_layer(int layer, bool capture = true) {
         ProfileScope scope(&profiler, "layer", "qsa", "qsa", position, layer, ggml_backend_name(backend.get()));
         auto & s = states[layer];
         const std::string p = "blk." + std::to_string(layer) + ".";
@@ -492,12 +586,12 @@ struct Engine::Impl {
         auto * raw_slot = ggml_view_1d(g.c(), s.raw_index, c.index_dim,
                                        size_t(position % c.block_size) * c.index_dim * sizeof(float));
         g.add(ggml_cpy(g.c(), raw, raw_slot));
-        ggml_tensor * top = nullptr;
+        ggml_tensor * top = nullptr, * scores = nullptr;
         if (complete > 0) {
             auto * cache = ggml_view_2d(g.c(), s.index_cache, c.index_dim, complete, s.index_cache->nb[1], 0);
             // Widen only the compressed index cache, on-device. F32 scoring avoids
             // CPU/CUDA BF16 matvec input-rounding differences at the top-k boundary.
-            auto * scores = ggml_mul_mat(g.c(), ggml_cast(g.c(), cache, GGML_TYPE_F32),
+            scores = ggml_mul_mat(g.c(), ggml_cast(g.c(), cache, GGML_TYPE_F32),
                                         ggml_reshape_2d(g.c(), iq, c.index_dim, c.index_heads));
             ggml_prec_set_acc(scores, GGML_PREC_F32);
             ggml_set_name(scores, (p + "index.scores").c_str());
@@ -508,6 +602,7 @@ struct Engine::Impl {
             ggml_set_name(top, (p + "index.top_k").c_str());
             g.add(top);
         }
+        if (s.device_keys) return finish_device_attention(g, layer, q, k, v, scores, top, capture);
         g.run();
         auto blocks = top ? g.get<int32_t>(top) : std::vector<int32_t>{};
         ProfileScope expand(&profiler, "cpu", "expand_blocks", "qsa.attention", position, layer, "CPU");
@@ -532,7 +627,7 @@ struct Engine::Impl {
         post.run();
         return {layer, std::move(selected)};
     }
-    Selection full_layer(int layer) {
+    Selection full_layer(int layer, bool capture = true) {
         ProfileScope scope(&profiler, "layer", "full_attention", "full", position, layer, ggml_backend_name(backend.get()));
         auto & s = states[layer];
         const auto p = "blk." + std::to_string(layer) + ".";
@@ -548,6 +643,7 @@ struct Engine::Impl {
         k = rope(g, norm(g, k, p + "attn.k_norm"), c.head_dim, c.kv_heads, position);
         auto * v = mm(g, p + "attn.v", x);
         g.add(q); g.add(k); g.add(v); g.add(ggml_cpy(g.c(), gate, s.gate));
+        if (s.device_keys) return finish_device_attention(g, layer, q, k, v, nullptr, nullptr, capture);
         g.run();
         auto queries = g.get<float>(q), keys = g.get<float>(k), values = g.get<float>(v);
         std::vector<int32_t> visible(position + 1);
@@ -798,25 +894,33 @@ struct Engine::Impl {
             g.run();
         });
     }
-    void batch_attention(ggml_tensor * batch, int layer, KVExporter & exporter,
+    void batch_attention(ggml_tensor * batch, int layer, KVExporter * exporter,
                          std::vector<Step> & steps, bool capture) {
         prefill_memory->protect(layer, {model.group(layer, WeightPart::Attention)});
         auto & state = states[layer];
         const int count = int(batch->ne[2]), total = position + count;
-        const int dim = c.head_dim <= 64 ? 64 : c.head_dim <= 128 ? 128 : 256;
+        const int dim = attention_dim();
         const int padded = (total + 255) / 256 * 256;
         const int qwidth = c.head_dim * c.q_heads, kvwidth = c.head_dim * c.kv_heads;
         const bool sparse = c.architecture == Architecture::Qwen4Exp;
         const std::string p = "blk." + std::to_string(layer) + ".";
-        auto cache = std::make_shared<PrefillTensorStorage>(*prefill_memory, prefill_backend.get());
-        auto * keys = cache->tensor(GGML_TYPE_BF16, kvwidth, total);
-        auto * values = cache->tensor(GGML_TYPE_BF16, kvwidth, total);
-        cache->allocate();
+        const bool device_kv = state.device_keys != nullptr;
+        std::shared_ptr<PrefillTensorStorage> cache;
+        ggml_tensor * keys = nullptr, * values = nullptr;
         PrefillTensorStorage layout(*prefill_memory, prefill_backend.get());
         const auto compute_type = options.prefill_precision == PrefillPrecision::FP16 ? GGML_TYPE_F16 : GGML_TYPE_BF16;
-        auto * compute_keys = layout.tensor(compute_type, dim, padded, c.kv_heads);
-        auto * compute_values = layout.tensor(compute_type, dim, padded, c.kv_heads);
-        layout.allocate();
+        auto * compute_keys = state.device_keys, * compute_values = state.device_values;
+        if (device_kv) {
+            if (state.device_kv_size != position) throw std::logic_error("GPU KV prefix is inconsistent");
+        } else {
+            cache = std::make_shared<PrefillTensorStorage>(*prefill_memory, prefill_backend.get());
+            keys = cache->tensor(GGML_TYPE_BF16, kvwidth, total);
+            values = cache->tensor(GGML_TYPE_BF16, kvwidth, total);
+            cache->allocate();
+            compute_keys = layout.tensor(compute_type, dim, padded, c.kv_heads);
+            compute_values = layout.tensor(compute_type, dim, padded, c.kv_heads);
+            layout.allocate();
+        }
         // Only the active layer's KV spans the full context. Projection,
         // permutation and output intermediates are bounded token ranges.
         auto convert = [&](int start, int length) {
@@ -837,7 +941,7 @@ struct Engine::Impl {
                 g.run();
             }, {}, false, start-position);
         };
-        if (position) {
+        if (position && !device_kv) {
             if (state.attention->size() != position) throw std::logic_error("Prefill KV prefix is inconsistent");
             auto g = graph("prefill.attention.prefix", layer);
             const size_t bytes = size_t(position)*kvwidth*sizeof(ggml_bf16_t);
@@ -880,8 +984,11 @@ struct Engine::Impl {
             auto suffix = [&](ggml_tensor * t) {
                 return ggml_view_2d(g.c(), t, kvwidth, n, t->nb[1], size_t(start)*t->nb[1]);
             };
-            g.add(ggml_cpy(g.c(), k, suffix(keys)));
-            g.add(ggml_cpy(g.c(), v, suffix(values)));
+            if (device_kv) append_device_kv(g, state, k, v, start, n);
+            else {
+                g.add(ggml_cpy(g.c(), k, suffix(keys)));
+                g.add(ggml_cpy(g.c(), v, suffix(values)));
+            }
             if (sparse) {
                 g.add(ggml_cpy(g.c(), mixed.inject, injection));
                 auto * iq = ggml_reshape_3d(g.c(), mm(g, p+"index.q", mixed.value), c.index_dim, c.index_heads, n);
@@ -915,8 +1022,9 @@ struct Engine::Impl {
                 }
             }
             g.run();
+            if (device_kv) state.device_kv_size = start+n;
         }, [&](int first, int n) {
-            convert(position+first, n);
+            if (!device_kv) convert(position+first, n);
             const int visible_end = position+first+n;
             const int visible_padded = (visible_end+255)/256*256;
             const int blocks = visible_end/c.block_size;
@@ -927,8 +1035,6 @@ struct Engine::Impl {
                 auto g = graph("prefill.attention", layer, first+offset);
                 auto * q = ggml_view_3d(g.c(), queries, c.head_dim, c.q_heads, queries_count,
                     queries->nb[1], queries->nb[2], size_t(offset)*queries->nb[2]);
-                q = ggml_cont(g.c(), ggml_permute(g.c(), q, 0, 2, 1, 3));
-                q = ggml_pad(g.c(), q, dim-c.head_dim, 0, 0, 0);
                 auto * mask = ggml_fill(g.c(), ggml_new_tensor_2d(g.c(), GGML_TYPE_F32, visible_padded, queries_count), 0);
                 mask = ggml_diag_mask_inf(g.c(), mask, position+first+offset);
                 ggml_tensor * top = nullptr;
@@ -960,16 +1066,7 @@ struct Engine::Impl {
                         ggml_reshape_2d(g.c(), g.integers(extra), c.block_size, queries_count));
                     if (capture) g.add(top);
                 }
-                mask = ggml_cast(g.c(), ggml_pad(g.c(), mask, 0, (64-queries_count%64)%64, 0, 0), GGML_TYPE_F16);
-                auto visible_kv = [&](ggml_tensor * t) {
-                    return ggml_view_3d(g.c(), t, dim, visible_padded, c.kv_heads, t->nb[1], t->nb[2], 0);
-                };
-                auto * attended = ggml_flash_attn_ext(g.c(), q, visible_kv(compute_keys), visible_kv(compute_values), mask,
-                    1.0f/std::sqrt(float(c.head_dim)), 0, 0);
-                ggml_prec_set_acc(attended, GGML_PREC_F32);
-                ggml_set_name(attended, (p+"attention.flash").c_str());
-                auto * cropped = ggml_cont(g.c(), ggml_view_3d(g.c(), attended, c.head_dim, c.q_heads, queries_count,
-                    attended->nb[1], attended->nb[2], 0));
+                auto * cropped = flash_attention(g, q, compute_keys, compute_values, mask, queries_count, visible_end);
                 auto * target = ggml_view_2d(g.c(), output, qwidth, queries_count, output->nb[1], size_t(offset)*output->nb[1]);
                 g.add(ggml_cpy(g.c(), cropped, target));
                 g.run(); ++stats.prefill_gpu_attention_calls;
@@ -1010,7 +1107,7 @@ struct Engine::Impl {
         });
         // The complete layer is now immutable. Export once, retaining the source
         // until the separate stream finishes; the next layer still starts later.
-        exporter.enqueue(cache, keys, values, *state.attention, position, count, layer);
+        if (exporter) exporter->enqueue(cache, keys, values, *state.attention, position, count, layer);
     }
 
     std::vector<Step> prefill(const std::vector<int32_t> & tokens, bool capture) {
@@ -1029,9 +1126,12 @@ struct Engine::Impl {
             prefill_backend = make_backend(options);
             ProfileScope scope(&profiler, "prefill", "layer_major", "prefill", position, -1, ggml_backend_name(prefill_backend.get()));
             {
-                KVExporter exporter(options.device, stats, profiler);
-                memory.reclaim_completed = [&] { exporter.reap(); };
-                memory.wait_transfers = [&] { exporter.finish(); };
+                std::unique_ptr<KVExporter> exporter;
+                if (options.kv_placement == KVPlacement::CPU) {
+                    exporter = std::make_unique<KVExporter>(options.device, stats, profiler);
+                    memory.reclaim_completed = [&] { exporter->reap(); };
+                    memory.wait_transfers = [&] { exporter->finish(); };
+                }
                 const int count = int(tokens.size());
                 for (int i=0; i<count; ++i) result.push_back({position+i, {}, {}});
                 const int embedding_group = c.tied_embeddings ? model.group(c.layers, WeightPart::Head) : model.group(-1, WeightPart::Embedding);
@@ -1053,7 +1153,7 @@ struct Engine::Impl {
                     ProfileScope layer_scope(&profiler, "layer", "batch", "prefill.layer", position, layer, ggml_backend_name(prefill_backend.get()));
                     if (states[layer].ple) batch_ple(batch, layer, tokens);
                     if (c.is_recurrent(layer)) batch_gdn(batch, layer);
-                    else batch_attention(batch, layer, exporter, result, capture);
+                    else batch_attention(batch, layer, exporter.get(), result, capture);
                     batch_ffn(batch, layer);
                     ++stats.prefill_layers;
                 }
@@ -1092,7 +1192,7 @@ struct Engine::Impl {
                     if (!std::isfinite(g.get<float>(finite)[0])) throw std::runtime_error("Non-finite logits or hidden values during prefill");
                     if (capture) result.back().logits = g.get<float>(last_logits);
                 }
-                exporter.finish();
+                if (exporter) exporter->finish();
             }
             memory.reclaim_completed = {}; memory.wait_transfers = {};
             // Release kernel-pool scratch before restoring the decode weight layout.
@@ -1129,7 +1229,11 @@ struct Engine::Impl {
             for (int layer = 0; layer < c.layers; ++layer) {
                 if (states[layer].ple) ple_layer(layer, token);
                 if (c.is_recurrent(layer)) linear_layer(layer);
-                else step.selections.push_back(c.architecture == Architecture::Qwen35 ? full_layer(layer) : sparse_layer(layer));
+                else {
+                    auto selection = c.architecture == Architecture::Qwen35 ? full_layer(layer, capture_logits) : sparse_layer(layer, capture_logits);
+                    if (capture_logits || options.kv_placement == KVPlacement::CPU)
+                        step.selections.push_back(std::move(selection));
+                }
             }
             auto head = graph("head");
             auto mixed = c.architecture == Architecture::Qwen35
@@ -1167,13 +1271,21 @@ struct Engine::Impl {
         for (size_t id=0; id<model.groups.size(); ++id) model.load(int(id));
         ggml_backend_synchronize(backend.get());
         ggml_backend_buffer_clear(state_buffer.get(), 0);
-        for (auto & s : states) if (s.attention) s.attention->reset();
+        for (auto & s : states) {
+            if (s.attention) s.attention->reset();
+            s.device_kv_size = 0;
+        }
+        if (kv_token_ids) {
+            std::vector<int32_t> ids(c.context); std::iota(ids.begin(), ids.end(), 0);
+            ggml_backend_tensor_set(kv_token_ids, ids.data(), 0, ids.size()*sizeof(int32_t));
+        }
         previous_tokens.clear();
         captured_logits.clear();
         sampler->reset();
         position = 0;
         failed = false;
         stats = {};
+        stats.gpu_kv_bytes = gpu_kv_bytes;
         profiler.clear();
     }
 };

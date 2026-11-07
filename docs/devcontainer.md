@@ -98,9 +98,10 @@ layers). See [the PLE contract](architecture.md#optional-per-layer-embedding-ple
 and its [numerical validation limits](validation.md#ple-coverage-and-limits).
 
 The preset uses Ninja and `RelWithDebInfo`, exports `compile_commands.json`, and
-enables ccache for C/C++/CUDA compilation. `GGML_CUDA_FA=OFF` skips unused GPU
-FlashAttention kernels: this engine computes main attention on the CPU. GDN and
-QSA indexer kernels remain enabled. Build output goes under `build/dev-cuda`, which
+enables ccache for C/C++/CUDA compilation. `GGML_CUDA_FA=ON` enables GPU
+FlashAttention for prefill and for decoding with `--kv-placement gpu`. The default
+hybrid mode retains CPU KV and CPU attention during decoding. GDN and QSA indexer
+kernels remain enabled. Build output goes under `build/dev-cuda`, which
 is separate from the earlier `build-cuda` instructions and ignored by Git.
 
 Build parallelism defaults to four jobs. On a machine with limited free RAM, use

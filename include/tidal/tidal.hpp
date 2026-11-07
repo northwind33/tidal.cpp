@@ -69,6 +69,7 @@ enum class ProfileMode { Off, Phases, Nodes };
 
 enum class SamplingBackend { Device, CPU };
 enum class PrefillPrecision { FP16, BF16 };
+enum class KVPlacement { CPU, GPU };
 
 struct SamplingConfig {
     SamplingBackend backend = SamplingBackend::Device;
@@ -116,6 +117,9 @@ struct Options {
     uint64_t prefill_memory_limit = 0;
     // UINT64_MAX selects automatic kernel/runtime headroom; zero disables it.
     uint64_t prefill_memory_reserve = UINT64_MAX;
+    // Benchmark alternative: persistent CUDA KV and attention in both phases.
+    // GPU KV uses prefill_precision directly; CPU KV remains canonical BF16.
+    KVPlacement kv_placement = KVPlacement::CPU;
 };
 
 struct Selection {
@@ -150,6 +154,8 @@ struct Statistics {
     uint64_t prefill_chunk_min_tokens = 0, prefill_chunk_max_tokens = 0;
     uint64_t prefill_attention_min_tile = 0, prefill_attention_max_tile = 0;
     uint64_t prefill_reserve_bytes = 0;
+    uint64_t gpu_attention_calls = 0; // Decode only; prefill has its own counter.
+    uint64_t gpu_kv_bytes = 0; // Persistent, padded K/V allocation; survives reset.
 };
 
 struct ModelInfo {

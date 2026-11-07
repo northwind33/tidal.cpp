@@ -9,7 +9,7 @@
     {
       "name": "dev-cuda",
       "displayName": "CUDA development (Titan RTX / SM 7.5)",
-      "description": "Debuggable CUDA build for the development container; main attention runs on CPU.",
+      "description": "Debuggable CUDA build with GPU prefill and optional persistent GPU KV/attention.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/dev-cuda",
       "cacheVariables": {

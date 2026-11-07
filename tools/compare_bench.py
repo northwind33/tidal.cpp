@@ -22,8 +22,18 @@ def compare(before, after, allow_sampler_change=False):
                 raise ValueError(f"Incompatible reports: {section}.{key} differs")
     if before["workload"].get("capture_logits", True) != after["workload"].get("capture_logits", True):
         raise ValueError("Incompatible reports: logit capture differs")
-    if before["workload"].get("prefill") != after["workload"].get("prefill"):
-        raise ValueError("Incompatible prefill execution, precision, chunk, tile or memory settings")
+    def prefill_settings(report):
+        value = report['workload'].get('prefill')
+        if value is None:
+            return None
+        value = dict(value)
+        # Reports predating the GPU KV option always used CPU BF16 decode KV.
+        value.setdefault('kv_placement', 'cpu')
+        value.setdefault('kv_type', 'BF16')
+        value.setdefault('decode_attention_backend', 'CPU')
+        return value
+    if prefill_settings(before) != prefill_settings(after):
+        raise ValueError("Incompatible KV placement/type, prefill execution, precision, chunk, tile or memory settings")
     a, b = dict(before["workload"].get("sampling", {})), dict(after["workload"].get("sampling", {}))
     if allow_sampler_change:
         a.pop("backend", None); b.pop("backend", None)

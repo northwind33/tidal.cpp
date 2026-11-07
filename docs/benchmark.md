@@ -2,7 +2,8 @@
 
 `tidal-bench` measures single-sequence inference and exports machine-readable
 results for comparisons. It uses the same `Engine` as `tidal-cli`; CUDA mode
-uses GPU layer-major prefill and CPU attention during decoding. Build with the normal
+uses GPU layer-major prefill and, by default, CPU attention during decoding.
+`--kv-placement gpu` also keeps decode attention and persistent KV on CUDA. Build with the normal
 CMake preset. No Python dependency is needed to run the benchmark itself.
 
 ## Throughput baseline
@@ -40,10 +41,15 @@ Model loading/backend initialization, state reset, warmup, checksum calculation 
 serialization are excluded. Load and reset times are reported separately.
 Each warmup and repetition starts from a reset sequence; measured repetitions
 must produce identical outputs. Decode latency samples retain their order.
-Prefill timing includes KV export completion and restoration of evicted weights.
+Prefill timing includes configured KV placement (export completion in CPU KV mode)
+and restoration of evicted weights.
 
-Reports also identify prefill execution, working precision, automatic or explicit
+Reports also identify persistent KV placement/type, decode attention backend,
+prefill execution, working precision, automatic or explicit
 chunk/tile sizes and memory settings; comparisons require them to match.
+Use `--kv-placement gpu --prefill-precision fp16` with an appropriate `--context`
+for a GPU KV comparison. The same options reach text inference through
+`tools/qwen35_text.py`; see [GPU KV mode](prefill.md#persistent-gpu-kv-benchmark-mode).
 
 Reports contain model configuration, file size and FNV-1a content fingerprint,
 backend/device/CPU, thread count, CUDA API driver/runtime versions, compiler,
