@@ -1,0 +1,25 @@
+# Run at build time, but touch the header only when Git identity changes.
+execute_process(COMMAND git rev-parse --short HEAD WORKING_DIRECTORY "${SOURCE_DIR}"
+    OUTPUT_VARIABLE revision OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+execute_process(COMMAND git status --porcelain --untracked-files=normal WORKING_DIRECTORY "${SOURCE_DIR}"
+    OUTPUT_VARIABLE status ERROR_QUIET)
+if(NOT revision)
+    set(revision "unknown")
+endif()
+if(status)
+    set(dirty "true")
+else()
+    set(dirty "false")
+endif()
+execute_process(COMMAND git rev-parse HEAD WORKING_DIRECTORY "${GGML_DIR}"
+    OUTPUT_VARIABLE ggml_revision OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(NOT ggml_revision)
+    set(ggml_revision "unknown")
+endif()
+set(contents "#pragma once\n#define TIDAL_BUILD_REVISION \"${revision}\"\n#define TIDAL_BUILD_DIRTY ${dirty}\n#define TIDAL_GGML_REVISION \"${ggml_revision}\"\n")
+if(EXISTS "${OUTPUT}")
+    file(READ "${OUTPUT}" previous)
+endif()
+if(NOT contents STREQUAL previous)
+    file(WRITE "${OUTPUT}" "${contents}")
+endif()
