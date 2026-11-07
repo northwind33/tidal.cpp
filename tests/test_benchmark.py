@@ -40,6 +40,10 @@ def main():
             assert r["schema_version"] == 1 and r["workload"]["repetitions"] == 2
             assert r["label"] == 'test "json"\nlabel' and r["model"]["path"] == str(model)
             assert len(r["runs"]) == 2
+            prefill = r['workload']['prefill']
+            assert prefill['chunk_mode'] == prefill['attention_tile_mode'] == 'auto'
+            assert prefill['chunk_tokens'] == prefill['attention_tile'] == 0
+            assert prefill['memory_reserve_mode'] == 'auto' and prefill['memory_reserve_bytes'] is None
             for item in r["runs"]:
                 assert item["prefill_latency_ms"] == [] and len(item["decode_latency_ms"]) == 4
                 assert item["statistics"]["sparse_attention_calls"] == cpu_tokens
@@ -143,6 +147,11 @@ def main():
         changed.write_text(json.dumps(candidate))
         run(sys.executable, compare, baseline, changed, "--allow-sampler-change", code=2)
         candidate = copy.deepcopy(reports["off"])
+        candidate['workload']['prefill']['chunk_tokens'] = 3
+        candidate['workload']['prefill']['chunk_mode'] = 'explicit'
+        changed.write_text(json.dumps(candidate))
+        run(sys.executable, compare, baseline, changed, code=2)
+        candidate = copy.deepcopy(reports["off"])
         candidate["workload"]["capture_logits"] = False
         changed.write_text(json.dumps(candidate))
         run(sys.executable, compare, baseline, changed, "--allow-sampler-change", code=2)
@@ -153,8 +162,20 @@ def main():
         z = json.loads(zero.read_text())
         assert z["summary"]["decode"]["tokens_per_second"] is None
         assert z["summary"]["decode"]["token_latency_ms"] is None
+        manual = root / 'manual.json'
+        run(*base, '--prefill-chunk', 3, '--prefill-tile', 2, '--prefill-reserve-mib', 0, '--json', manual)
+        m = json.loads(manual.read_text())
+        assert m['workload']['prefill']['chunk_tokens'] == 3
+        assert m['workload']['prefill']['attention_tile'] == 2
+        assert m['workload']['prefill']['memory_reserve_bytes'] == 0
+        if args.backend == 'cuda':
+            for item in m['runs']:
+                assert 1 <= item['statistics']['prefill_chunk_max_tokens'] <= 3
+                assert 1 <= item['statistics']['prefill_attention_max_tile'] <= 2
         for extra in [["--profile", "invalid"], ["--trace", root / "bad.json"], ["--json", model],
-                      ["--tokens", "1,"], ["--nvtx", 2]]:
+                      ["--tokens", "1,"], ["--nvtx", 2], ['--prefill-chunk',0], ['--prefill-chunk',-1],
+                      ['--prefill-chunk','automatic'], ['--prefill-tile',0], ['--prefill-tile',4097],
+                      ['--prefill-reserve-mib',-1]]:
             run(*base, *extra, code=1)
         run(bench, "--model", model, "--backend", args.backend, "--repetitions", 0, code=1)
         run(bench, "--model", model, "--backend", args.backend, "--prompt", 32, "--steps", 1, code=1)

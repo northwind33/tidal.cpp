@@ -6,6 +6,14 @@ optional PLE, GDN or attention, and FFN, followed by the output head. Query tile
 stay inside the current attention layer; they never traverse the whole model.
 The explicit CPU backend retains sequential reference execution.
 
+Within a layer, embedding, PLE, GDN, Dense/MoE FFN, attention projections/KV layout
+and diagnostic heads use bounded token ranges. GDN and PLE carry their recurrent
+and convolution histories between ranges. Attention retains the active layer's
+full KV and a range of queries/gates/output; it never materializes those three
+intermediates for the entire prompt. The layer's hidden activation buffer remains
+resident until every layer has finished. A range does not advance to the next
+decoder layer before the rest of the prompt.
+
 Native `qwen35` uses full causal attention. Synthetic `qwen4exp` Dense/MoE uses
 QSA: each query can rank only blocks complete at its own position, and always
 includes its incomplete tail. Pooling later blocks cannot expose future tokens.
@@ -62,15 +70,49 @@ poisons the partially updated sequence; call `reset()` before reuse. There is no
 implicit CPU placement. ggml kernel-internal allocations also consume VRAM;
 `--prefill-reserve-mib` leaves headroom for them and other device users.
 
+Automatic chunk sizing estimates temporary bytes per token from model dimensions
+and the current phase, and uses at most one quarter of the memory recoverable by
+evicting unprotected weights. It rounds down to a power of two to retain wide
+matrix operations. Actual ggml graph sizing remains the allocation gate: if a
+pre-compute allocation fails, the uncommitted range is halved and retried, down to
+one token. Later successful ranges use the reduced width. A new phase recomputes
+its initial estimate against live availability. Attention query tiles follow the
+same policy with a 4,096-query ceiling and estimates that grow with KV length.
+
+Only allocation failures before graph execution are retryable. A later compute
+error or a failure in a consumer phase poisons the sequence without replaying
+already committed recurrent/QSA state. Failure at one token reports the phase and
+position. Explicit sizes fail instead of silently changing the requested setting.
+The irreducible hidden buffer, active-layer KV, protected weights and CPU KV must
+still fit their respective memories; shrinking temporary ranges cannot eliminate
+these allocations. Diagnostic capture also retains per-position host results.
+
+Default kernel/runtime headroom is automatic: the larger of 64 MiB and 1/16 of
+device capacity. This is separate from the managed graph budget. It protects
+against typical ggml kernel-pool allocations, but cannot promise recovery from
+every external allocation race or a backend that aborts internally. A numeric
+reserve overrides the heuristic; zero disables the reserve.
+After temporary storage and the prefill kernel pool are released, restoring the
+original decode weights uses actual free device memory rather than retaining the
+prefill-only reserve.
+
 ## Controls and measurements
 
 The CLI and benchmark accept:
 
-- `--prefill-tile N`: attention queries per tile, default 128; range 1–4096.
+- `--prefill-chunk auto|N`: temporary tensor/GEMM token range, default `auto`.
+  Explicit `N` must be positive; the final range can be shorter.
+- `--prefill-tile auto|N`: attention query tile, default `auto`; explicit 1–4096.
 - `--prefill-precision fp16|bf16`: GPU attention working KV format.
 - `--prefill-memory-mib N`: optional managed weight/workspace cap for pressure
   experiments; zero uses live availability.
-- `--prefill-reserve-mib N`: device headroom, default 64 MiB.
+- `--prefill-reserve-mib auto|N`: device headroom, default `auto`.
+
+For example, use `--prefill-chunk 4096 --prefill-tile 256` to compare fixed
+partitions, or omit both flags to adapt to the model and available memory. The
+C++ equivalents are `Options::prefill_chunk_tokens` and
+`Options::prefill_attention_tile` (zero means automatic);
+`Options::prefill_memory_reserve == UINT64_MAX` means automatic headroom.
 
 Compact inference returns prompt positions without vocabulary vectors or
 per-query selection lists. Diagnostic capture returns both for every position;
@@ -91,6 +133,11 @@ FlashAttention/output, FFN, head, KV export and weight residency. Counters repor
 prefill tokens/layers/attention tiles, exported KV bytes, weight evictions,
 reloads/prefetches and peak managed workspace. Host wall times from asynchronous
 transfers can overlap compute; adding them does not produce elapsed prefill time.
+Reports also identify automatic versus explicit chunk/tile/reserve settings and
+record actual minimum/maximum range sizes (including short tails), completed
+range count, allocation retry count and resolved headroom. `prefill/chunk` profile
+events carry the range length in `shape`; `memory/chunk_reduce` carries the failed
+and reduced lengths. Failed attempts do not increment completed-range counters.
 
 See [validation](validation.md) for reproducible correctness checks. Models,
 measurement JSON, profiler traces and local development explanations belong in

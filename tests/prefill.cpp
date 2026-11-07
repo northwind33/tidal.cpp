@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 
 namespace {
@@ -74,11 +75,43 @@ int main(int argc, char ** argv) {
         close(continuation,engine.decode(17),gpu?.004f:0.f);
         require(engine.prefill({}).empty(),"Empty prefill changed sequence");
         if (gpu) {
+            // Internal sublayer ranges must preserve layer order, recurrence,
+            // PLE n-grams/convolution, causal QSA and CPU-KV decode continuation.
+            for (int width : {1,5,11}) {
+                auto split_options=options;
+                split_options.prefill_chunk_tokens=width;
+                split_options.prefill_attention_tile=0;
+                tidal::Engine split(argv[1],split_options);
+                auto actual=split.prefill(tokens);
+                for (size_t i=0;i<tokens.size();++i) close(expected[i],actual[i],.004f);
+                const auto s=split.statistics();
+                require(s.prefill_layers==uint64_t(split.config().layers) && s.prefill_tokens==tokens.size(),"Internal ranges changed layer/token counts");
+                require(s.prefill_chunk_max_tokens<=uint64_t(width) && s.prefill_chunk_min_tokens>=1,"Explicit range bound ignored");
+                require(!s.full_attention_calls && !s.sparse_attention_calls,"Internal ranges used CPU attention");
+                int current=-1;
+                std::map<std::string,int> positions;
+                for (const auto & e:split.profile_events()) {
+                    if (e.category=="graph" && e.phase.rfind("prefill.",0)==0 && e.layer>=0) {
+                        require(e.layer>=current,"Internal ranges crossed a layer boundary");current=e.layer;
+                    }
+                    if (e.category=="prefill" && e.name=="chunk") {
+                        auto & next=positions[e.phase+":"+std::to_string(e.layer)];
+                        require(e.shape.size()==1 && e.position==next,"Chunk profile lost its absolute token range");
+                        next+=int(e.shape[0]);
+                    }
+                }
+                for (const auto & [phase,next]:positions) {
+                    (void)phase;
+                    require(next==int(tokens.size()),"Chunk profile omitted or duplicated prompt tokens");
+                }
+                close(continuation,split.decode(17),.004f);
+            }
             options.profile=tidal::ProfileMode::Phases;
             options.prefill_memory_limit=engine.model_info().weight_buffer_bytes;
             tidal::Engine pressured(argv[1],options);
             const auto actual=pressured.prefill(tokens);
-            for (size_t i=0;i<tokens.size();++i) close(expected[i],actual[i],0);
+            // Pressure can change the automatic GEMM partition and reduction order.
+            for (size_t i=0;i<tokens.size();++i) close(expected[i],actual[i],.004f);
             const auto s=pressured.statistics();
             require(s.prefill_weight_evictions && s.prefill_weight_reloads,"Pressure did not evict/reload weights");
             bool restored=false;
@@ -86,7 +119,7 @@ int main(int argc, char ** argv) {
                 if (e.phase=="prefill.restore") restored=true;
                 if (restored) require(e.category!="graph","Weights restored before prefill graph completion");
             }
-            close(continuation,pressured.decode(17),0);
+            close(continuation,pressured.decode(17),.004f);
             options.prefill_memory_limit=1;
             tidal::Engine tiny(argv[1],options);
             bool rejected=false;
@@ -97,6 +130,22 @@ int main(int argc, char ** argv) {
             try { tiny.decode(1); } catch(const std::runtime_error &) { poisoned=true; }
             require(poisoned,"Failed prefill did not poison partial state");
             tiny.reset(); engine.reset(); close(engine.decode(1),tiny.decode(1),0);
+        }
+        if (gpu && engine.config().context>=514) {
+            auto extended_options=options;
+            extended_options.prefill_memory_limit=0;
+            extended_options.prefill_chunk_tokens=37;
+            extended_options.prefill_attention_tile=17;
+            extended_options.profile=tidal::ProfileMode::Off;
+            tidal::Engine whole(argv[1],extended_options), extended(argv[1],extended_options);
+            std::vector<int32_t> long_tokens;
+            for (int i=0;i<513;++i) long_tokens.push_back(tokens[i%tokens.size()]);
+            auto target=whole.prefill(long_tokens);
+            auto prefix=extended.prefill({long_tokens.begin(),long_tokens.begin()+300});
+            auto suffix=extended.prefill({long_tokens.begin()+300,long_tokens.end()});
+            for (size_t i=0;i<prefix.size();++i) close(target[i],prefix[i],.004f);
+            for (size_t i=0;i<suffix.size();++i) close(target[300+i],suffix[i],.004f);
+            close(whole.decode(17),extended.decode(17),.004f);
         }
         std::cout << "Layer order, GPU attention, KV export, prefix continuation, reset, pressure and failure recovery passed\n";
     } catch(const std::exception & e) {std::cerr<<e.what()<<'\n';return 1;}

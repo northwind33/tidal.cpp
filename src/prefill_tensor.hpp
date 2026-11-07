@@ -23,7 +23,7 @@ public:
         const auto bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(context.get(), buft);
         memory_.acquire(bytes); allocated_ = bytes;
         buffer.reset(ggml_backend_alloc_ctx_tensors(context.get(), backend_));
-        if (!buffer) throw std::runtime_error("Cannot allocate reserved GPU prefill storage");
+        if (!buffer) throw PrefillAllocationError("Insufficient VRAM for reserved GPU prefill storage");
         ggml_backend_buffer_clear(buffer.get(), 0);
     }
 };

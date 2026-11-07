@@ -42,8 +42,8 @@ Each warmup and repetition starts from a reset sequence; measured repetitions
 must produce identical outputs. Decode latency samples retain their order.
 Prefill timing includes KV export completion and restoration of evicted weights.
 
-Reports also identify prefill execution, working precision, tile size and memory
-settings; comparisons require them to match.
+Reports also identify prefill execution, working precision, automatic or explicit
+chunk/tile sizes and memory settings; comparisons require them to match.
 
 Reports contain model configuration, file size and FNV-1a content fingerprint,
 backend/device/CPU, thread count, CUDA API driver/runtime versions, compiler,

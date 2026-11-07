@@ -1,6 +1,7 @@
 #include "residency.hpp"
 #include "prefill_memory.hpp"
 #include "prefill_tensor.hpp"
+#include "prefill_chunks.hpp"
 #include "kv_export.hpp"
 #include "ggml-cpu.h"
 #ifdef TIDAL_CUDA
@@ -117,6 +118,50 @@ int main(int argc, char ** argv) {
         if (!model.resident(next) || !model.resident(future_ffn) || model.resident_bytes() > options.prefill_memory_limit)
             throw std::runtime_error("Prefetch evicted a requested group or exceeded the reserved budget");
         paired.restore();
+        // Decode restoration must not keep a prefill-only workspace reserve:
+        // all temporary buffers and the prefill kernel pool have been released.
+        auto restore_options=options;
+        restore_options.prefill_memory_reserve=UINT64_MAX-1;
+        tidal::PrefillMemory restoration(model,backend.get(),stats,profile,restore_options);
+        model.evict(last);
+        restoration.restore();
+        if (!model.resident(last) || model.resident_bytes()!=resident)
+            throw std::runtime_error("Prefill-only headroom prevented decode weight restoration");
+        // Exercise reduction with real backend allocations under a managed cap,
+        // not only simulated exceptions. Two rows fit; eight and four must fail.
+        auto adaptive_options=options;
+        adaptive_options.prefill_memory_limit=model.groups[active].allocation_bytes+8192;
+        adaptive_options.prefill_memory_reserve=0;
+        tidal::PrefillMemory adaptive(model,backend.get(),stats,profile,adaptive_options);
+        adaptive.protect(2,{active});
+        std::vector<int> committed, reduced;
+        tidal::visit_prefill_chunks(13,8,true,[&](int,int n) {
+            tidal::PrefillTensorStorage storage(adaptive,backend.get());
+            storage.tensor(GGML_TYPE_F32,1024,n);
+            storage.allocate();
+            if (!model.resident(active)) throw std::runtime_error("Adaptive allocation evicted active weights");
+        },[&](int first,int n) {
+            for (int i=first;i<first+n;++i) committed.push_back(i);
+        },[&](int,int,int smaller) { reduced.push_back(smaller); });
+        if (reduced!=std::vector<int>{4,2} || committed.size()!=13 || adaptive.workspace_bytes())
+            throw std::runtime_error("Backend allocation pressure did not shrink and release ranges");
+        for (int i=0;i<13;++i)
+            if (committed[i]!=i) throw std::runtime_error("Backend allocation retry duplicated tokens");
+        adaptive.restore();
+        adaptive_options.prefill_memory_limit=model.groups[active].allocation_bytes;
+        tidal::PrefillMemory impossible(model,backend.get(),stats,profile,adaptive_options);
+        impossible.protect(2,{active});
+        int attempts=0; bool minimum_rejected=false;
+        try {
+            tidal::visit_prefill_chunks(8,8,true,[&](int,int n) {
+                ++attempts;
+                tidal::PrefillTensorStorage storage(impossible,backend.get());
+                storage.tensor(GGML_TYPE_F32,1024,n); storage.allocate();
+            },[](int,int) { throw std::runtime_error("Impossible range was committed"); },[](int,int,int) {});
+        } catch (const tidal::PrefillAllocationError &) { minimum_rejected=true; }
+        if (!minimum_rejected || attempts!=4 || impossible.workspace_bytes())
+            throw std::runtime_error("Backend allocation did not reject after shrinking to one token");
+        impossible.restore();
         if (std::string(argv[2]) == "cuda") {
             options.prefill_memory_limit = 0;
             tidal::PrefillMemory export_memory(model, backend.get(), stats, profile, options);

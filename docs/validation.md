@@ -197,6 +197,33 @@ chunked prefixes, subsequent decoding, reset and capture-independent sampling.
 Pressure tests require eviction/reload and compare the resulting logits; an
 impossible managed budget must fail and allow recovery after reset.
 
+Explicit internal ranges of 1, 5 and 11 tokens exercise convolution/ngram and
+incomplete QSA-block boundaries for Dense, PLE, MoE and native qwen35. Their
+trajectories and subsequent CPU-KV decoding are compared with the unsplit and
+independent reference paths; graph events must remain in layer order. Memory
+pressure may select different GEMM partitions, so that comparison uses the same
+bounded floating-point tolerance as other partition changes. Core tests simulate
+changing allocation capacity to check progressive reduction, exact-once commits,
+minimum-size failure, explicit-size rejection and no replay after consumer or
+compute errors. Benchmark tests cover automatic defaults, manual bounds, invalid
+flags and rejection of comparisons with incompatible chunk settings.
+Residency tests also enforce a managed cap on real backend buffers, requiring
+8-token and 4-token allocation failures followed by successful 2-token ranges,
+exact-once completion and full workspace release on both CPU and CUDA. A second
+cap rejects even one token and verifies termination after 8/4/2/1 attempts.
+Additional 513-token QSA/PLE and native qwen35 fixtures cross the 256-token KV
+padding boundaries with 37-token ranges and 17-query tiles. They compare one
+prefill call with a 300-token prefix plus 213-token extension, including logits,
+selections and subsequent decoding.
+
+Large-model validation is opt-in. With a local GGUF whose context supports the
+requested length, `tidal-bench --model MODEL --backend cuda --prompt 262144
+--steps 0 --warmup 0 --repetitions 1 --json build/long-prefill.json` exercises a
+single layer-major call at that length without retaining diagnostic histories.
+Keep the model, measurements and machine-specific validation notes under ignored
+directories. Small fixtures do not establish that a particular large model fits;
+validate the actual target model and device before making that claim.
+
 F32/F16/BF16/Q8_0/Q4_0 matrices also have isolated 24-column tests. The CUDA
 reference distinguishes batch MMQ from single-token MMVQ: Q8 batch scales use
 F32, and the Q4 MMA path subtracts the integer zero point before multiplication.

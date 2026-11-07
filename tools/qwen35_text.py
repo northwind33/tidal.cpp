@@ -26,13 +26,14 @@ def main():
     parser.add_argument('--penalty-last-n', type=int, default=64)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--prefill-precision',choices=['fp16','bf16'],default='fp16')
-    parser.add_argument('--prefill-tile',type=int,default=128)
+    parser.add_argument('--prefill-chunk',default='auto')
+    parser.add_argument('--prefill-tile',default='auto')
     parser.add_argument('--prefill-memory-mib',type=int,default=0)
-    parser.add_argument('--prefill-reserve-mib',type=int,default=64)
+    parser.add_argument('--prefill-reserve-mib',default='auto')
     args = parser.parse_args()
     sampling = [part for name in ['sampler','temp','top_k','top_p','min_p','repeat_penalty',
                                   'frequency_penalty','presence_penalty','penalty_last_n','seed',
-                                  'prefill_precision','prefill_tile','prefill_memory_mib','prefill_reserve_mib']
+                                  'prefill_precision','prefill_chunk','prefill_tile','prefill_memory_mib','prefill_reserve_mib']
                 for part in ['--'+name.replace('_','-'), str(getattr(args,name))]]
     try:
         from tokenizers import Tokenizer

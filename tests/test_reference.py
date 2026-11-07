@@ -102,7 +102,8 @@ def check_placement(result, config, backend, steps):
     d2h += 12 * len(result["generated"]) # GPU sampler token/error/candidate count.
     if prefill:
         blocks = prefill // config["block_size"]
-        tile = result["prefill"]["attention_tile"]
+        tile = result["prefill"]["attention_tile"] or stats['prefill_attention_max_tile']
+        assert tile > 0
         prefill_ids = prefill * min(config["top_blocks"], blocks)
         decode_ids = sum(min(config["top_blocks"], visible // config["block_size"])
                          for visible in range(prefill+1,steps+1))

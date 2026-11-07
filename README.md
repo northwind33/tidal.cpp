@@ -7,6 +7,8 @@ or QSA-selected sparse attention for the synthetic model, reads a BF16 KV cache
 in CPU RAM and computes QK/softmax/V on CPU during decoding. CUDA prefill instead
 processes the whole prompt layer by layer, with GPU attention and asynchronous
 KV export to CPU RAM; see [prefill](docs/prefill.md).
+Within each layer, automatic memory-aware token ranges bound temporary tensors;
+`--prefill-chunk N` and `--prefill-tile N` select explicit sizes for comparisons.
 
 Qwen3.5 loads native `qwen35` GGUFs without conversion to the synthetic schema.
 See [the real-model guide](docs/qwen35.md) for downloads, text generation and

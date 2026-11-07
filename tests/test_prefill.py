@@ -67,6 +67,31 @@ def main():
             batch_matrices(b/'tidal-matvec-test',model,a.backend)
             trajectory(b/'tidal-cli',model,root/(kind+'.json'),a.backend,Reference(model,a.backend),.025 if kind.startswith('q') else .004 if a.backend=='cuda' else .012)
             print(kind+': isolated batch matrices and full prompt/continuation oracle passed',flush=True)
+        if a.backend == 'cuda':
+            # Cross multiple 256-token KV padding boundaries with a partial
+            # projection range. KV head strides still span the whole context.
+            for name in ['long-qsa-ple','long-qwen35']:
+                model=root/(name+'.gguf')
+                if name == 'long-qsa-ple':
+                    run(b/'tidal-dummy','--output',model,'--context',768,'--type','f32','--ple-layers','0,2')
+                else:
+                    metadata,tensors=fixture(tied=False,explicit=True)
+                    metadata['qwen35.context_length']=(4,768)
+                    write_gguf(model,metadata,tensors)
+                run(b/'tidal-prefill-test',model,'cuda')
+                tokens=(PROMPT*40)[:513]
+                reports=[]
+                for width,tile in [('auto','auto'),('37','17')]:
+                    path=root/f'{name}-{width}.json'
+                    run(b/'tidal-cli','--model',model,'--backend','cuda','--tokens',','.join(map(str,tokens)),
+                        '--steps',1,'--prefill-chunk',width,'--prefill-tile',tile,'--json',path)
+                    reports.append(json.loads(path.read_text()))
+                assert reports[0]['generated']==reports[1]['generated']
+                for expected,actual in zip(reports[0]['trace'],reports[1]['trace']):
+                    assert expected['selections']==actual['selections']
+                    np.testing.assert_allclose(actual['logits'],expected['logits'],atol=.004,rtol=.004)
+                assert reports[1]['statistics']['prefill_chunk_max_tokens']<=37
+                print(name+': KV padding/head strides, causal masks and range continuation passed',flush=True)
     print('Layer-major prefill validation passed')
 
 

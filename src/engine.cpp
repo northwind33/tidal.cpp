@@ -1,6 +1,7 @@
 #include "internal.hpp"
 #include "sampling.hpp"
 #include "prefill_tensor.hpp"
+#include "prefill_chunks.hpp"
 #include "kv_export.hpp"
 #include "profiler.hpp"
 #include "ggml-cpu.h"
@@ -63,6 +64,7 @@ public:
     PrefillMemory * memory = nullptr;
     std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)> allocator{nullptr, ggml_gallocr_free};
     size_t allocated_bytes = 0;
+    bool reserved = false;
     std::function<void()> before_compute;
     Statistics & stats;
     bool device;
@@ -116,7 +118,8 @@ public:
         if (device) stats.device_to_host_bytes += ggml_nbytes(t);
         return values;
     }
-    void run() {
+    void reserve() {
+        if (reserved) return;
         build_scope.finish();
         ProfileScope validation(&profiler, "host", "supports_op", phase, position, layer, "CPU");
         for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
@@ -133,13 +136,17 @@ public:
             size_t bytes = 0;
             ggml_gallocr_reserve_n_size(allocator.get(), graph, nullptr, nullptr, &bytes);
             memory->acquire(bytes); allocated_bytes = bytes;
-            if (!ggml_gallocr_reserve(allocator.get(), graph)) throw std::runtime_error("Prefill graph reservation failed");
-            if (!ggml_gallocr_alloc_graph(allocator.get(), graph)) throw std::runtime_error("Prefill graph allocation failed");
+            if (!ggml_gallocr_reserve(allocator.get(), graph)) throw PrefillAllocationError("Insufficient VRAM for prefill graph reservation");
+            if (!ggml_gallocr_alloc_graph(allocator.get(), graph)) throw PrefillAllocationError("Insufficient VRAM for prefill graph allocation");
         } else {
             storage.reset(ggml_backend_alloc_ctx_tensors(c(), backend));
             if (!storage) throw std::runtime_error("Graph allocation failed");
         }
         allocation.finish();
+        reserved = true;
+    }
+    void run() {
+        reserve();
         for (auto & upload : uploads) upload();
         if (before_compute) before_compute();
         ProfileScope compute(&profiler, "graph", "compute", phase, position, layer, backend_label);
@@ -215,7 +222,7 @@ struct Engine::Impl {
     Impl(const std::string & path, Options opts)
         : options(std::move(opts)), backend(make_backend(options)), model(path, backend.get()), c(model.config),
           profiler(options.profile, options.nvtx, options.profile_event_limit), state_context(context(1024 * 1024)), states(c.layers) {
-        if (options.prefill_attention_tile < 1 || options.prefill_attention_tile > 4096 ||
+        if (options.prefill_chunk_tokens < 0 || options.prefill_attention_tile < 0 || options.prefill_attention_tile > 4096 ||
             (options.prefill_precision != PrefillPrecision::FP16 && options.prefill_precision != PrefillPrecision::BF16))
             throw std::invalid_argument("Invalid prefill precision or attention tile");
         if (options.context < 0 || options.context > c.context) throw std::invalid_argument("Invalid runtime context capacity");
@@ -582,6 +589,40 @@ struct Engine::Impl {
         auto * value = ggml_repeat(g.c(), ggml_reshape_3d(g.c(), out, c.hidden, 1, count), h);
         return ggml_add(g.c(), h, ggml_mul(g.c(), value, ggml_reshape_3d(g.c(), injection, 1, c.branches, count)));
     }
+    ggml_tensor * token_range(ggml_context * ctx, ggml_tensor * h, int first, int count) {
+        return ggml_view_3d(ctx, h, h->ne[0], h->ne[1], count, h->nb[1], h->nb[2], size_t(first)*h->nb[2]);
+    }
+    template<class F>
+    void chunks(const std::string & phase, int layer, int count, uint64_t bytes_per_token,
+                int requested, F execute, std::function<void(int, int)> after = {}, bool attention = false, int token_offset = 0) {
+        int width = prefill_memory->initial_chunk(count, bytes_per_token, requested);
+        if (attention && !requested) width = std::min(width, 4096);
+        visit_prefill_chunks(count, width, requested == 0, [&](int first, int n) {
+            ProfileScope range(&profiler, "prefill", "chunk", phase, position+token_offset+first, layer, ggml_backend_name(prefill_backend.get()));
+            range.event.shape = {n};
+            try {
+                // execute may only throw PrefillAllocationError before changing
+                // model state. Later phases run outside this retry boundary.
+                execute(first, n);
+            } catch (const PrefillAllocationError & error) {
+                range.event.name = "chunk_failed";
+                throw PrefillAllocationError(phase + " at token " + std::to_string(position+token_offset+first) +
+                    " cannot allocate " + std::to_string(n) + " token(s)" +
+                    (requested ? " (explicit size; use auto to reduce it): " : n == 1 ? " (minimum size): " : ": ") + error.what());
+            }
+        }, [&](int first, int n) {
+            ++stats.prefill_chunks;
+            auto & minimum = attention ? stats.prefill_attention_min_tile : stats.prefill_chunk_min_tokens;
+            auto & maximum = attention ? stats.prefill_attention_max_tile : stats.prefill_chunk_max_tokens;
+            minimum = minimum ? std::min<uint64_t>(minimum, n) : n;
+            maximum = std::max<uint64_t>(maximum, n);
+            if (after) after(first, n);
+        }, [&](int first, int n, int smaller) {
+            ++stats.prefill_chunk_retries;
+            ProfileScope retry(&profiler, "memory", "chunk_reduce", phase, position+token_offset+first, layer, "CPU");
+            retry.event.shape = {n, smaller};
+        });
+    }
     ggml_tensor * batch_moe(Graph & g, ggml_tensor * x, const std::string & p) {
         const int64_t count = x->ne[1];
         auto * probabilities = ggml_soft_max(g.c(), mm(g, p + "router", x));
@@ -610,29 +651,33 @@ struct Engine::Impl {
         }
         return result;
     }
-    void batch_ffn(ggml_tensor * h, int layer) {
+    void batch_ffn(ggml_tensor * batch, int layer) {
         prefill_memory->protect(layer, {model.group(layer, WeightPart::FeedForward)});
-        auto g = graph("prefill.ffn", layer);
-        const auto p = "blk." + std::to_string(layer) + ".";
-        const int64_t count = h->ne[2];
-        ggml_tensor * result;
-        if (c.architecture == Architecture::Qwen35) {
-            auto * flat = ggml_reshape_2d(g.c(), h, c.hidden, count);
-            auto * x = norm(g, flat, p + "ffn_norm");
-            auto * active = ggml_mul(g.c(), ggml_silu(g.c(), mm(g, p + "ffn.gate", x)), mm(g, p + "ffn.up", x));
-            result = ggml_add(g.c(), flat, mm(g, p + "ffn.down", active));
-        } else {
-            auto mixed = batch_mix(g, h, p + "hc_ffn");
-            auto * output = c.experts ? batch_moe(g, mixed.value, p + "ffn.") :
-                mm(g, p + "ffn.down", ggml_mul(g.c(), ggml_silu(g.c(), mm(g, p + "ffn.gate", mixed.value)),
-                                             mm(g, p + "ffn.up", mixed.value)));
-            result = batch_combine(g, h, output, mixed.inject);
-        }
-        g.add(ggml_cpy(g.c(), result, h));
-        if (layer + 1 < c.layers) g.before_compute = [this, layer] {
-            prefill_memory->prefetch({model.group(layer + 1, WeightPart::PLE), model.group(layer + 1, WeightPart::Attention)});
-        };
-        g.run();
+        const uint64_t expanded = c.experts ? uint64_t(c.expert_ffn)*c.experts_used+c.shared_ffn : c.ffn;
+        chunks("prefill.ffn", layer, int(batch->ne[2]), sizeof(float)*(6*uint64_t(c.hidden)*c.branches+6*expanded),
+               options.prefill_chunk_tokens, [&](int first, int count) {
+            auto g = graph("prefill.ffn", layer, first);
+            auto * h = token_range(g.c(), batch, first, count);
+            const auto p = "blk." + std::to_string(layer) + ".";
+            ggml_tensor * result;
+            if (c.architecture == Architecture::Qwen35) {
+                auto * flat = ggml_reshape_2d(g.c(), h, c.hidden, count);
+                auto * x = norm(g, flat, p + "ffn_norm");
+                auto * active = ggml_mul(g.c(), ggml_silu(g.c(), mm(g, p + "ffn.gate", x)), mm(g, p + "ffn.up", x));
+                result = ggml_add(g.c(), flat, mm(g, p + "ffn.down", active));
+            } else {
+                auto mixed = batch_mix(g, h, p + "hc_ffn");
+                auto * output = c.experts ? batch_moe(g, mixed.value, p + "ffn.") :
+                    mm(g, p + "ffn.down", ggml_mul(g.c(), ggml_silu(g.c(), mm(g, p + "ffn.gate", mixed.value)),
+                                                 mm(g, p + "ffn.up", mixed.value)));
+                result = batch_combine(g, h, output, mixed.inject);
+            }
+            g.add(ggml_cpy(g.c(), result, h));
+            if (layer + 1 < c.layers && first+count == batch->ne[2]) g.before_compute = [this, layer] {
+                prefill_memory->prefetch({model.group(layer + 1, WeightPart::PLE), model.group(layer + 1, WeightPart::Attention)});
+            };
+            g.run();
+        });
     }
     ggml_tensor * batch_rope(Graph & g, ggml_tensor * x, int dim, int heads, int count, int first) {
         std::vector<int32_t> positions(count); std::iota(positions.begin(), positions.end(), first);
@@ -652,100 +697,112 @@ struct Engine::Impl {
         }
         return ggml_cont(g.c(), expanded);
     }
-    void batch_gdn(ggml_tensor * h, int layer) {
+    void batch_gdn(ggml_tensor * batch, int layer) {
         prefill_memory->protect(layer, {model.group(layer, WeightPart::Attention)});
-        auto g = graph("prefill.gdn", layer);
-        auto & state = states[layer];
-        const auto p = "blk." + std::to_string(layer) + ".";
-        const int count = int(h->ne[2]);
-        auto mixed = c.architecture == Architecture::Qwen35
-            ? Mixed{norm(g, ggml_reshape_2d(g.c(), h, c.hidden, count), p + "attn_norm"), nullptr}
-            : batch_mix(g, h, p + "hc_attn");
-        auto * qkv = mm(g, p + "gdn.qkv", mixed.value);
-        const int kd = c.gdn_key_heads * c.gdn_dim, vd = c.gdn_value_heads * c.gdn_dim;
-        const int channels = 2 * kd + vd;
-        auto * history = ggml_concat(g.c(), state.conv, ggml_cont(g.c(), ggml_transpose(g.c(), qkv)), 0);
-        auto * convolved = ggml_silu(g.c(), ggml_ssm_conv(g.c(), history, weight(p + "gdn.conv")));
-        auto slice = [&](int heads, int offset) {
-            return ggml_cont(g.c(), ggml_view_3d(g.c(), convolved, c.gdn_dim, heads, count,
-                size_t(c.gdn_dim) * sizeof(float), size_t(channels) * sizeof(float), size_t(offset) * sizeof(float)));
-        };
-        auto * q = slice(c.gdn_key_heads, 0), * k = slice(c.gdn_key_heads, kd);
-        auto * v = slice(c.gdn_value_heads, 2 * kd);
-        const float scale = 1.0f / std::sqrt(float(c.gdn_dim));
-        const float eps = c.architecture == Architecture::Qwen35 ? 1e-6f : c.eps;
-        q = batch_gdn_heads(g, ggml_scale(g.c(), ggml_rms_norm(g.c(), q, eps / c.gdn_dim), scale), count);
-        k = batch_gdn_heads(g, ggml_scale(g.c(), ggml_rms_norm(g.c(), k, eps / c.gdn_dim), scale), count);
-        auto * a = ggml_softplus(g.c(), ggml_add(g.c(), mm(g, p + "gdn.a", mixed.value), weight(p + "gdn.dt_bias")));
-        auto * decay = c.architecture == Architecture::Qwen35 ? ggml_mul(g.c(), a, weight(p + "gdn.a_log"))
-            : ggml_neg(g.c(), ggml_mul(g.c(), a, ggml_exp(g.c(), weight(p + "gdn.a_log"))));
-        auto * beta = ggml_sigmoid(g.c(), mm(g, p + "gdn.b", mixed.value));
-        decay = ggml_reshape_4d(g.c(), decay, 1, c.gdn_value_heads, count, 1);
-        beta = ggml_reshape_4d(g.c(), beta, 1, c.gdn_value_heads, count, 1);
-        auto * packed = ggml_gated_delta_net(g.c(), q, k, v, decay, beta, state.recurrent, 1);
-        ggml_set_name(packed, (p + "gdn.batch_recurrence").c_str());
-        auto * output = ggml_reshape_3d(g.c(), ggml_view_2d(g.c(), packed, vd, count, size_t(vd) * sizeof(float), 0),
-                                       c.gdn_dim, c.gdn_value_heads, count);
-        auto * z = ggml_reshape_3d(g.c(), mm(g, p + "gdn.z", mixed.value), c.gdn_dim, c.gdn_value_heads, count);
-        output = ggml_mul(g.c(), norm(g, output, p + "gdn.norm"), ggml_silu(g.c(), z));
-        output = mm(g, p + "gdn.out", ggml_reshape_2d(g.c(), output, vd, count));
-        auto * result = c.architecture == Architecture::Qwen35
-            ? ggml_add(g.c(), ggml_reshape_2d(g.c(), h, c.hidden, count), output)
-            : batch_combine(g, h, output, mixed.inject);
-        g.add(ggml_cpy(g.c(), result, h));
-        auto * tail = ggml_view_2d(g.c(), history, c.conv_kernel - 1, channels, history->nb[1], size_t(count) * sizeof(float));
-        g.add(ggml_cpy(g.c(), tail, state.conv));
-        auto * final_state = ggml_view_1d(g.c(), packed, int64_t(c.gdn_dim) * vd, size_t(vd) * count * sizeof(float));
-        g.add(ggml_cpy(g.c(), final_state, state.recurrent));
-        g.run();
+        const uint64_t channels = uint64_t(2*c.gdn_key_heads+c.gdn_value_heads)*c.gdn_dim;
+        chunks("prefill.gdn", layer, int(batch->ne[2]), sizeof(float)*(6*uint64_t(c.hidden)*c.branches+8*channels),
+               options.prefill_chunk_tokens, [&](int first, int count) {
+            auto g = graph("prefill.gdn", layer, first);
+            auto * h = token_range(g.c(), batch, first, count);
+            auto & state = states[layer];
+            const auto p = "blk." + std::to_string(layer) + ".";
+            auto mixed = c.architecture == Architecture::Qwen35
+                ? Mixed{norm(g, ggml_reshape_2d(g.c(), h, c.hidden, count), p + "attn_norm"), nullptr}
+                : batch_mix(g, h, p + "hc_attn");
+            auto * qkv = mm(g, p + "gdn.qkv", mixed.value);
+            const int kd = c.gdn_key_heads * c.gdn_dim, vd = c.gdn_value_heads * c.gdn_dim;
+            const int channels = 2 * kd + vd;
+            auto * history = ggml_concat(g.c(), state.conv, ggml_cont(g.c(), ggml_transpose(g.c(), qkv)), 0);
+            auto * convolved = ggml_silu(g.c(), ggml_ssm_conv(g.c(), history, weight(p + "gdn.conv")));
+            auto slice = [&](int heads, int offset) {
+                return ggml_cont(g.c(), ggml_view_3d(g.c(), convolved, c.gdn_dim, heads, count,
+                    size_t(c.gdn_dim) * sizeof(float), size_t(channels) * sizeof(float), size_t(offset) * sizeof(float)));
+            };
+            auto * q = slice(c.gdn_key_heads, 0), * k = slice(c.gdn_key_heads, kd);
+            auto * v = slice(c.gdn_value_heads, 2 * kd);
+            const float scale = 1.0f / std::sqrt(float(c.gdn_dim));
+            const float eps = c.architecture == Architecture::Qwen35 ? 1e-6f : c.eps;
+            q = batch_gdn_heads(g, ggml_scale(g.c(), ggml_rms_norm(g.c(), q, eps / c.gdn_dim), scale), count);
+            k = batch_gdn_heads(g, ggml_scale(g.c(), ggml_rms_norm(g.c(), k, eps / c.gdn_dim), scale), count);
+            auto * a = ggml_softplus(g.c(), ggml_add(g.c(), mm(g, p + "gdn.a", mixed.value), weight(p + "gdn.dt_bias")));
+            auto * decay = c.architecture == Architecture::Qwen35 ? ggml_mul(g.c(), a, weight(p + "gdn.a_log"))
+                : ggml_neg(g.c(), ggml_mul(g.c(), a, ggml_exp(g.c(), weight(p + "gdn.a_log"))));
+            auto * beta = ggml_sigmoid(g.c(), mm(g, p + "gdn.b", mixed.value));
+            decay = ggml_reshape_4d(g.c(), decay, 1, c.gdn_value_heads, count, 1);
+            beta = ggml_reshape_4d(g.c(), beta, 1, c.gdn_value_heads, count, 1);
+            auto * packed = ggml_gated_delta_net(g.c(), q, k, v, decay, beta, state.recurrent, 1);
+            ggml_set_name(packed, (p + "gdn.batch_recurrence").c_str());
+            auto * output = ggml_reshape_3d(g.c(), ggml_view_2d(g.c(), packed, vd, count, size_t(vd) * sizeof(float), 0),
+                                           c.gdn_dim, c.gdn_value_heads, count);
+            auto * z = ggml_reshape_3d(g.c(), mm(g, p + "gdn.z", mixed.value), c.gdn_dim, c.gdn_value_heads, count);
+            output = ggml_mul(g.c(), norm(g, output, p + "gdn.norm"), ggml_silu(g.c(), z));
+            output = mm(g, p + "gdn.out", ggml_reshape_2d(g.c(), output, vd, count));
+            auto * result = c.architecture == Architecture::Qwen35
+                ? ggml_add(g.c(), ggml_reshape_2d(g.c(), h, c.hidden, count), output)
+                : batch_combine(g, h, output, mixed.inject);
+            g.add(ggml_cpy(g.c(), result, h));
+            auto * tail = ggml_view_2d(g.c(), history, c.conv_kernel - 1, channels, history->nb[1], size_t(count) * sizeof(float));
+            g.add(ggml_cpy(g.c(), tail, state.conv));
+            auto * final_state = ggml_view_1d(g.c(), packed, int64_t(c.gdn_dim) * vd, size_t(vd) * count * sizeof(float));
+            g.add(ggml_cpy(g.c(), final_state, state.recurrent));
+            g.run();
+        });
     }
-    void batch_ple(ggml_tensor * h, int layer, const std::vector<int32_t> & tokens) {
+    void batch_ple(ggml_tensor * batch, int layer, const std::vector<int32_t> & tokens) {
         prefill_memory->protect(layer, {model.group(layer, WeightPart::PLE)});
-        auto & state = states[layer];
-        auto g = graph("prefill.ple", layer);
-        const auto p = "blk." + std::to_string(layer) + ".ple.";
-        const int count = int(tokens.size());
-        ProfileScope hash(&profiler, "host", "ngram_hash", "prefill.ple", position, layer, "CPU");
-        std::vector<int32_t> history_tokens = previous_tokens, rows;
-        for (int32_t token : tokens) {
-            auto current = ple_rows(c.ple, *state.ple, token, history_tokens);
-            rows.insert(rows.end(), current.begin(), current.end());
-            history_tokens.push_back(token);
-            if (history_tokens.size() >= size_t(c.ple.ngram_size)) history_tokens.erase(history_tokens.begin());
-        }
-        hash.finish();
-        auto * emb = ggml_reshape_2d(g.c(), ggml_get_rows(g.c(), weight(p + "embedding"), g.integers(rows)), c.ple.embedding_dim, count);
-        auto * key = norm(g, ggml_reshape_3d(g.c(), mm(g, p + "key", emb), c.hidden, c.branches, count), p + "norm_key");
-        auto * query = norm(g, h, p + "norm_query");
-        auto * score = ggml_scale(g.c(), ggml_sum_rows(g.c(), ggml_mul(g.c(), key, query)), 1.0f / std::sqrt(float(c.hidden)));
-        auto * magnitude = ggml_sqrt(g.c(), ggml_clamp(g.c(), ggml_abs(g.c(), score), 1e-6f, INFINITY));
-        auto * gate = ggml_sigmoid(g.c(), ggml_mul(g.c(), ggml_sgn(g.c(), score), magnitude));
-        auto * value = ggml_repeat(g.c(), ggml_reshape_3d(g.c(), mm(g, p + "value", emb), c.hidden, 1, count), h);
-        auto * gated = ggml_mul(g.c(), value, gate);
-        const int channels = c.hidden * c.branches;
-        auto * normalized = ggml_reshape_2d(g.c(), norm(g, gated, p + "norm_conv"), channels, count);
-        auto * history = state.ple_conv ? ggml_concat(g.c(), state.ple_conv, normalized, 1) : normalized;
-        auto * kernel = weight(p + "conv");
-        ggml_tensor * convolved = nullptr;
-        for (int k = 0; k < c.ple.conv_kernel; ++k) {
-            auto * input = ggml_view_2d(g.c(), history, channels, count, history->nb[1], size_t(k * c.ple.ngram_size) * history->nb[1]);
-            auto * tap = ggml_cont(g.c(), ggml_view_2d(g.c(), kernel, 1, channels, kernel->nb[1], k * kernel->nb[0]));
-            auto * term = ggml_mul(g.c(), input, ggml_reshape_1d(g.c(), tap, channels));
-            convolved = convolved ? ggml_add(g.c(), convolved, term) : term;
-        }
-        convolved = ggml_reshape_3d(g.c(), ggml_silu(g.c(), convolved), c.hidden, c.branches, count);
-        g.add(ggml_cpy(g.c(), ggml_add(g.c(), h, ggml_add(g.c(), gated, convolved)), h));
-        if (state.ple_conv) {
-            auto * tail = ggml_view_2d(g.c(), history, channels, state.ple_conv->ne[1], history->nb[1], size_t(count) * history->nb[1]);
-            g.add(ggml_cpy(g.c(), tail, state.ple_conv));
-        }
-        g.run();
+        chunks("prefill.ple", layer, int(tokens.size()), sizeof(float)*(16*uint64_t(c.hidden)*c.branches+4*uint64_t(c.ple.embedding_dim)),
+               options.prefill_chunk_tokens, [&](int first, int count) {
+            auto & state = states[layer];
+            auto g = graph("prefill.ple", layer, first);
+            auto * h = token_range(g.c(), batch, first, count);
+            const auto p = "blk." + std::to_string(layer) + ".ple.";
+            ProfileScope hash(&profiler, "host", "ngram_hash", "prefill.ple", position+first, layer, "CPU");
+            std::vector<int32_t> history_tokens = previous_tokens, rows;
+            for (int i = std::max(0, first-c.ple.ngram_size+1); i < first; ++i) {
+                history_tokens.push_back(tokens[i]);
+                if (history_tokens.size() >= size_t(c.ple.ngram_size)) history_tokens.erase(history_tokens.begin());
+            }
+            for (int i = first; i < first+count; ++i) {
+                const int32_t token = tokens[i];
+                auto current = ple_rows(c.ple, *state.ple, token, history_tokens);
+                rows.insert(rows.end(), current.begin(), current.end());
+                history_tokens.push_back(token);
+                if (history_tokens.size() >= size_t(c.ple.ngram_size)) history_tokens.erase(history_tokens.begin());
+            }
+            hash.finish();
+            auto * emb = ggml_reshape_2d(g.c(), ggml_get_rows(g.c(), weight(p + "embedding"), g.integers(rows)), c.ple.embedding_dim, count);
+            auto * key = norm(g, ggml_reshape_3d(g.c(), mm(g, p + "key", emb), c.hidden, c.branches, count), p + "norm_key");
+            auto * query = norm(g, h, p + "norm_query");
+            auto * score = ggml_scale(g.c(), ggml_sum_rows(g.c(), ggml_mul(g.c(), key, query)), 1.0f / std::sqrt(float(c.hidden)));
+            auto * magnitude = ggml_sqrt(g.c(), ggml_clamp(g.c(), ggml_abs(g.c(), score), 1e-6f, INFINITY));
+            auto * gate = ggml_sigmoid(g.c(), ggml_mul(g.c(), ggml_sgn(g.c(), score), magnitude));
+            auto * value = ggml_repeat(g.c(), ggml_reshape_3d(g.c(), mm(g, p + "value", emb), c.hidden, 1, count), h);
+            auto * gated = ggml_mul(g.c(), value, gate);
+            const int channels = c.hidden * c.branches;
+            auto * normalized = ggml_reshape_2d(g.c(), norm(g, gated, p + "norm_conv"), channels, count);
+            auto * history = state.ple_conv ? ggml_concat(g.c(), state.ple_conv, normalized, 1) : normalized;
+            auto * kernel = weight(p + "conv");
+            ggml_tensor * convolved = nullptr;
+            for (int k = 0; k < c.ple.conv_kernel; ++k) {
+                auto * input = ggml_view_2d(g.c(), history, channels, count, history->nb[1], size_t(k * c.ple.ngram_size) * history->nb[1]);
+                auto * tap = ggml_cont(g.c(), ggml_view_2d(g.c(), kernel, 1, channels, kernel->nb[1], k * kernel->nb[0]));
+                auto * term = ggml_mul(g.c(), input, ggml_reshape_1d(g.c(), tap, channels));
+                convolved = convolved ? ggml_add(g.c(), convolved, term) : term;
+            }
+            convolved = ggml_reshape_3d(g.c(), ggml_silu(g.c(), convolved), c.hidden, c.branches, count);
+            g.add(ggml_cpy(g.c(), ggml_add(g.c(), h, ggml_add(g.c(), gated, convolved)), h));
+            if (state.ple_conv) {
+                auto * tail = ggml_view_2d(g.c(), history, channels, state.ple_conv->ne[1], history->nb[1], size_t(count) * history->nb[1]);
+                g.add(ggml_cpy(g.c(), tail, state.ple_conv));
+            }
+            g.run();
+        });
     }
-    void batch_attention(ggml_tensor * h, int layer, KVExporter & exporter,
+    void batch_attention(ggml_tensor * batch, int layer, KVExporter & exporter,
                          std::vector<Step> & steps, bool capture) {
         prefill_memory->protect(layer, {model.group(layer, WeightPart::Attention)});
         auto & state = states[layer];
-        const int count = int(h->ne[2]), total = position + count;
+        const int count = int(batch->ne[2]), total = position + count;
         const int dim = c.head_dim <= 64 ? 64 : c.head_dim <= 128 ? 128 : 256;
         const int padded = (total + 255) / 256 * 256;
         const int qwidth = c.head_dim * c.q_heads, kvwidth = c.head_dim * c.kv_heads;
@@ -755,68 +812,102 @@ struct Engine::Impl {
         auto * keys = cache->tensor(GGML_TYPE_BF16, kvwidth, total);
         auto * values = cache->tensor(GGML_TYPE_BF16, kvwidth, total);
         cache->allocate();
-        auto work = std::make_shared<PrefillTensorStorage>(*prefill_memory, prefill_backend.get());
-        auto * queries = work->tensor(GGML_TYPE_F32, c.head_dim, c.q_heads, count);
-        auto * gates = work->tensor(GGML_TYPE_F32, qwidth, count);
-        auto * injection = sparse ? work->tensor(GGML_TYPE_F32, c.branches, count) : nullptr;
-        auto * index_queries = sparse ? work->tensor(GGML_TYPE_F32, c.index_dim, c.index_heads, count) : nullptr;
-        auto * output = work->tensor(GGML_TYPE_F32, qwidth, count);
+        PrefillTensorStorage layout(*prefill_memory, prefill_backend.get());
         const auto compute_type = options.prefill_precision == PrefillPrecision::FP16 ? GGML_TYPE_F16 : GGML_TYPE_BF16;
-        auto * compute_keys = work->tensor(compute_type, dim, padded, c.kv_heads);
-        auto * compute_values = work->tensor(compute_type, dim, padded, c.kv_heads);
-        work->allocate();
-        {
-            auto g = graph("prefill.attention.prepare", layer);
-            if (position) {
-                if (state.attention->size() != position) throw std::logic_error("Prefill KV prefix is inconsistent");
-                const size_t bytes = size_t(position) * kvwidth * sizeof(ggml_bf16_t);
-                g.put(keys, state.attention->keys(), bytes);
-                g.put(values, state.attention->values(), bytes);
-            }
-            auto mixed = sparse ? batch_mix(g, h, p + "hc_attn")
-                : Mixed{norm(g, ggml_reshape_2d(g.c(), h, c.hidden, count), p + "attn_norm"), nullptr};
-            auto * qg = mm(g, p + "attn.qg", mixed.value);
-            auto * q = ggml_cont(g.c(), ggml_view_3d(g.c(), qg, c.head_dim, c.q_heads, count,
+        auto * compute_keys = layout.tensor(compute_type, dim, padded, c.kv_heads);
+        auto * compute_values = layout.tensor(compute_type, dim, padded, c.kv_heads);
+        layout.allocate();
+        // Only the active layer's KV spans the full context. Projection,
+        // permutation and output intermediates are bounded token ranges.
+        auto convert = [&](int start, int length) {
+            chunks("prefill.attention.layout", layer, length, sizeof(float)*uint64_t(kvwidth)*8,
+                   options.prefill_chunk_tokens, [&](int offset, int n) {
+                auto g = graph("prefill.attention.layout", layer, start-position+offset);
+                auto copy = [&](ggml_tensor * source, ggml_tensor * destination) {
+                    auto * range = ggml_view_2d(g.c(), source, kvwidth, n, source->nb[1], size_t(start+offset)*source->nb[1]);
+                    auto * shaped = ggml_reshape_3d(g.c(), range, c.head_dim, c.kv_heads, n);
+                    auto * wide = ggml_cast(g.c(), shaped, GGML_TYPE_F32);
+                    auto * permuted = ggml_cont(g.c(), ggml_permute(g.c(), wide, 0, 2, 1, 3));
+                    auto * padded_kv = ggml_pad(g.c(), permuted, dim-c.head_dim, 0, 0, 0);
+                    auto * target = ggml_view_3d(g.c(), destination, dim, n, c.kv_heads,
+                        destination->nb[1], destination->nb[2], size_t(start+offset)*destination->nb[1]);
+                    g.add(ggml_cpy(g.c(), padded_kv, target));
+                };
+                copy(keys, compute_keys); copy(values, compute_values);
+                g.run();
+            }, {}, false, start-position);
+        };
+        if (position) {
+            if (state.attention->size() != position) throw std::logic_error("Prefill KV prefix is inconsistent");
+            auto g = graph("prefill.attention.prefix", layer);
+            const size_t bytes = size_t(position)*kvwidth*sizeof(ggml_bf16_t);
+            g.put(keys, state.attention->keys(), bytes);
+            g.put(values, state.attention->values(), bytes);
+            convert(0, position);
+        }
+        std::unique_ptr<PrefillTensorStorage> part;
+        ggml_tensor * queries = nullptr, * gates = nullptr, * injection = nullptr;
+        ggml_tensor * index_queries = nullptr, * output = nullptr;
+        chunks("prefill.attention.prepare", layer, count,
+               sizeof(float)*(8*uint64_t(c.hidden)*c.branches+12*uint64_t(qwidth)+8*uint64_t(kvwidth)),
+               options.prefill_chunk_tokens, [&](int first, int n) {
+            // Allocation and this producer graph are one retry boundary. No
+            // later attention/layout failure can replay its QSA state updates.
+            part.reset();
+            part = std::make_unique<PrefillTensorStorage>(*prefill_memory, prefill_backend.get());
+            queries = part->tensor(GGML_TYPE_F32, c.head_dim, c.q_heads, n);
+            gates = part->tensor(GGML_TYPE_F32, qwidth, n);
+            injection = sparse ? part->tensor(GGML_TYPE_F32, c.branches, n) : nullptr;
+            index_queries = sparse ? part->tensor(GGML_TYPE_F32, c.index_dim, c.index_heads, n) : nullptr;
+            output = part->tensor(GGML_TYPE_F32, qwidth, n);
+            part->allocate();
+            auto g = graph("prefill.attention.prepare", layer, first);
+            auto * h = token_range(g.c(), batch, first, n);
+            const int start = position+first;
+            auto mixed = sparse ? batch_mix(g, h, p+"hc_attn")
+                : Mixed{norm(g, ggml_reshape_2d(g.c(), h, c.hidden, n), p+"attn_norm"), nullptr};
+            auto * qg = mm(g, p+"attn.qg", mixed.value);
+            auto * q = ggml_cont(g.c(), ggml_view_3d(g.c(), qg, c.head_dim, c.q_heads, n,
                 size_t(2*c.head_dim)*sizeof(float), qg->nb[1], 0));
-            auto * gate = ggml_cont(g.c(), ggml_view_3d(g.c(), qg, c.head_dim, c.q_heads, count,
+            auto * gate = ggml_cont(g.c(), ggml_view_3d(g.c(), qg, c.head_dim, c.q_heads, n,
                 size_t(2*c.head_dim)*sizeof(float), qg->nb[1], size_t(c.head_dim)*sizeof(float)));
-            q = batch_rope(g, norm(g, q, p + "attn.q_norm"), c.head_dim, c.q_heads, count, position);
-            auto * k = ggml_reshape_3d(g.c(), mm(g, p + "attn.k", mixed.value), c.head_dim, c.kv_heads, count);
-            k = batch_rope(g, norm(g, k, p + "attn.k_norm"), c.head_dim, c.kv_heads, count, position);
-            auto * v = mm(g, p + "attn.v", mixed.value);
+            q = batch_rope(g, norm(g, q, p+"attn.q_norm"), c.head_dim, c.q_heads, n, start);
+            auto * k = ggml_reshape_3d(g.c(), mm(g, p+"attn.k", mixed.value), c.head_dim, c.kv_heads, n);
+            k = batch_rope(g, norm(g, k, p+"attn.k_norm"), c.head_dim, c.kv_heads, n, start);
+            auto * v = mm(g, p+"attn.v", mixed.value);
             g.add(ggml_cpy(g.c(), q, queries));
             g.add(ggml_cpy(g.c(), gate, gates));
             auto suffix = [&](ggml_tensor * t) {
-                return ggml_view_2d(g.c(), t, kvwidth, count, t->nb[1], size_t(position)*t->nb[1]);
+                return ggml_view_2d(g.c(), t, kvwidth, n, t->nb[1], size_t(start)*t->nb[1]);
             };
             g.add(ggml_cpy(g.c(), k, suffix(keys)));
             g.add(ggml_cpy(g.c(), v, suffix(values)));
             if (sparse) {
                 g.add(ggml_cpy(g.c(), mixed.inject, injection));
-                auto * iq = ggml_reshape_3d(g.c(), mm(g, p + "index.q", mixed.value), c.index_dim, c.index_heads, count);
-                iq = batch_rope(g, norm(g, iq, p + "index.q_norm"), c.index_dim, c.index_heads, count, position);
+                auto * iq = ggml_reshape_3d(g.c(), mm(g, p+"index.q", mixed.value), c.index_dim, c.index_heads, n);
+                iq = batch_rope(g, norm(g, iq, p+"index.q_norm"), c.index_dim, c.index_heads, n, start);
                 g.add(ggml_cpy(g.c(), iq, index_queries));
-                auto * raw = mm(g, p + "index.k", mixed.value);
-                const int old_tail = position % c.block_size;
+                auto * raw = mm(g, p+"index.k", mixed.value);
+                const int old_tail = start%c.block_size;
                 if (old_tail) raw = ggml_concat(g.c(), ggml_view_2d(g.c(), state.raw_index,
                     c.index_dim, old_tail, state.raw_index->nb[1], 0), raw, 1);
-                const int new_blocks = (old_tail + count) / c.block_size;
+                const int new_blocks = (old_tail+n)/c.block_size;
                 if (new_blocks) {
                     auto * complete = ggml_cont(g.c(), ggml_view_2d(g.c(), raw, c.index_dim,
                         new_blocks*c.block_size, raw->nb[1], 0));
                     complete = ggml_reshape_3d(g.c(), complete, c.index_dim, c.block_size, new_blocks);
                     auto * pooled = ggml_reshape_3d(g.c(), ggml_mean(g.c(), ggml_cont(g.c(),
                         ggml_permute(g.c(), complete, 1, 0, 2, 3))), c.index_dim, 1, new_blocks);
-                    pooled = norm(g, pooled, p + "index.k_norm");
+                    pooled = norm(g, pooled, p+"index.k_norm");
                     std::vector<int32_t> starts(new_blocks);
-                    for (int j=0; j<new_blocks; ++j) starts[j] = (position/c.block_size+j)*c.block_size;
+                    for (int j=0; j<new_blocks; ++j) starts[j] = (start/c.block_size+j)*c.block_size;
                     pooled = ggml_rope_ext(g.c(), pooled, g.integers(starts), nullptr, c.rope_dim,
                         GGML_ROPE_TYPE_NEOX, c.context, c.rope_base, 1, 0, 1, 0, 0);
                     auto * destination = ggml_view_2d(g.c(), state.index_cache, c.index_dim, new_blocks,
-                        state.index_cache->nb[1], size_t(position/c.block_size)*state.index_cache->nb[1]);
+                        state.index_cache->nb[1], size_t(start/c.block_size)*state.index_cache->nb[1]);
                     g.add(ggml_cpy(g.c(), pooled, destination));
                 }
-                const int tail = total % c.block_size;
+                const int tail = (start+n)%c.block_size;
                 if (tail) {
                     auto * source = ggml_view_2d(g.c(), raw, c.index_dim, tail, raw->nb[1], size_t(new_blocks*c.block_size)*raw->nb[1]);
                     auto * destination = ggml_view_2d(g.c(), state.raw_index, c.index_dim, tail, state.raw_index->nb[1], 0);
@@ -824,100 +915,102 @@ struct Engine::Impl {
                 }
             }
             g.run();
-        }
-        // The producer graph is complete. A separate transfer stream and pinned
-        // staging preserve the source while GPU attention/FFN continue.
+        }, [&](int first, int n) {
+            convert(position+first, n);
+            const int visible_end = position+first+n;
+            const int visible_padded = (visible_end+255)/256*256;
+            const int blocks = visible_end/c.block_size;
+            const uint64_t attention_bytes = sizeof(float)*(4*uint64_t(visible_padded)+
+                (sparse ? 4*uint64_t(blocks)*c.index_heads : 0)+8*uint64_t(qwidth));
+            chunks("prefill.attention", layer, n, attention_bytes, options.prefill_attention_tile,
+                   [&](int offset, int queries_count) {
+                auto g = graph("prefill.attention", layer, first+offset);
+                auto * q = ggml_view_3d(g.c(), queries, c.head_dim, c.q_heads, queries_count,
+                    queries->nb[1], queries->nb[2], size_t(offset)*queries->nb[2]);
+                q = ggml_cont(g.c(), ggml_permute(g.c(), q, 0, 2, 1, 3));
+                q = ggml_pad(g.c(), q, dim-c.head_dim, 0, 0, 0);
+                auto * mask = ggml_fill(g.c(), ggml_new_tensor_2d(g.c(), GGML_TYPE_F32, visible_padded, queries_count), 0);
+                mask = ggml_diag_mask_inf(g.c(), mask, position+first+offset);
+                ggml_tensor * top = nullptr;
+                if (sparse && blocks) {
+                    auto * iq = ggml_cont(g.c(), ggml_view_3d(g.c(), index_queries, c.index_dim, c.index_heads, queries_count,
+                        index_queries->nb[1], index_queries->nb[2], size_t(offset)*index_queries->nb[2]));
+                    auto * compressed = ggml_view_2d(g.c(), state.index_cache, c.index_dim, blocks, state.index_cache->nb[1], 0);
+                    auto * scores = ggml_mul_mat(g.c(), ggml_cast(g.c(), compressed, GGML_TYPE_F32),
+                        ggml_reshape_2d(g.c(), iq, c.index_dim, c.index_heads*queries_count));
+                    ggml_prec_set_acc(scores, GGML_PREC_F32);
+                    scores = ggml_reshape_3d(g.c(), ggml_relu(g.c(), scores), blocks, c.index_heads, queries_count);
+                    scores = ggml_reshape_2d(g.c(), ggml_sum_rows(g.c(), ggml_cont(g.c(), ggml_permute(g.c(), scores, 1, 0, 2, 3))), blocks, queries_count);
+                    scores = ggml_scale(g.c(), scores, 1.0f/std::sqrt(float(c.index_dim)));
+                    std::vector<float> completed(queries_count);
+                    std::vector<int32_t> extra(size_t(queries_count)*c.block_size, -1), mapping(size_t(blocks)*c.block_size);
+                    std::iota(mapping.begin(), mapping.end(), 0);
+                    for (int i=0; i<queries_count; ++i) {
+                        const int visible = position+first+offset+i+1, full = visible/c.block_size;
+                        completed[i] = float(full);
+                        for (int j=full*c.block_size; j<visible; ++j) extra[size_t(i)*c.block_size+j-full*c.block_size] = j;
+                    }
+                    auto * eligible = ggml_sub(g.c(), ggml_repeat(g.c(), ggml_reshape_2d(g.c(), g.floats(completed), 1, queries_count), scores),
+                        ggml_arange(g.c(), 0, float(blocks), 1));
+                    scores = ggml_add(g.c(), scores, ggml_log(g.c(), ggml_step(g.c(), eligible)));
+                    top = ggml_cont(g.c(), ggml_top_k(g.c(), scores, std::min(c.top_blocks, blocks)));
+                    ggml_set_name(top, (p+"index.batch_top_k").c_str());
+                    mask = ggml_top_k_mask(g.c(), mask, top, scores,
+                        ggml_reshape_2d(g.c(), g.integers(mapping), c.block_size, blocks),
+                        ggml_reshape_2d(g.c(), g.integers(extra), c.block_size, queries_count));
+                    if (capture) g.add(top);
+                }
+                mask = ggml_cast(g.c(), ggml_pad(g.c(), mask, 0, (64-queries_count%64)%64, 0, 0), GGML_TYPE_F16);
+                auto visible_kv = [&](ggml_tensor * t) {
+                    return ggml_view_3d(g.c(), t, dim, visible_padded, c.kv_heads, t->nb[1], t->nb[2], 0);
+                };
+                auto * attended = ggml_flash_attn_ext(g.c(), q, visible_kv(compute_keys), visible_kv(compute_values), mask,
+                    1.0f/std::sqrt(float(c.head_dim)), 0, 0);
+                ggml_prec_set_acc(attended, GGML_PREC_F32);
+                ggml_set_name(attended, (p+"attention.flash").c_str());
+                auto * cropped = ggml_cont(g.c(), ggml_view_3d(g.c(), attended, c.head_dim, c.q_heads, queries_count,
+                    attended->nb[1], attended->nb[2], 0));
+                auto * target = ggml_view_2d(g.c(), output, qwidth, queries_count, output->nb[1], size_t(offset)*output->nb[1]);
+                g.add(ggml_cpy(g.c(), cropped, target));
+                g.run(); ++stats.prefill_gpu_attention_calls;
+                if (capture) {
+                    const auto ids = top ? g.get<int32_t>(top) : std::vector<int32_t>{};
+                    for (int i=0; i<queries_count; ++i) {
+                        const int visible = position+first+offset+i+1;
+                        std::vector<int32_t> selected;
+                        if (sparse) {
+                            std::vector<int32_t> chosen;
+                            if (top) for (int j=0; j<top->ne[0]; ++j) {
+                                const int id = ids[size_t(i)*top->ne[0]+j];
+                                if (id < visible/c.block_size) chosen.push_back(id);
+                            }
+                            selected = expand_blocks(chosen, visible, c.block_size);
+                        } else { selected.resize(visible); std::iota(selected.begin(), selected.end(), 0); }
+                        steps[first+offset+i].selections.push_back({layer, std::move(selected)});
+                    }
+                }
+            }, {}, true, first);
+            chunks("prefill.attention.finish", layer, n, sizeof(float)*(6*uint64_t(c.hidden)*c.branches+4*uint64_t(qwidth)),
+                   options.prefill_chunk_tokens, [&](int offset, int size) {
+                auto g = graph("prefill.attention.finish", layer, first+offset);
+                auto * h = token_range(g.c(), batch, first+offset, size);
+                auto range = [&](ggml_tensor * t) {
+                    return ggml_view_2d(g.c(), t, t->ne[0], size, t->nb[1], size_t(offset)*t->nb[1]);
+                };
+                auto * attended = ggml_mul(g.c(), range(output), ggml_sigmoid(g.c(), range(gates)));
+                auto * projected = mm(g, p+"attn.out", attended);
+                auto * result = sparse ? batch_combine(g, h, projected, range(injection))
+                    : ggml_add(g.c(), ggml_reshape_2d(g.c(), h, c.hidden, size), projected);
+                g.add(ggml_cpy(g.c(), result, h));
+                if (first+offset+size == count)
+                    g.before_compute = [this, layer] { prefill_memory->prefetch({model.group(layer, WeightPart::FeedForward)}); };
+                g.run();
+            }, {}, false, first);
+            part.reset();
+        });
+        // The complete layer is now immutable. Export once, retaining the source
+        // until the separate stream finishes; the next layer still starts later.
         exporter.enqueue(cache, keys, values, *state.attention, position, count, layer);
-        {
-            auto g = graph("prefill.attention.layout", layer);
-            auto layout = [&](ggml_tensor * source, ggml_tensor * destination) {
-                auto * shaped = ggml_reshape_3d(g.c(), source, c.head_dim, c.kv_heads, total);
-                auto * wide = ggml_cast(g.c(), shaped, GGML_TYPE_F32);
-                auto * permuted = ggml_cont(g.c(), ggml_permute(g.c(), wide, 0, 2, 1, 3));
-                auto * padded_kv = ggml_pad(g.c(), permuted, dim-c.head_dim, padded-total, 0, 0);
-                g.add(ggml_cpy(g.c(), padded_kv, destination));
-            };
-            layout(keys, compute_keys); layout(values, compute_values);
-            g.run();
-        }
-        cache.reset(); // Exporter retains it until its asynchronous copy completes.
-        const int blocks = total / c.block_size;
-        for (int first = 0; first < count; first += options.prefill_attention_tile) {
-            const int n = std::min(options.prefill_attention_tile, count-first);
-            auto g = graph("prefill.attention", layer, first);
-            auto * q = ggml_view_3d(g.c(), queries, c.head_dim, c.q_heads, n,
-                queries->nb[1], queries->nb[2], size_t(first)*queries->nb[2]);
-            q = ggml_cont(g.c(), ggml_permute(g.c(), q, 0, 2, 1, 3));
-            q = ggml_pad(g.c(), q, dim-c.head_dim, 0, 0, 0);
-            auto * mask = ggml_fill(g.c(), ggml_new_tensor_2d(g.c(), GGML_TYPE_F32, padded, n), 0);
-            mask = ggml_diag_mask_inf(g.c(), mask, position + first);
-            ggml_tensor * top = nullptr;
-            if (sparse && blocks) {
-                auto * iq = ggml_cont(g.c(), ggml_view_3d(g.c(), index_queries, c.index_dim, c.index_heads, n,
-                    index_queries->nb[1], index_queries->nb[2], size_t(first)*index_queries->nb[2]));
-                auto * compressed = ggml_view_2d(g.c(), state.index_cache, c.index_dim, blocks, state.index_cache->nb[1], 0);
-                auto * scores = ggml_mul_mat(g.c(), ggml_cast(g.c(), compressed, GGML_TYPE_F32),
-                    ggml_reshape_2d(g.c(), iq, c.index_dim, c.index_heads*n));
-                ggml_prec_set_acc(scores, GGML_PREC_F32);
-                scores = ggml_reshape_3d(g.c(), ggml_relu(g.c(), scores), blocks, c.index_heads, n);
-                scores = ggml_reshape_2d(g.c(), ggml_sum_rows(g.c(), ggml_cont(g.c(), ggml_permute(g.c(), scores, 1, 0, 2, 3))), blocks, n);
-                scores = ggml_scale(g.c(), scores, 1.0f/std::sqrt(float(c.index_dim)));
-                std::vector<float> completed(n);
-                std::vector<int32_t> extra(size_t(n)*c.block_size, -1), mapping(size_t(blocks)*c.block_size);
-                std::iota(mapping.begin(), mapping.end(), 0);
-                for (int i=0; i<n; ++i) {
-                    const int visible = position+first+i+1, full = visible/c.block_size;
-                    completed[i] = float(full);
-                    for (int j=full*c.block_size; j<visible; ++j) extra[size_t(i)*c.block_size+j-full*c.block_size] = j;
-                }
-                auto * eligible = ggml_sub(g.c(), ggml_repeat(g.c(), ggml_reshape_2d(g.c(), g.floats(completed), 1, n), scores),
-                    ggml_arange(g.c(), 0, float(blocks), 1));
-                scores = ggml_add(g.c(), scores, ggml_log(g.c(), ggml_step(g.c(), eligible)));
-                top = ggml_cont(g.c(), ggml_top_k(g.c(), scores, std::min(c.top_blocks, blocks)));
-                ggml_set_name(top, (p+"index.batch_top_k").c_str());
-                mask = ggml_top_k_mask(g.c(), mask, top, scores,
-                    ggml_reshape_2d(g.c(), g.integers(mapping), c.block_size, blocks),
-                    ggml_reshape_2d(g.c(), g.integers(extra), c.block_size, n));
-                if (capture) g.add(top);
-            }
-            // Padding the query mask does not create additional queries.
-            mask = ggml_cast(g.c(), ggml_pad(g.c(), mask, 0, (64-n%64)%64, 0, 0), GGML_TYPE_F16);
-            auto * attended = ggml_flash_attn_ext(g.c(), q, compute_keys, compute_values, mask,
-                1.0f/std::sqrt(float(c.head_dim)), 0, 0);
-            ggml_prec_set_acc(attended, GGML_PREC_F32);
-            ggml_set_name(attended, (p+"attention.flash").c_str());
-            auto * cropped = ggml_cont(g.c(), ggml_view_3d(g.c(), attended, c.head_dim, c.q_heads, n,
-                attended->nb[1], attended->nb[2], 0));
-            auto * target = ggml_view_2d(g.c(), output, qwidth, n, output->nb[1], size_t(first)*output->nb[1]);
-            g.add(ggml_cpy(g.c(), cropped, target));
-            g.run(); ++stats.prefill_gpu_attention_calls;
-            if (capture) {
-                const auto ids = top ? g.get<int32_t>(top) : std::vector<int32_t>{};
-                for (int i=0; i<n; ++i) {
-                    const int visible = position+first+i+1;
-                    std::vector<int32_t> selected;
-                    if (sparse) {
-                        std::vector<int32_t> chosen;
-                        if (top) for (int j=0; j<top->ne[0]; ++j) {
-                            const int id = ids[size_t(i)*top->ne[0]+j];
-                            if (id < visible/c.block_size) chosen.push_back(id);
-                        }
-                        selected = expand_blocks(chosen, visible, c.block_size);
-                    } else { selected.resize(visible); std::iota(selected.begin(), selected.end(), 0); }
-                    steps[first+i].selections.push_back({layer, std::move(selected)});
-                }
-            }
-        }
-        {
-            auto g = graph("prefill.attention.finish", layer);
-            auto * attended = ggml_mul(g.c(), output, ggml_sigmoid(g.c(), gates));
-            auto * projected = mm(g, p+"attn.out", attended);
-            auto * result = sparse ? batch_combine(g, h, projected, injection)
-                : ggml_add(g.c(), ggml_reshape_2d(g.c(), h, c.hidden, count), projected);
-            g.add(ggml_cpy(g.c(), result, h));
-            g.before_compute = [this, layer] { prefill_memory->prefetch({model.group(layer, WeightPart::FeedForward)}); };
-            g.run();
-        }
     }
 
     std::vector<Step> prefill(const std::vector<int32_t> & tokens, bool capture) {
@@ -930,7 +1023,6 @@ struct Engine::Impl {
             for (auto token : tokens) result.push_back(decode(token, capture));
             return result;
         }
-        if (options.prefill_attention_tile <= 0) throw std::invalid_argument("Prefill attention tile must be positive");
         PrefillMemory memory(model, backend.get(), stats, profiler, options);
         prefill_memory = &memory;
         try {
@@ -946,13 +1038,17 @@ struct Engine::Impl {
                 memory.protect(-1, {embedding_group});
                 PrefillTensorStorage activations(memory, prefill_backend.get());
                 auto * batch = activations.tensor(GGML_TYPE_F32, c.hidden, c.branches, count);
+                auto * finite_flag = activations.tensor(GGML_TYPE_F32, 1);
                 activations.allocate();
-                {
-                    auto g = graph("prefill.embedding");
-                    auto * embedded = ggml_get_rows(g.c(), weight("token_embd.weight"), g.integers(tokens));
-                    embedded = ggml_reshape_3d(g.c(), embedded, c.hidden, 1, count);
-                    g.add(ggml_cpy(g.c(), ggml_repeat(g.c(), embedded, batch), batch)); g.run();
-                }
+                chunks("prefill.embedding", -1, count, sizeof(float)*uint64_t(c.hidden)*(2*c.branches+1),
+                       options.prefill_chunk_tokens, [&](int first, int n) {
+                    auto g = graph("prefill.embedding", -1, first);
+                    auto * target = token_range(g.c(), batch, first, n);
+                    auto * embedded = ggml_get_rows(g.c(), weight("token_embd.weight"),
+                                                   g.integers({tokens.begin()+first, tokens.begin()+first+n}));
+                    embedded = ggml_reshape_3d(g.c(), embedded, c.hidden, 1, n);
+                    g.add(ggml_cpy(g.c(), ggml_repeat(g.c(), embedded, target), target)); g.run();
+                });
                 for (int layer=0; layer<c.layers; ++layer) {
                     ProfileScope layer_scope(&profiler, "layer", "batch", "prefill.layer", position, layer, ggml_backend_name(prefill_backend.get()));
                     if (states[layer].ple) batch_ple(batch, layer, tokens);
@@ -962,32 +1058,39 @@ struct Engine::Impl {
                     ++stats.prefill_layers;
                 }
                 memory.protect(c.layers, {model.group(c.layers, WeightPart::Head)});
-                {
-                    auto g = graph("prefill.head");
-                    auto * tail = ggml_view_3d(g.c(), batch, c.hidden, c.branches, 1, batch->nb[1], batch->nb[2], size_t(count-1)*batch->nb[2]);
-                    auto project = [&](ggml_tensor * source) {
+                auto project = [&](Graph & g, ggml_tensor * source) {
                         auto mixed = c.architecture == Architecture::Qwen35
                             ? Mixed{norm(g, ggml_reshape_2d(g.c(), source, c.hidden, source->ne[2]), "output_norm.weight"), nullptr}
                             : batch_mix(g, source, "head", false);
                         return mm(g, "output.weight", mixed.value);
-                    };
-                    auto * logits = capture ? project(batch) : nullptr;
+                };
+                chunks("prefill.head", c.layers, count,
+                       sizeof(float)*(6*uint64_t(c.hidden)*c.branches+(capture ? 2*uint64_t(c.vocab) : 0)),
+                       options.prefill_chunk_tokens, [&](int first, int n) {
+                    auto g = graph("prefill.head", c.layers, first);
+                    auto * source = token_range(g.c(), batch, first, n);
+                    auto * logits = capture ? project(g, source) : nullptr;
                     if (logits) g.add(logits);
-                    // Diagnostics must not change the arithmetic used for sampling.
-                    // Quantized GEMM and GEMV can round their inputs differently.
-                    auto * last = project(tail);
-                    g.add(ggml_cpy(g.c(), last, last_logits));
-                    auto * finite = ggml_add(g.c(), ggml_sum(g.c(), ggml_sub(g.c(), batch, batch)),
-                        ggml_sum(g.c(), ggml_sub(g.c(), last, last)));
+                    auto * finite = ggml_sum(g.c(), ggml_sub(g.c(), source, source));
                     if (logits) finite = ggml_add(g.c(), finite, ggml_sum(g.c(), ggml_sub(g.c(), logits, logits)));
-                    g.add(finite); g.add(ggml_cpy(g.c(), tail, hidden));
+                    g.add(ggml_cpy(g.c(), ggml_add(g.c(), finite_flag, finite), finite_flag));
                     g.run();
-                    if (!std::isfinite(g.get<float>(finite)[0])) throw std::runtime_error("Non-finite logits or hidden values during prefill");
                     if (capture) {
                         auto all = g.get<float>(logits);
-                        for (int i=0; i<count; ++i) result[i].logits.assign(all.begin()+size_t(i)*c.vocab, all.begin()+size_t(i+1)*c.vocab);
-                        result.back().logits = g.get<float>(last_logits);
+                        for (int i=0; i<n; ++i) result[first+i].logits.assign(all.begin()+size_t(i)*c.vocab, all.begin()+size_t(i+1)*c.vocab);
                     }
+                });
+                {
+                    // Preserve the same final GEMV arithmetic with and without
+                    // diagnostics, independent of the intermediate chunk sizes.
+                    auto g = graph("prefill.head", c.layers, count-1);
+                    auto * tail = token_range(g.c(), batch, count-1, 1);
+                    auto * last = project(g, tail);
+                    auto * finite = ggml_add(g.c(), finite_flag, ggml_sum(g.c(), ggml_sub(g.c(), last, last)));
+                    g.add(finite); g.add(ggml_cpy(g.c(), last, last_logits));
+                    g.add(ggml_cpy(g.c(), tail, hidden)); g.run();
+                    if (!std::isfinite(g.get<float>(finite)[0])) throw std::runtime_error("Non-finite logits or hidden values during prefill");
+                    if (capture) result.back().logits = g.get<float>(last_logits);
                 }
                 exporter.finish();
             }

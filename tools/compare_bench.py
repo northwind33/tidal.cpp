@@ -23,7 +23,7 @@ def compare(before, after, allow_sampler_change=False):
     if before["workload"].get("capture_logits", True) != after["workload"].get("capture_logits", True):
         raise ValueError("Incompatible reports: logit capture differs")
     if before["workload"].get("prefill") != after["workload"].get("prefill"):
-        raise ValueError("Incompatible prefill execution, precision, tile or memory settings")
+        raise ValueError("Incompatible prefill execution, precision, chunk, tile or memory settings")
     a, b = dict(before["workload"].get("sampling", {})), dict(after["workload"].get("sampling", {}))
     if allow_sampler_change:
         a.pop("backend", None); b.pop("backend", None)

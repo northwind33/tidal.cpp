@@ -107,12 +107,15 @@ struct Options {
     int context = 0; // 0 uses GGUF capacity; otherwise bounded by the model capacity.
     SamplingConfig sampling;
     PrefillPrecision prefill_precision = PrefillPrecision::FP16;
-    // Query tiling stays inside the current layer; it never traverses the model.
-    int prefill_attention_tile = 128;
+    // Zero selects a memory-aware size. Explicit sizes are upper bounds; the
+    // final range may be shorter. Neither range traverses the next layer.
+    int prefill_chunk_tokens = 0;
+    int prefill_attention_tile = 0;
     // Zero uses live device availability. A nonzero cap limits resident weights
     // plus prefill workspace, for controlled memory-pressure experiments.
     uint64_t prefill_memory_limit = 0;
-    uint64_t prefill_memory_reserve = 64ull * 1024 * 1024;
+    // UINT64_MAX selects automatic kernel/runtime headroom; zero disables it.
+    uint64_t prefill_memory_reserve = UINT64_MAX;
 };
 
 struct Selection {
@@ -143,6 +146,10 @@ struct Statistics {
     uint64_t prefill_kv_to_host_bytes = 0;
     uint64_t prefill_weight_evictions = 0, prefill_weight_reloads = 0, prefill_weight_prefetches = 0;
     uint64_t prefill_weight_reload_bytes = 0, prefill_peak_workspace_bytes = 0;
+    uint64_t prefill_chunks = 0, prefill_chunk_retries = 0;
+    uint64_t prefill_chunk_min_tokens = 0, prefill_chunk_max_tokens = 0;
+    uint64_t prefill_attention_min_tile = 0, prefill_attention_max_tile = 0;
+    uint64_t prefill_reserve_bytes = 0;
 };
 
 struct ModelInfo {

@@ -5,6 +5,12 @@
 #include <limits>
 
 namespace tidal {
+// Only pre-compute allocation failures are retryable. Execution errors must
+// never replay a range that may already have updated recurrent state or KV.
+class PrefillAllocationError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 // The execution order is controlled by the prefill driver. This allocator only
 // chooses weight victims and overlaps an optional future upload with compute.
 class PrefillMemory {
@@ -29,6 +35,7 @@ public:
     void release(uint64_t bytes);
     void prefetch(std::vector<int> groups);
     void restore();
+    int initial_chunk(int tokens, uint64_t bytes_per_token, int requested) const;
     uint64_t workspace_bytes() const { return workspace_; }
 };
 } // namespace tidal
