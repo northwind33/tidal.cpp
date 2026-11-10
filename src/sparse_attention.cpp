@@ -8,10 +8,67 @@
 #include <thread>
 
 namespace tidal {
-SparseAttention::SparseAttention(int heads, int kv_heads, int dim, int capacity, int threads)
-    : heads_(heads), kv_heads_(kv_heads), dim_(dim), capacity_(capacity), threads_(threads) {
+WorkerPool::WorkerPool(int threads) {
+    if (threads <= 0) throw std::invalid_argument("Worker pool needs at least one thread");
+    for (int i = 1; i < threads; ++i) workers_.emplace_back([this] { work(); });
+}
+
+WorkerPool::~WorkerPool() {
+    { std::lock_guard lock(mutex_); stop_ = true; }
+    wake_.notify_all();
+    for (auto & worker : workers_) worker.join();
+}
+
+void WorkerPool::drain() {
+    for (int task; (task = next_.fetch_add(1, std::memory_order_relaxed)) < tasks_; ) {
+        (*job_)(task);
+        finished_.fetch_add(1, std::memory_order_release);
+    }
+}
+
+void WorkerPool::work() {
+    uint64_t seen = 0;
+    for (;;) {
+        {
+            std::unique_lock lock(mutex_);
+            wake_.wait(lock, [&] { return stop_ || generation_ != seen; });
+            if (stop_) return;
+            seen = generation_;
+            ++acknowledged_; ++busy_;
+        }
+        drain();
+        { std::lock_guard lock(mutex_); --busy_; }
+        done_.notify_one();
+    }
+}
+
+void WorkerPool::run(int tasks, const std::function<void(int)> & fn) {
+    if (tasks <= 0) return;
+    if (workers_.empty() || tasks == 1) { for (int i = 0; i < tasks; ++i) fn(i); return; }
+    {
+        std::lock_guard lock(mutex_);
+        job_ = &fn; tasks_ = tasks;
+        next_.store(0, std::memory_order_relaxed); finished_.store(0, std::memory_order_relaxed);
+        acknowledged_ = 0;
+        ++generation_;
+    }
+    wake_.notify_all();
+    drain();
+    // Return only after every worker has observed this generation and left
+    // drain(), so no worker can carry a stale view of job_ into the next run.
+    std::unique_lock lock(mutex_);
+    done_.wait(lock, [&] {
+        return finished_.load(std::memory_order_acquire) == tasks_ && busy_ == 0 && acknowledged_ == int(workers_.size());
+    });
+    job_ = nullptr;
+}
+
+SparseAttention::SparseAttention(int heads, int kv_heads, int dim, int capacity, int threads,
+                                 std::shared_ptr<WorkerPool> pool)
+    : heads_(heads), kv_heads_(kv_heads), dim_(dim), capacity_(capacity), threads_(threads), pool_(std::move(pool)) {
     if (heads <= 0 || kv_heads <= 0 || heads % kv_heads || dim <= 0 || capacity <= 0 || threads <= 0)
         throw std::invalid_argument("Invalid sparse-attention dimensions");
+    if (!pool_) pool_ = std::make_shared<WorkerPool>(threads);
     keys_.resize(size_t(capacity) * kv_heads * dim);
     values_.resize(keys_.size());
 }
@@ -74,15 +131,9 @@ std::vector<float> SparseAttention::attend(const std::vector<float> & query,
             }
         }
     };
-    const int workers = std::min(threads_, heads_);
-    std::vector<std::jthread> pool;
-    ProfileScope launch(profiler, "host", "worker_launch", phase, position, layer, "CPU");
-    for (int w = 1; w < workers; ++w) pool.emplace_back(worker, w, workers);
-    launch.finish();
-    worker(0, workers);
-    // Join before moving result into the return value.
-    ProfileScope join(profiler, "host", "worker_join", phase, position, layer, "CPU");
-    for (auto & thread : pool) thread.join();
+    const int workers = std::min({threads_, heads_, pool_->threads()});
+    ProfileScope dispatch(profiler, "host", "worker_dispatch", phase, position, layer, "CPU");
+    pool_->run(workers, [&](int w) { worker(w, workers); });
     return result;
 }
 

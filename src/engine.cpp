@@ -257,6 +257,8 @@ struct Engine::Impl {
     uint64_t gpu_kv_bytes = 0;
     std::vector<float> captured_logits;
     std::unique_ptr<Sampler> sampler;
+    // Shared by every CPU attention layer; declared before states so it outlives them.
+    std::shared_ptr<WorkerPool> attention_pool;
     std::vector<LayerState> states;
     std::vector<int32_t> previous_tokens;
     int position = 0;
@@ -301,8 +303,9 @@ struct Engine::Impl {
                     s.device_values = ggml_new_tensor_3d(ctx, type, dim, padded, c.kv_heads);
                     gpu_kv_bytes += ggml_nbytes(s.device_keys)+ggml_nbytes(s.device_values);
                 } else {
+                    if (!attention_pool) attention_pool = std::make_shared<WorkerPool>(options.threads);
                     s.attention = std::make_unique<SparseAttention>(c.q_heads, c.kv_heads, c.head_dim,
-                                                                   c.context, options.threads);
+                                                                   c.context, options.threads, attention_pool);
                 }
             }
         }

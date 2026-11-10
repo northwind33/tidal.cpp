@@ -6,7 +6,14 @@
 #include "ggml-alloc.h"
 #include "gguf.h"
 #include <map>
+#include <atomic>
+#include <condition_variable>
+#include <functional>
 #include <future>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
 #include <stdexcept>
 #include <utility>
 
@@ -81,9 +88,33 @@ private:
 };
 
 class Profiler;
+// Persistent workers for CPU attention. run() executes fn(0..tasks-1) on the
+// caller and the workers and returns when every task has finished.
+class WorkerPool {
+public:
+    explicit WorkerPool(int threads);
+    ~WorkerPool();
+    WorkerPool(const WorkerPool &) = delete;
+    WorkerPool & operator=(const WorkerPool &) = delete;
+    int threads() const { return int(workers_.size()) + 1; }
+    void run(int tasks, const std::function<void(int)> & fn);
+private:
+    void work();
+    void drain();
+    std::vector<std::thread> workers_;
+    std::mutex mutex_;
+    std::condition_variable wake_, done_;
+    const std::function<void(int)> * job_ = nullptr;
+    std::atomic<int> next_{0}, finished_{0};
+    int tasks_ = 0, busy_ = 0, acknowledged_ = 0;
+    uint64_t generation_ = 0;
+    bool stop_ = false;
+};
+
 class SparseAttention {
 public:
-    SparseAttention(int heads, int kv_heads, int dim, int capacity, int threads);
+    SparseAttention(int heads, int kv_heads, int dim, int capacity, int threads,
+                    std::shared_ptr<WorkerPool> pool = nullptr);
     void append(const std::vector<float> & key, const std::vector<float> & value);
     void append_bf16(const ggml_bf16_t * key, const ggml_bf16_t * value, int tokens);
     const ggml_bf16_t * keys() const { return keys_.data(); }
@@ -96,6 +127,7 @@ public:
     int size() const { return size_; }
 private:
     int heads_, kv_heads_, dim_, capacity_, threads_, size_ = 0;
+    std::shared_ptr<WorkerPool> pool_;
     std::vector<ggml_bf16_t> keys_, values_;
 };
 std::vector<int32_t> expand_blocks(const std::vector<int32_t> & blocks,

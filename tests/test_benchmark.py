@@ -74,7 +74,7 @@ def main():
                 assert len([e for e in events if e["name"] == "layer_major"]) == 1
                 assert p["statistics"]["prefill_tokens"] == 8
             names = {e["name"] for e in events}
-            assert {"qk", "softmax", "weighted_v", "kv_append_bf16", "worker_launch", "worker_join"} <= names
+            assert {"qk", "softmax", "weighted_v", "kv_append_bf16", "worker_dispatch"} <= names
             for event in events:
                 assert math.isfinite(event["dur"]) and event["dur"] >= 0 and event["ts"] >= 0
             for name in ["qk", "softmax", "weighted_v"]:

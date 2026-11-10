@@ -64,6 +64,18 @@ int main() {
         require(a.size() == 0, "Reset");
         a.append({0, 0, 0, 0}, {4, 8, 12, 16});
         require(a.attend(std::vector<float>(8), {0})[0] == 4, "Reset must exclude stale KV");
+        {
+            // Every task of every run executes exactly once, including runs with
+            // fewer tasks than workers and back-to-back runs on the same pool.
+            tidal::WorkerPool pool(4);
+            std::vector<std::atomic<int>> hits(64);
+            for (int round = 0; round < 2000; ++round) {
+                const int tasks = 1 + round % 64;
+                for (int i = 0; i < tasks; ++i) hits[i].store(0);
+                pool.run(tasks, [&](int i) { hits[i].fetch_add(1); });
+                for (int i = 0; i < tasks; ++i) require(hits[i].load() == 1, "Worker pool lost or repeated a task");
+            }
+        }
         std::cout << "core tests passed\n";
     } catch (const std::exception & e) { std::cerr << e.what() << '\n'; return 1; }
 }
