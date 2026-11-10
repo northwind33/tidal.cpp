@@ -358,8 +358,10 @@ struct Engine::Impl {
     }
     ggml_tensor * flash_attention(Graph & g, ggml_tensor * q, ggml_tensor * keys, ggml_tensor * values,
                                   ggml_tensor * mask, int count, int visible) {
-        q = ggml_cont(g.c(), ggml_permute(g.c(), q, 0, 2, 1, 3));
-        q = ggml_pad(g.c(), q, attention_dim()-c.head_dim, 0, 0, 0);
+        // FlashAttention reads a permuted Q directly; padding is needed only
+        // when the head size is below the kernel's head dimension.
+        q = ggml_permute(g.c(), q, 0, 2, 1, 3);
+        if (attention_dim() != c.head_dim) q = ggml_pad(g.c(), ggml_cont(g.c(), q), attention_dim()-c.head_dim, 0, 0, 0);
         // A decode graph passes one ready F16 mask shared by every layer.
         if (mask->type != GGML_TYPE_F16)
             mask = ggml_cast(g.c(), ggml_pad(g.c(), mask, 0, (64-count%64)%64, 0, 0), GGML_TYPE_F16);
@@ -376,6 +378,7 @@ struct Engine::Impl {
         }
         ggml_prec_set_acc(result, GGML_PREC_F32);
         ggml_set_name(result, ("blk."+std::to_string(g.layer)+".attention.flash").c_str());
+        if (attention_dim() == c.head_dim) return result;
         return ggml_cont(g.c(), ggml_view_3d(g.c(), result, c.head_dim, c.q_heads, count,
             result->nb[1], result->nb[2], 0));
     }
@@ -441,7 +444,7 @@ struct Engine::Impl {
         return result;
     }
     ggml_tensor * rope(Graph & g, ggml_tensor * x, int dim, int heads, int pos) {
-        x = ggml_reshape_3d(g.c(), ggml_cont(g.c(), x), dim, heads, 1);
+        x = ggml_reshape_3d(g.c(), ggml_is_contiguous(x) ? x : ggml_cont(g.c(), x), dim, heads, 1);
         auto * positions = g.position_input && pos == position ? g.position_input : g.integer(pos);
         return ggml_rope_ext(g.c(), x, positions, nullptr, c.rope_dim,
                              GGML_ROPE_TYPE_NEOX, c.context, c.rope_base, 1, 0, 1, 0, 0);
@@ -469,13 +472,13 @@ struct Engine::Impl {
     ggml_tensor * ffn(Graph & g, ggml_tensor * h, const std::string & p) {
         if (c.architecture == Architecture::Qwen35) {
             auto * x = norm(g, h, p + "ffn_norm");
-            auto * active = ggml_mul(g.c(), ggml_silu(g.c(), mm(g, p + "ffn.gate", x)), mm(g, p + "ffn.up", x));
+            // GLU form lets the CUDA backend fuse gate/up matvecs with the activation.
+            auto * active = ggml_swiglu_split(g.c(), mm(g, p + "ffn.gate", x), mm(g, p + "ffn.up", x));
             return ggml_add(g.c(), h, mm(g, p + "ffn.down", active));
         }
         auto mixed = mix(g, h, p + "hc_ffn");
         if (c.experts) return combine(g, h, moe(g, mixed.value, p + "ffn."), mixed.inject);
-        auto * v = ggml_mul(g.c(), ggml_silu(g.c(), mm(g, p + "ffn.gate", mixed.value)),
-                           mm(g, p + "ffn.up", mixed.value));
+        auto * v = ggml_swiglu_split(g.c(), mm(g, p + "ffn.gate", mixed.value), mm(g, p + "ffn.up", mixed.value));
         return combine(g, h, mm(g, p + "ffn.down", v), mixed.inject);
     }
     ggml_tensor * moe(Graph & g, ggml_tensor * x, const std::string & p) {
@@ -597,8 +600,16 @@ struct Engine::Impl {
         // sqrt(sum) to eps. RMSNorm with eps/d followed by 1/sqrt(d) is exact.
         const float scale = 1.0f / std::sqrt(float(c.gdn_dim));
         const float l2_eps = c.architecture == Architecture::Qwen35 ? 1e-6f : c.eps;
-        q = repeat_gdn_heads(g, ggml_scale(g.c(), ggml_rms_norm(g.c(), q, l2_eps / c.gdn_dim), scale));
-        k = repeat_gdn_heads(g, ggml_scale(g.c(), ggml_rms_norm(g.c(), k, l2_eps / c.gdn_dim), scale));
+        q = ggml_scale(g.c(), ggml_rms_norm(g.c(), q, l2_eps / c.gdn_dim), scale);
+        k = ggml_scale(g.c(), ggml_rms_norm(g.c(), k, l2_eps / c.gdn_dim), scale);
+        // GATED_DELTA_NET tiles key heads over value heads (head % key_heads) on
+        // CPU and CUDA, which is exactly the native qwen35 layout.
+        if (c.architecture == Architecture::Qwen35) {
+            q = ggml_reshape_4d(g.c(), q, c.gdn_dim, c.gdn_key_heads, 1, 1);
+            k = ggml_reshape_4d(g.c(), k, c.gdn_dim, c.gdn_key_heads, 1, 1);
+        } else {
+            q = repeat_gdn_heads(g, q); k = repeat_gdn_heads(g, k);
+        }
         auto * a = ggml_softplus(g.c(), ggml_add(g.c(), mm(g, p + "gdn.a", mixed.value), weight(p + "gdn.dt_bias")));
         // qwen35 GGUF stores -exp(A_log), while the tidal schema stores A_log.
         auto * decay = c.architecture == Architecture::Qwen35 ? ggml_mul(g.c(), weight(p + "gdn.a_log"), a)
@@ -1326,7 +1337,8 @@ struct Engine::Impl {
             // Only one mask entry is updated per token, so the allocator must not
             // reuse this tensor's memory for intermediates after its last reader.
             ggml_set_output(g.mask_input);
-            auto * h = ggml_repeat(g.c(), ggml_get_rows(g.c(), weight("token_embd.weight"), g.token_input), hidden);
+            auto * embedded = ggml_get_rows(g.c(), weight("token_embd.weight"), g.token_input);
+            auto * h = c.branches == 1 ? ggml_reshape_2d(g.c(), embedded, c.hidden, 1) : ggml_repeat(g.c(), embedded, hidden);
             for (int layer = 0; layer < c.layers; ++layer) {
                 if (states[layer].ple) h = build_ple(g, layer, token, h);
                 if (c.is_recurrent(layer)) { h = build_linear(g, layer, h); continue; }
