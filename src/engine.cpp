@@ -95,6 +95,16 @@ public:
     // Read back after run(): a shared allocator may otherwise reuse its memory.
     void output(ggml_tensor * t) { ggml_set_output(t); ggml_build_forward_expand(graph, t); }
     bool allocated_inputs() const { return memory || shared; }
+    // Per-token data of a reusable decode graph. Their values change between
+    // runs while the graph topology, and thus its captured CUDA graph, does not.
+    ggml_tensor * token_input = nullptr, * position_input = nullptr, * kv_row_input = nullptr, * mask_input = nullptr;
+    ggml_tensor * finite = nullptr;
+    int kv_padded = 0;
+    ggml_tensor * input(ggml_type type, int64_t n) {
+        auto * t = ggml_new_tensor_1d(c(), type, n);
+        ggml_set_input(t);
+        return t;
+    }
     ggml_tensor * integer(int32_t value) {
         return integers({value});
     }
@@ -110,13 +120,14 @@ public:
         uploads.emplace_back([this, t, values] { put(t, values.data(), values.size() * sizeof(float)); });
         return t;
     }
-    void put(ggml_tensor * t, const void * data, size_t size) {
+    void put(ggml_tensor * t, const void * data, size_t size) { put_at(t, data, 0, size); }
+    void put_at(ggml_tensor * t, const void * data, size_t offset, size_t size) {
         // Graph allocators skip inputs whose consumers were never expanded.
         if (!t->buffer && !t->data) return;
         ProfileScope transfer(&profiler, "transfer", device ? "H2D" : "host_write", phase, position, layer, backend_label);
         transfer.event.bytes = size;
         auto start = Clock::now();
-        ggml_backend_tensor_set(t, data, 0, size);
+        ggml_backend_tensor_set(t, data, offset, size);
         stats.transfer_ms += elapsed(start);
         if (device) stats.host_to_device_bytes += size;
     }
@@ -242,6 +253,9 @@ struct Engine::Impl {
     PrefillMemory * prefill_memory = nullptr;
     Backend prefill_backend{nullptr, ggml_backend_free};
     std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)> decode_allocator{nullptr, ggml_gallocr_free};
+    // Reused while weights stay resident and the KV bucket is unchanged; prefill
+    // may evict/reload weights, and reset rewinds the position.
+    std::unique_ptr<Graph> decode_graph;
 
     Impl(const std::string & path, Options opts)
         : options(std::move(opts)), backend(make_backend(options)), model(path, backend.get()), c(model.config),
@@ -310,19 +324,28 @@ struct Engine::Impl {
     // Persistent GPU KV keeps every decode operation on the device, so a token
     // runs as one graph with one synchronization on a reused compute buffer.
     bool single_graph_decode(bool capture) const { return options.kv_placement == KVPlacement::GPU && !capture; }
-    Graph token_graph() {
+    ggml_gallocr * decode_allocator_get() {
         if (!decode_allocator) {
             decode_allocator.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend.get())));
             if (!decode_allocator) throw std::runtime_error("Cannot create decode graph allocator");
         }
-        return Graph(backend.get(), stats, options.backend == "cuda", profiler, "decode", position, -1,
-                     nullptr, decode_allocator.get(), 16384);
+        return decode_allocator.get();
     }
     int attention_dim() const { return c.head_dim <= 64 ? 64 : c.head_dim <= 128 ? 128 : 256; }
     // Store directly in the persistent working format: GPU FP16 KV must not
     // incur the hybrid path's intermediate BF16 rounding or host export.
     void append_device_kv(Graph & g, LayerState & s, ggml_tensor * k, ggml_tensor * v, int first, int count) {
         if (s.device_kv_size != first) throw std::logic_error("GPU KV prefix is inconsistent");
+        if (g.kv_row_input && count == 1) {
+            // The destination row is data, so a reused graph appends at any position.
+            auto row = [&](ggml_tensor * source, ggml_tensor * target) {
+                source = ggml_reshape_3d(g.c(), source, c.head_dim, 1, c.kv_heads);
+                if (attention_dim() != c.head_dim) source = ggml_pad(g.c(), source, attention_dim()-c.head_dim, 0, 0, 0);
+                g.add(ggml_set_rows(g.c(), target, source, g.kv_row_input));
+            };
+            row(k, s.device_keys); row(v, s.device_values);
+            return;
+        }
         auto copy = [&](ggml_tensor * source, ggml_tensor * target) {
             source = ggml_reshape_3d(g.c(), source, c.head_dim, c.kv_heads, count);
             source = ggml_cont(g.c(), ggml_permute(g.c(), source, 0, 2, 1, 3));
@@ -361,7 +384,8 @@ struct Engine::Impl {
         const int visible = position+1, padded = (visible+255)/256*256;
         const auto p = "blk."+std::to_string(layer)+".";
         append_device_kv(g, s, k, v, position, 1);
-        auto * mask = ggml_diag_mask_inf(g.c(), ggml_fill(g.c(), ggml_new_tensor_2d(g.c(), GGML_TYPE_F32, padded, 1), 0), position);
+        auto * mask = g.mask_input && g.kv_padded == padded ? ggml_reshape_2d(g.c(), g.mask_input, padded, 1)
+            : ggml_diag_mask_inf(g.c(), ggml_fill(g.c(), ggml_new_tensor_2d(g.c(), GGML_TYPE_F32, padded, 1), 0), position);
         if (top) {
             const int blocks = visible/c.block_size;
             std::vector<int32_t> extra(c.block_size, -1);
@@ -416,7 +440,8 @@ struct Engine::Impl {
     }
     ggml_tensor * rope(Graph & g, ggml_tensor * x, int dim, int heads, int pos) {
         x = ggml_reshape_3d(g.c(), ggml_cont(g.c(), x), dim, heads, 1);
-        return ggml_rope_ext(g.c(), x, g.integer(pos), nullptr, c.rope_dim,
+        auto * positions = g.position_input && pos == position ? g.position_input : g.integer(pos);
+        return ggml_rope_ext(g.c(), x, positions, nullptr, c.rope_dim,
                              GGML_ROPE_TYPE_NEOX, c.context, c.rope_base, 1, 0, 1, 0, 0);
     }
     Mixed mix(Graph & g, ggml_tensor * h, const std::string & p, bool inject = true) {
@@ -1172,6 +1197,7 @@ struct Engine::Impl {
 
     std::vector<Step> prefill(const std::vector<int32_t> & tokens, bool capture) {
         if (failed) throw std::runtime_error("Previous execution failed; call reset() before prefill");
+        decode_graph.reset();
         if (tokens.size() > size_t(c.context-position)) throw std::out_of_range("Prompt exceeds context capacity");
         for (auto token : tokens) if (token < 0 || token >= c.vocab) throw std::out_of_range("Prompt token outside vocabulary");
         if (tokens.empty()) return {};
@@ -1278,25 +1304,59 @@ struct Engine::Impl {
     // One graph from embedding to logits. Builders chain activations instead of
     // round-tripping through the persistent hidden tensor between layers.
     void decode_single_graph(int32_t token) {
-        auto g = token_graph();
-        auto * h = ggml_repeat(g.c(), ggml_get_rows(g.c(), weight("token_embd.weight"), g.integer(token)), hidden);
-        for (int layer = 0; layer < c.layers; ++layer) {
-            if (states[layer].ple) h = build_ple(g, layer, token, h);
-            if (c.is_recurrent(layer)) { h = build_linear(g, layer, h); continue; }
-            auto prepared = c.architecture == Architecture::Qwen35 ? full_prepare(g, layer, h) : sparse_prepare(g, layer, h);
-            h = device_attention(g, layer, h, prepared.q, prepared.k, prepared.v, prepared.scores, prepared.top);
+        const int padded = (position+256)/256*256;
+        // Qwen3.5 topology depends only on the 256-token KV bucket; QSA and PLE
+        // graphs carry position-dependent structure and are rebuilt per token.
+        const bool reusable = c.architecture == Architecture::Qwen35 && c.ple.layers.empty();
+        const bool rebuild = !decode_graph || !reusable || decode_graph->kv_padded != padded;
+        if (rebuild) {
+            decode_graph.reset();
+            decode_graph = std::make_unique<Graph>(backend.get(), stats, options.backend == "cuda", profiler, "decode", position, -1,
+                                                   nullptr, decode_allocator_get(), 16384);
+            auto & g = *decode_graph;
+            g.kv_padded = padded;
+            g.token_input = g.input(GGML_TYPE_I32, 1);
+            g.position_input = g.input(GGML_TYPE_I32, 1);
+            g.kv_row_input = g.input(GGML_TYPE_I64, 1);
+            g.mask_input = g.input(GGML_TYPE_F32, padded);
+            // Only one mask entry is updated per token, so the allocator must not
+            // reuse this tensor's memory for intermediates after its last reader.
+            ggml_set_output(g.mask_input);
+            auto * h = ggml_repeat(g.c(), ggml_get_rows(g.c(), weight("token_embd.weight"), g.token_input), hidden);
+            for (int layer = 0; layer < c.layers; ++layer) {
+                if (states[layer].ple) h = build_ple(g, layer, token, h);
+                if (c.is_recurrent(layer)) { h = build_linear(g, layer, h); continue; }
+                auto prepared = c.architecture == Architecture::Qwen35 ? full_prepare(g, layer, h) : sparse_prepare(g, layer, h);
+                h = device_attention(g, layer, h, prepared.q, prepared.k, prepared.v, prepared.scores, prepared.top);
+            }
+            auto mixed = c.architecture == Architecture::Qwen35
+                ? Mixed{norm(g, h, "output_norm.weight"), nullptr} : mix(g, h, "head", false);
+            auto * logits = mm(g, "output.weight", mixed.value);
+            g.add(ggml_cpy(g.c(), logits, last_logits));
+            g.add(ggml_cpy(g.c(), h, hidden));
+            g.finite = ggml_sum(g.c(), ggml_sub(g.c(), logits, logits));
+            g.output(g.finite);
+            g.reserve();
+            std::vector<float> mask(padded, -INFINITY);
+            std::fill(mask.begin(), mask.begin()+position+1, 0.0f);
+            g.put(g.mask_input, mask.data(), mask.size()*sizeof(float));
+        } else {
+            const float unmasked = 0.0f;
+            decode_graph->put_at(decode_graph->mask_input, &unmasked, size_t(position)*sizeof(float), sizeof(float));
         }
-        auto mixed = c.architecture == Architecture::Qwen35
-            ? Mixed{norm(g, h, "output_norm.weight"), nullptr} : mix(g, h, "head", false);
-        auto * logits = mm(g, "output.weight", mixed.value);
-        g.add(ggml_cpy(g.c(), logits, last_logits));
-        g.add(ggml_cpy(g.c(), h, hidden));
-        auto * finite = ggml_sum(g.c(), ggml_sub(g.c(), logits, logits));
-        g.output(finite);
+        auto & g = *decode_graph;
+        const int64_t row = position;
+        g.put(g.token_input, &token, sizeof(token));
+        g.put(g.position_input, &position, sizeof(position));
+        g.put(g.kv_row_input, &row, sizeof(row));
         g.run();
+        if (!rebuild) ++stats.decode_graph_reuses;
+        stats.gpu_attention_calls += rebuild ? 0 : uint64_t(std::count_if(states.begin(), states.end(),
+            [](const LayerState & s) { return s.device_keys != nullptr; }));
         for (int layer = 0; layer < c.layers; ++layer)
             if (states[layer].device_keys) states[layer].device_kv_size = position + 1;
-        if (!std::isfinite(g.get<float>(finite)[0])) throw std::runtime_error("Non-finite logits");
+        if (!std::isfinite(g.get<float>(g.finite)[0])) throw std::runtime_error("Non-finite logits");
+        if (!reusable) decode_graph.reset();
     }
     Step decode(int32_t token, bool capture_logits) {
         if (failed) throw std::runtime_error("Previous decode failed; call reset() before reusing the engine");
@@ -1362,6 +1422,7 @@ struct Engine::Impl {
         catch (...) { failed = true; throw; }
     }
     void reset() {
+        decode_graph.reset();
         model.wait_all();
         for (size_t id=0; id<model.groups.size(); ++id) model.load(int(id));
         ggml_backend_synchronize(backend.get());

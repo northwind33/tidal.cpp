@@ -84,6 +84,7 @@ int main(int argc, char ** argv) {
             const int steps=std::min<int>(300,c.context-int(tokens.size()));
             for(int i=0;i<steps;++i) {
                 const auto expected_token=diagnostic.sample(), actual_token=fast.sample();
+                if(expected_token!=actual_token) std::cerr<<"mismatch step "<<i<<" "<<expected_token<<" "<<actual_token<<"\n";
                 require(expected_token==actual_token, "Compact GPU KV decode changed greedy sampling");
                 diagnostic.decode(expected_token);
                 require(fast.decode(actual_token,false).logits.empty(), "Compact GPU KV decode downloaded logits");

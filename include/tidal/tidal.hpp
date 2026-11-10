@@ -155,6 +155,7 @@ struct Statistics {
     uint64_t prefill_attention_min_tile = 0, prefill_attention_max_tile = 0;
     uint64_t prefill_reserve_bytes = 0;
     uint64_t gpu_attention_calls = 0; // Decode only; prefill has its own counter.
+    uint64_t decode_graph_reuses = 0; // GPU KV decode tokens that reused the previous graph.
     uint64_t gpu_kv_bytes = 0; // Persistent, padded K/V allocation; survives reset.
 };
 

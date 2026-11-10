@@ -12,6 +12,7 @@ set(TIDAL_GGML_SOURCE_DIR "" CACHE PATH "Use an existing checkout of the pinned 
 set(GGML_CUDA ${TIDAL_CUDA} CACHE BOOL "" FORCE)
 if(TIDAL_CUDA)
     set(GGML_CUDA_FA ON CACHE BOOL "Required by GPU layer prefill" FORCE)
+    set(GGML_CUDA_GRAPHS ON CACHE BOOL "Replay reused GPU KV decode graphs" FORCE)
 endif()
 set(GGML_METAL OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
