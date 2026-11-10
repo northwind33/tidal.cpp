@@ -530,13 +530,12 @@ struct Engine::Impl {
         if (c.architecture == Architecture::Qwen35)
             return ggml_repeat_4d(g.c(), x, c.gdn_dim, c.gdn_value_heads, 1, 1);
         // ggml's fused GDN broadcasts by tiling; Qwen requires repeat_interleave.
-        ggml_tensor * expanded = nullptr;
+        // Repeating a unit axis between dim and key heads gives value head
+        // h = key_head * repeat + j in one REPEAT instead of a per-head CONCAT chain.
         const int repeat = c.gdn_value_heads / c.gdn_key_heads;
-        for (int h = 0; h < c.gdn_value_heads; ++h) {
-            auto * head = ggml_view_1d(g.c(), x, c.gdn_dim, size_t(h / repeat) * c.gdn_dim * sizeof(float));
-            expanded = expanded ? ggml_concat(g.c(), expanded, head, 0) : head;
-        }
-        return ggml_reshape_4d(g.c(), ggml_cont(g.c(), expanded), c.gdn_dim, c.gdn_value_heads, 1, 1);
+        auto * unit = ggml_reshape_4d(g.c(), ggml_is_contiguous(x) ? x : ggml_cont(g.c(), x), c.gdn_dim, 1, c.gdn_key_heads, 1);
+        return ggml_reshape_4d(g.c(), ggml_repeat_4d(g.c(), unit, c.gdn_dim, repeat, c.gdn_key_heads, 1),
+                               c.gdn_dim, c.gdn_value_heads, 1, 1);
     }
     void ple_layer(int layer, int32_t token) {
         ProfileScope scope(&profiler, "layer", "ple", "ple", position, layer, ggml_backend_name(backend.get()));
@@ -896,14 +895,10 @@ struct Engine::Impl {
     ggml_tensor * batch_gdn_heads(Graph & g, ggml_tensor * x, int count) {
         if (c.architecture == Architecture::Qwen35)
             return ggml_repeat_4d(g.c(), x, c.gdn_dim, c.gdn_value_heads, count, 1);
-        ggml_tensor * expanded = nullptr;
         const int repeat = c.gdn_value_heads / c.gdn_key_heads;
-        for (int h = 0; h < c.gdn_value_heads; ++h) {
-            auto * head = ggml_view_3d(g.c(), x, c.gdn_dim, 1, count, x->nb[1], x->nb[2],
-                                      size_t(h / repeat) * x->nb[1]);
-            expanded = expanded ? ggml_concat(g.c(), expanded, head, 1) : head;
-        }
-        return ggml_cont(g.c(), expanded);
+        auto * unit = ggml_reshape_4d(g.c(), ggml_is_contiguous(x) ? x : ggml_cont(g.c(), x), c.gdn_dim, 1, c.gdn_key_heads, count);
+        return ggml_reshape_3d(g.c(), ggml_repeat_4d(g.c(), unit, c.gdn_dim, repeat, c.gdn_key_heads, count),
+                               c.gdn_dim, c.gdn_value_heads, count);
     }
     void batch_gdn(ggml_tensor * batch, int layer) {
         prefill_memory->protect(layer, {model.group(layer, WeightPart::Attention)});
