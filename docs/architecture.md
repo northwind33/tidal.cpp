@@ -230,8 +230,12 @@ reduce sequence capacity from the GGUF value; zero retains the model capacity.
 
 ## Current performance limits
 
-In the default CPU KV mode, decode graphs are allocated per phase and each graph
-compute synchronizes; decode transfers synchronize, while prefill KV exports and
+In the default CPU KV mode, decode runs one GPU graph per span between two CPU
+attention layers: the previous layer's output projection and FFN, the GDN/PLE
+layers in between and the next layer's projections. Q, K and V return as one
+packed download; each span synchronizes once because the next CPU attention needs
+its result. Spans are launched asynchronously, and while one executes the host
+builds and allocates the next from an alternate allocator. Prefill KV exports and
 weight prefetch overlap work. Persistent GPU KV decode instead runs one graph per
 token on a reused compute buffer and, for Qwen3.5, reuses that graph across tokens
 (see [GPU prefill](prefill.md#persistent-gpu-kv-benchmark-mode)).
