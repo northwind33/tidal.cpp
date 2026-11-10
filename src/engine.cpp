@@ -111,6 +111,11 @@ public:
     ggml_tensor * token_input = nullptr, * position_input = nullptr, * kv_row_input = nullptr, * mask_input = nullptr;
     ggml_tensor * finite = nullptr;
     int kv_padded = 0;
+    // Reusable CPU-KV decode segments: one I32 input carries the per-token
+    // scalars {position, index-cache row, raw-index ring row, block start}.
+    ggml_tensor * scalars = nullptr;
+    ggml_tensor * block_mask = nullptr;   // 0 for complete QSA blocks, -inf beyond
+    int qsa_padded = 0;                   // scored block count, fixed per graph
     ggml_tensor * input(ggml_type type, int64_t n) {
         auto * t = ggml_new_tensor_1d(c(), type, n);
         ggml_set_input(t);
@@ -513,6 +518,11 @@ struct Engine::Impl {
         ggml_set_name(result, n.c_str());
         return result;
     }
+    ggml_tensor * rope_at(Graph & g, ggml_tensor * x, int dim, int heads, ggml_tensor * positions) {
+        x = ggml_reshape_3d(g.c(), ggml_is_contiguous(x) ? x : ggml_cont(g.c(), x), dim, heads, 1);
+        return ggml_rope_ext(g.c(), x, positions, nullptr, c.rope_dim,
+                             GGML_ROPE_TYPE_NEOX, c.context, c.rope_base, 1, 0, 1, 0, 0);
+    }
     ggml_tensor * rope(Graph & g, ggml_tensor * x, int dim, int heads, int pos) {
         x = ggml_reshape_3d(g.c(), ggml_is_contiguous(x) ? x : ggml_cont(g.c(), x), dim, heads, 1);
         auto * positions = g.position_input && pos == position ? g.position_input : g.integer(pos);
@@ -752,6 +762,37 @@ struct Engine::Impl {
         iq = rope(g, norm(g, iq, p + "index.q_norm"), c.index_dim, c.index_heads, position);
         auto * raw = mm(g, p + "index.k", mixed.value);
         const int visible = position + 1, complete = visible / c.block_size;
+        if (g.scalars) {
+            // Position-independent form: every token pools its current block into
+            // index-cache row position / block_size. Rows of incomplete blocks are
+            // masked out of scoring and overwritten once the block completes, so
+            // the completing token writes exactly what the conditional form wrote.
+            auto scalar = [&](int i) { return ggml_view_1d(g.c(), g.scalars, 1, size_t(i) * sizeof(int32_t)); };
+            auto * pooled = raw;
+            for (int i = 0; i < c.block_size - 1; ++i)
+                pooled = ggml_add(g.c(), pooled, ggml_view_1d(g.c(), s.raw_index, c.index_dim,
+                                                           size_t(i) * c.index_dim * sizeof(float)));
+            pooled = ggml_scale(g.c(), pooled, 1.0f / c.block_size);
+            pooled = rope_at(g, norm(g, pooled, p + "index.k_norm"), c.index_dim, 1, scalar(3));
+            g.add(ggml_set_rows(g.c(), s.index_cache, ggml_reshape_2d(g.c(), pooled, c.index_dim, 1), scalar(1)));
+            g.add(ggml_set_rows(g.c(), s.raw_index, ggml_reshape_2d(g.c(), raw, c.index_dim, 1), scalar(2)));
+            ggml_tensor * top = nullptr, * scores = nullptr;
+            if (g.qsa_padded > 0) {
+                auto * cache = ggml_view_2d(g.c(), s.index_cache, c.index_dim, g.qsa_padded, s.index_cache->nb[1], 0);
+                scores = ggml_mul_mat(g.c(), ggml_cast(g.c(), cache, GGML_TYPE_F32),
+                                      ggml_reshape_2d(g.c(), iq, c.index_dim, c.index_heads));
+                ggml_prec_set_acc(scores, GGML_PREC_F32);
+                ggml_set_name(scores, (p + "index.scores").c_str());
+                scores = ggml_relu(g.c(), scores);
+                scores = ggml_sum_rows(g.c(), ggml_cont(g.c(), ggml_transpose(g.c(), scores)));
+                scores = ggml_scale(g.c(), ggml_reshape_1d(g.c(), scores, g.qsa_padded), 1.0f / std::sqrt(float(c.index_dim)));
+                scores = ggml_add(g.c(), scores, g.block_mask);   // x + 0 == x for complete blocks
+                top = ggml_cont(g.c(), ggml_top_k(g.c(), scores, std::min(c.top_blocks, g.qsa_padded)));
+                ggml_set_name(top, (p + "index.top_k").c_str());
+                g.add(top);
+            }
+            return {q, k, v, scores, top};
+        }
         if (visible % c.block_size == 0) {
             auto * pooled = raw;
             for (int i = 0; i < c.block_size - 1; ++i)
@@ -1307,6 +1348,7 @@ struct Engine::Impl {
     std::vector<Step> prefill(const std::vector<int32_t> & tokens, bool capture) {
         if (failed) throw std::runtime_error("Previous execution failed; call reset() before prefill");
         decode_graph.reset();
+        hybrid.clear();
         if (tokens.size() > size_t(c.context-position)) throw std::out_of_range("Prompt exceeds context capacity");
         for (auto token : tokens) if (token < 0 || token >= c.vocab) throw std::out_of_range("Prompt token outside vocabulary");
         if (tokens.empty()) return {};
@@ -1487,14 +1529,24 @@ struct Engine::Impl {
         bool sparse = false;
         ggml_tensor * qkv = nullptr, * top = nullptr, * finite = nullptr;
     };
-    Segment build_segment(int finished, int allocator, int32_t token, bool capture) {
+    // padded >= 0 builds a reusable segment whose per-token values are inputs
+    // (see Graph::scalars); padded is then the scored QSA block count.
+    Segment build_segment(int finished, ggml_gallocr * allocator, int32_t token, bool capture, int padded = -1) {
         Segment seg;
         seg.g = std::make_unique<Graph>(backend.get(), stats, options.backend == "cuda", profiler, "hybrid.segment",
-                                        position, -1, nullptr, decode_allocator_get(allocator), 16384);
+                                        position, -1, nullptr, allocator, 16384);
         auto & g = *seg.g;
+        const bool reusable = padded >= 0;
+        if (reusable) {
+            g.scalars = g.input(GGML_TYPE_I32, 4);
+            g.position_input = ggml_view_1d(g.c(), g.scalars, 1, 0);
+            g.qsa_padded = padded;
+            if (padded > 0) { g.block_mask = g.input(GGML_TYPE_F32, padded); ggml_set_output(g.block_mask); }
+            if (finished < 0) g.token_input = g.input(GGML_TYPE_I32, 1);
+        }
         ggml_tensor * h;
         if (finished < 0) {
-            h = ggml_get_rows(g.c(), weight("token_embd.weight"), g.integer(token));
+            h = ggml_get_rows(g.c(), weight("token_embd.weight"), reusable ? g.token_input : g.integer(token));
             h = c.branches == 1 ? ggml_reshape_2d(g.c(), h, c.hidden, 1) : ggml_repeat(g.c(), h, hidden);
             g.mark(h, "embedding", -1);
         } else {
@@ -1536,15 +1588,109 @@ struct Engine::Impl {
         g.mark(nullptr, "head", -1);
         return seg;
     }
+    // Reused CPU-KV segments: built once per QSA block bucket, then replayed with
+    // new scalar inputs, which lets ggml capture each segment as a CUDA graph.
+    struct HybridCache {
+        std::vector<Segment> segments;
+        std::vector<std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)>> allocators;
+        int padded = -1, complete = -1;
+        void clear() { segments.clear(); allocators.clear(); padded = complete = -1; }
+    } hybrid;
+    void decode_hybrid_reused(int32_t token, bool capture, Step & step) {
+        const bool sparse = c.architecture == Architecture::Qwen4Exp;
+        const int visible = position + 1, complete = sparse ? visible / c.block_size : 0;
+        const int capacity_blocks = std::max(1, c.context / c.block_size);
+        // 256-block buckets: the graph is rebuilt only when the scored block count grows past one.
+        const int padded = sparse && complete ? std::min(capacity_blocks, (complete + 255) / 256 * 256) : 0;
+        if (hybrid.segments.empty() || hybrid.padded != padded) {
+            hybrid.clear();
+            for (int finished = -1;;) {
+                hybrid.allocators.emplace_back(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend.get())), ggml_gallocr_free);
+                if (!hybrid.allocators.back()) throw std::runtime_error("Cannot create decode segment allocator");
+                hybrid.segments.push_back(build_segment(finished, hybrid.allocators.back().get(), token, false, padded));
+                auto & seg = hybrid.segments.back();
+                if (!seg.g->uploads.empty()) throw std::logic_error("Reusable decode segment has baked inputs");
+                seg.g->reserve();
+                if (seg.attention < 0) break;
+                finished = seg.attention;
+            }
+            hybrid.padded = padded;
+        }
+        if (hybrid.complete != complete) {
+            // Only whole blocks change the mask; upload it to every QSA segment.
+            std::vector<float> mask(size_t(padded), -INFINITY);
+            std::fill(mask.begin(), mask.begin() + std::min(complete, padded), 0.0f);
+            for (auto & seg : hybrid.segments) if (seg.g->block_mask) seg.g->put(seg.g->block_mask, mask.data(), mask.size() * sizeof(float));
+            hybrid.complete = complete;
+        }
+        const int32_t scalars[4] = {position, sparse ? position / c.block_size : 0, sparse ? position % c.block_size : 0,
+                                    sparse ? position / c.block_size * c.block_size : 0};
+        std::vector<float> output;
+        for (size_t i = 0; i < hybrid.segments.size(); ++i) {
+            auto & seg = hybrid.segments[i];
+            seg.g->put(seg.g->scalars, scalars, sizeof(scalars));
+            if (i == 0) seg.g->put(seg.g->token_input, &token, sizeof(token));
+            else seg.g->put(seg.input, output.data(), output.size() * sizeof(float));
+            seg.g->launch();
+            seg.g->wait();
+            if (seg.attention < 0) break;
+            output = segment_attention(seg, visible, complete, step);
+        }
+        auto & head = hybrid.segments.back();
+        captured_logits.clear();
+        if (capture) step.logits = head.g->get<float>(last_logits);
+        if (!std::isfinite(head.g->get<float>(head.finite)[0]) ||
+            !std::all_of(step.logits.begin(), step.logits.end(), [](float f) { return std::isfinite(f); }))
+            throw std::runtime_error("Non-finite logits");
+        captured_logits = step.logits;
+    }
+    // CPU attention for the layer whose projections end seg.
+    std::vector<float> segment_attention(Segment & seg, int visible, int complete, Step & step) {
+        const int layer = seg.attention;
+        auto & s = states[layer];
+        std::vector<int32_t> selected;
+        if (seg.sparse) {
+            auto blocks = seg.top ? seg.g->get<int32_t>(seg.top) : std::vector<int32_t>{};
+            // Padded scoring may rank masked (incomplete or future) blocks last.
+            blocks.erase(std::remove_if(blocks.begin(), blocks.end(), [&](int32_t b) { return b >= complete; }), blocks.end());
+            ProfileScope expand(&profiler, "cpu", "expand_blocks", "qsa.attention", position, layer, "CPU");
+            selected = expand_blocks(blocks, visible, c.block_size);
+        } else {
+            selected.resize(visible);
+            std::iota(selected.begin(), selected.end(), 0);
+        }
+        const auto packed = seg.g->get<float>(seg.qkv);
+        const size_t qn = size_t(c.q_heads) * c.head_dim, kn = size_t(c.kv_heads) * c.head_dim;
+        const char * phase = seg.sparse ? "qsa.attention" : "full.attention";
+        std::vector<float> queries(packed.begin(), packed.begin() + qn), keys(packed.begin() + qn, packed.begin() + qn + kn),
+            values(packed.begin() + qn + kn, packed.end());
+        auto start = Clock::now();
+        ProfileScope append(&profiler, "cpu", "kv_append_bf16", phase, position, layer, "CPU");
+        append.event.bytes = (keys.size() + values.size()) * sizeof(uint16_t);
+        try { s.attention->append(keys, values); }
+        catch (const std::overflow_error & error) {
+            throw std::overflow_error(std::string(error.what()) + " in layer " + std::to_string(layer) + " at position " +
+                std::to_string(position) + "; use --cpu-kv-precision bf16 for this model");
+        }
+        append.finish();
+        ProfileScope attention_scope(&profiler, "cpu", seg.sparse ? "sparse_attention" : "full_attention", phase, position, layer, "CPU");
+        auto output = s.attention->attend(queries, selected, &profiler, position, layer, phase);
+        attention_scope.finish();
+        stats.attention_ms += elapsed(start);
+        ++(seg.sparse ? stats.sparse_attention_calls : stats.full_attention_calls);
+        step.selections.push_back({layer, std::move(selected)});
+        return output;
+    }
     void decode_hybrid(int32_t token, bool capture, Step & step) {
+        if (c.ple.layers.empty()) { decode_hybrid_reused(token, capture, step); return; }
         const int visible = position + 1;
         int which = 0;
-        auto seg = build_segment(-1, which, token, capture);
+        auto seg = build_segment(-1, decode_allocator_get(which), token, capture);
         seg.g->launch();
         for (;;) {
             Segment next;
             if (seg.attention >= 0) {
-                next = build_segment(seg.attention, which ^ 1, token, capture);
+                next = build_segment(seg.attention, decode_allocator_get(which ^ 1), token, capture);
                 next.g->reserve();
             }
             seg.g->wait();
@@ -1668,6 +1814,7 @@ struct Engine::Impl {
     }
     void reset() {
         decode_graph.reset();
+        hybrid.clear();
         model.wait_all();
         for (size_t id=0; id<model.groups.size(); ++id) model.load(int(id));
         ggml_backend_synchronize(backend.get());
