@@ -289,6 +289,9 @@ struct Engine::Impl {
     // Decode-only copies of hyper-connection norm gammas scaled by 1/branches
     // (see mix()); they live in the state buffer, independent of weight eviction.
     std::map<std::string, ggml_tensor *> hc_norm_scaled;
+    // Decode-only -exp(A_log) per qwen4exp GDN layer, a constant otherwise
+    // recomputed (EXP + NEG) for every token.
+    std::map<int, ggml_tensor *> gdn_neg_exp_a;
     std::vector<LayerState> states;
     std::vector<int32_t> previous_tokens;
     int position = 0;
@@ -371,6 +374,12 @@ struct Engine::Impl {
                 hc_norm_scaled[n] = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, w->ne);
             }
         }
+        if (c.architecture == Architecture::Qwen4Exp)
+            for (int l = 0; l < c.layers; ++l) {
+                if (!c.is_recurrent(l)) continue;
+                auto * w = model.at("blk." + std::to_string(l) + ".gdn.a_log");
+                if (w->type == GGML_TYPE_F32) gdn_neg_exp_a[l] = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, w->ne);
+            }
         state_buffer.reset(ggml_backend_alloc_ctx_tensors(ctx, backend.get()));
         if (!state_buffer) throw std::runtime_error("State allocation failed");
 
@@ -510,11 +519,13 @@ struct Engine::Impl {
         return ggml_rope_ext(g.c(), x, positions, nullptr, c.rope_dim,
                              GGML_ROPE_TYPE_NEOX, c.context, c.rope_base, 1, 0, 1, 0, 0);
     }
-    // The state buffer is cleared by reset(), so the scaled copies are rebuilt there.
-    void refresh_hc_norms() {
-        if (hc_norm_scaled.empty()) return;
-        Graph g(backend.get(), stats, options.backend == "cuda", profiler, "init.hc_norm", 0, -1, nullptr, nullptr, 4096);
+    // The state buffer is cleared by reset(), so derived constants are rebuilt there.
+    void refresh_derived_weights() {
+        if (hc_norm_scaled.empty() && gdn_neg_exp_a.empty()) return;
+        Graph g(backend.get(), stats, options.backend == "cuda", profiler, "init.derived", 0, -1, nullptr, nullptr, 4096);
         for (const auto & [n, t] : hc_norm_scaled) g.add(ggml_cpy(g.c(), ggml_scale(g.c(), weight(n), 1.0f / c.branches), t));
+        for (const auto & [l, t] : gdn_neg_exp_a)
+            g.add(ggml_cpy(g.c(), ggml_neg(g.c(), ggml_exp(g.c(), weight("blk." + std::to_string(l) + ".gdn.a_log"))), t));
         g.run();
     }
     Mixed mix(Graph & g, ggml_tensor * h, const std::string & p, bool inject = true) {
@@ -697,7 +708,9 @@ struct Engine::Impl {
         }
         auto * a = ggml_softplus(g.c(), ggml_add(g.c(), mm(g, p + "gdn.a", mixed.value), weight(p + "gdn.dt_bias")));
         // qwen35 GGUF stores -exp(A_log), while the tidal schema stores A_log.
+        const auto neg_exp = gdn_neg_exp_a.find(layer);
         auto * decay = c.architecture == Architecture::Qwen35 ? ggml_mul(g.c(), weight(p + "gdn.a_log"), a)
+            : neg_exp != gdn_neg_exp_a.end() ? ggml_mul(g.c(), neg_exp->second, a)   // -(e*a) == (-e)*a exactly
             : ggml_neg(g.c(), ggml_mul(g.c(), ggml_exp(g.c(), weight(p + "gdn.a_log")), a));
         auto * beta = ggml_sigmoid(g.c(), mm(g, p + "gdn.b", mixed.value));
         decay = ggml_reshape_4d(g.c(), decay, 1, c.gdn_value_heads, 1, 1);
@@ -1667,7 +1680,7 @@ struct Engine::Impl {
             std::vector<int32_t> ids(c.context); std::iota(ids.begin(), ids.end(), 0);
             ggml_backend_tensor_set(kv_token_ids, ids.data(), 0, ids.size()*sizeof(int32_t));
         }
-        refresh_hc_norms();
+        refresh_derived_weights();
         previous_tokens.clear();
         captured_logits.clear();
         sampler->reset();
