@@ -54,6 +54,17 @@ int main(int argc, char ** argv) {
             require(flash==int(stats.prefill_gpu_attention_calls) && batched_mm && transfer,"Batch kernels or async transfer not profiled");
         }
         const auto continuation=engine.decode(17);
+        {
+            // FP16 CPU KV follows the same prefill/decode path as BF16 within the
+            // 16-bit rounding difference, with identical causal selections.
+            auto half_options=options; half_options.profile=tidal::ProfileMode::Off;
+            half_options.cpu_kv_precision=tidal::CpuKVPrecision::FP16;
+            auto bf16_options=half_options; bf16_options.cpu_kv_precision=tidal::CpuKVPrecision::BF16;
+            tidal::Engine half(argv[1],half_options), bf16(argv[1],bf16_options);
+            const auto a=bf16.prefill(tokens), b=half.prefill(tokens);
+            for (size_t i=0;i<a.size();++i) close(a[i],b[i],.01f);
+            for (int t:{17,4,99}) close(bf16.decode(t),half.decode(t),.01f);
+        }
         engine.reset();
         for (size_t i=0;i<tokens.size();++i) close(expected[i],engine.decode(tokens[i]),gpu?.004f:0.f);
         close(continuation,engine.decode(17),gpu?.004f:0.f);

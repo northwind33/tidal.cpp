@@ -27,7 +27,8 @@ execute on CUDA. Attention uses ggml FlashAttention with bounded query tiles;
 there is no CPU attention fallback. Unsupported head widths are zero-padded to a
 supported width while retaining the original attention scale.
 
-With the default `--kv-placement cpu`, canonical KV remains BF16. New KV is produced on GPU and
+With the default `--kv-placement cpu`, canonical KV is BF16 unless `--cpu-kv-precision fp16`
+selects FP16 (see below). New KV is produced on GPU and
 exported through a separate CUDA stream using pinned host staging. The transfer
 owns its source allocation until completion. A bounded queue prevents outstanding
 copies from retaining an unbounded number of GPU caches. Before prefill returns,
@@ -164,6 +165,13 @@ The CLI and benchmark accept:
   default `cpu`. GPU placement requires CUDA.
 - `--prefill-precision fp16|bf16`: GPU attention working KV format, also used for
   persistent KV and decoding with `--kv-placement gpu`.
+- `--cpu-kv-precision bf16|fp16`: 16-bit type of the CPU KV cache with
+  `--kv-placement cpu`; default `bf16`. FP16 has a 10-bit mantissa and is read
+  with F16C conversion on the CPU, but its range ends at 65504. Prefill exports
+  FP16 rows produced on the GPU, and decode converts on the host. A key or value
+  above that range, or NaN, stops the engine with an error naming the layer
+  (and position in decode); nothing is saturated and there is no fallback.
+  Call `reset()` and use `bf16` for such a model.
 - `--prefill-memory-mib N`: optional managed weight/workspace cap for pressure
   experiments; zero uses live availability.
 - `--prefill-reserve-mib auto|N`: device headroom, default `auto`.

@@ -107,7 +107,7 @@ and CPU worker heads execute concurrently. Do not sum all categories to obtain
 inference time. Worker lanes in the exported trace are labelled by the first query
 head of the task's group; tasks from one call run concurrently on the pool.
 Transfer byte counts are actual API payload sizes;
-node bytes are logical output size; CPU QK/V bytes are the BF16 cache rows a task
+node bytes are logical output size; CPU QK/V bytes are the 16-bit cache rows a task
 reads, once for its whole query-head group.
 
 `--json` stores every event plus aggregates grouped by category, phase, layer,

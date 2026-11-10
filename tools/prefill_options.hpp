@@ -4,7 +4,7 @@
 #include <ostream>
 
 inline std::vector<std::string> prefill_options(std::vector<std::string> names) {
-    for (const char * name : {"--kv-placement", "--prefill-precision", "--prefill-chunk", "--prefill-tile", "--prefill-memory-mib", "--prefill-reserve-mib"}) names.emplace_back(name);
+    for (const char * name : {"--kv-placement", "--cpu-kv-precision", "--prefill-precision", "--prefill-chunk", "--prefill-tile", "--prefill-memory-mib", "--prefill-reserve-mib"}) names.emplace_back(name);
     return names;
 }
 inline void configure_prefill(const Args & args, tidal::Options & options) {
@@ -12,6 +12,10 @@ inline void configure_prefill(const Args & args, tidal::Options & options) {
     if (placement == "cpu") options.kv_placement = tidal::KVPlacement::CPU;
     else if (placement == "gpu") options.kv_placement = tidal::KVPlacement::GPU;
     else throw std::invalid_argument("--kv-placement must be cpu or gpu");
+    const auto cpu_kv = args.get("--cpu-kv-precision", "bf16");
+    if (cpu_kv == "bf16") options.cpu_kv_precision = tidal::CpuKVPrecision::BF16;
+    else if (cpu_kv == "fp16") options.cpu_kv_precision = tidal::CpuKVPrecision::FP16;
+    else throw std::invalid_argument("--cpu-kv-precision must be bf16 or fp16");
     const auto precision = args.get("--prefill-precision", "fp16");
     if (precision == "fp16") options.prefill_precision = tidal::PrefillPrecision::FP16;
     else if (precision == "bf16") options.prefill_precision = tidal::PrefillPrecision::BF16;
@@ -34,18 +38,20 @@ inline void configure_prefill(const Args & args, tidal::Options & options) {
     options.prefill_memory_reserve = reserve_text == "auto" ? UINT64_MAX : uint64_t(reserve)*1024*1024;
 }
 inline void prefill_help(std::ostream & out) {
-    out << "  [--kv-placement cpu|gpu] [--prefill-precision fp16|bf16]\n"
+    out << "  [--kv-placement cpu|gpu] [--cpu-kv-precision bf16|fp16] [--prefill-precision fp16|bf16]\n"
            "  [--prefill-chunk auto|N] [--prefill-tile auto|N]\n"
            "  [--prefill-memory-mib 0] [--prefill-reserve-mib auto|MiB]\n"
            "CUDA prefill processes all prompt tokens in each layer before advancing.\n"
            "Chunks bound intermediate tensors; tiles bound attention queries (1-4096).\n"
            "Auto sizes shrink on pre-compute allocation failure; explicit sizes fail.\n"
            "Memory 0 uses live free VRAM; automatic reserve leaves kernel headroom.\n"
-           "KV defaults to CPU BF16. GPU KV requires CUDA, stays on GPU during decode,\n"
+           "KV defaults to CPU BF16; --cpu-kv-precision fp16 stores CPU KV as FP16 and fails\n"
+           "on |K| or |V| > 65504. GPU KV requires CUDA, stays on GPU during decode,\n"
            "and uses --prefill-precision for persistent KV as well. Set --context to fit VRAM.\n";
 }
 inline const char * kv_type_name(const tidal::Options & o) {
-    return o.kv_placement == tidal::KVPlacement::CPU || o.prefill_precision == tidal::PrefillPrecision::BF16 ? "BF16" : "F16";
+    if (o.kv_placement == tidal::KVPlacement::CPU) return o.cpu_kv_precision == tidal::CpuKVPrecision::FP16 ? "F16" : "BF16";
+    return o.prefill_precision == tidal::PrefillPrecision::BF16 ? "BF16" : "F16";
 }
 inline const char * decode_attention_backend(const tidal::Options & o) {
     return o.kv_placement == tidal::KVPlacement::GPU ? "CUDA" : "CPU";

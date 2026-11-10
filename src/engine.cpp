@@ -303,8 +303,9 @@ struct Engine::Impl {
         : options(std::move(opts)), backend(make_backend(options)), model(path, backend.get()), c(model.config),
           profiler(options.profile, options.nvtx, options.profile_event_limit), state_context(context(1024 * 1024)), states(c.layers) {
         if (options.prefill_chunk_tokens < 0 || options.prefill_attention_tile < 0 || options.prefill_attention_tile > 4096 ||
-            (options.prefill_precision != PrefillPrecision::FP16 && options.prefill_precision != PrefillPrecision::BF16))
-            throw std::invalid_argument("Invalid prefill precision or attention tile");
+            (options.prefill_precision != PrefillPrecision::FP16 && options.prefill_precision != PrefillPrecision::BF16) ||
+            (options.cpu_kv_precision != CpuKVPrecision::BF16 && options.cpu_kv_precision != CpuKVPrecision::FP16))
+            throw std::invalid_argument("Invalid prefill/CPU KV precision or attention tile");
         if (options.context < 0 || options.context > c.context) throw std::invalid_argument("Invalid runtime context capacity");
         if (options.context) c.context = options.context;
         auto * ctx = state_context.get();
@@ -334,7 +335,7 @@ struct Engine::Impl {
                 } else {
                     if (!attention_pool) attention_pool = std::make_shared<WorkerPool>(options.threads);
                     s.attention = std::make_unique<SparseAttention>(c.q_heads, c.kv_heads, c.head_dim,
-                                                                   c.context, options.threads, attention_pool);
+                                                                   c.context, options.threads, attention_pool, cpu_kv_type());
                 }
             }
         }
@@ -361,6 +362,7 @@ struct Engine::Impl {
         sampler = std::make_unique<Sampler>(c.vocab, options.sampling, backend.get(), options.device, stats, profiler);
         reset();
     }
+    ggml_type cpu_kv_type() const { return options.cpu_kv_precision == CpuKVPrecision::FP16 ? GGML_TYPE_F16 : GGML_TYPE_BF16; }
     Graph graph(const std::string & phase, int layer = -1, int token_offset = 0) {
         return Graph(prefill_backend ? prefill_backend.get() : backend.get(), stats, options.backend == "cuda", profiler, phase, position + token_offset, layer, prefill_memory);
     }
@@ -1051,8 +1053,8 @@ struct Engine::Impl {
             if (state.device_kv_size != position) throw std::logic_error("GPU KV prefix is inconsistent");
         } else {
             cache = std::make_shared<PrefillTensorStorage>(*prefill_memory, prefill_backend.get());
-            keys = cache->tensor(GGML_TYPE_BF16, kvwidth, total);
-            values = cache->tensor(GGML_TYPE_BF16, kvwidth, total);
+            keys = cache->tensor(cpu_kv_type(), kvwidth, total);
+            values = cache->tensor(cpu_kv_type(), kvwidth, total);
             cache->allocate();
             compute_keys = layout.tensor(compute_type, dim, padded, c.kv_heads);
             compute_values = layout.tensor(compute_type, dim, padded, c.kv_heads);
@@ -1081,7 +1083,7 @@ struct Engine::Impl {
         if (position && !device_kv) {
             if (state.attention->size() != position) throw std::logic_error("Prefill KV prefix is inconsistent");
             auto g = graph("prefill.attention.prefix", layer);
-            const size_t bytes = size_t(position)*kvwidth*sizeof(ggml_bf16_t);
+            const size_t bytes = size_t(position)*kvwidth*sizeof(uint16_t);
             g.put(keys, state.attention->keys(), bytes);
             g.put(values, state.attention->values(), bytes);
             convert(0, position);
@@ -1511,7 +1513,11 @@ struct Engine::Impl {
             auto start = Clock::now();
             ProfileScope append(&profiler, "cpu", "kv_append_bf16", phase, position, layer, "CPU");
             append.event.bytes = (keys.size() + values.size()) * sizeof(ggml_bf16_t);
-            s.attention->append(keys, values);
+            try { s.attention->append(keys, values); }
+            catch (const std::overflow_error & error) {
+                throw std::overflow_error(std::string(error.what()) + " in layer " + std::to_string(layer) + " at position " +
+                    std::to_string(position) + "; use --cpu-kv-precision bf16 for this model");
+            }
             append.finish();
             ProfileScope attention_scope(&profiler, "cpu", seg.sparse ? "sparse_attention" : "full_attention", phase, position, layer, "CPU");
             auto output = s.attention->attend(queries, selected, &profiler, position, layer, phase);

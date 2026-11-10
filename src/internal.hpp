@@ -118,11 +118,14 @@ private:
 class SparseAttention {
 public:
     SparseAttention(int heads, int kv_heads, int dim, int capacity, int threads,
-                    std::shared_ptr<WorkerPool> pool = nullptr);
+                    std::shared_ptr<WorkerPool> pool = nullptr, ggml_type type = GGML_TYPE_BF16);
     void append(const std::vector<float> & key, const std::vector<float> & value);
-    void append_bf16(const ggml_bf16_t * key, const ggml_bf16_t * value, int tokens);
-    const ggml_bf16_t * keys() const { return keys_.data(); }
-    const ggml_bf16_t * values() const { return values_.data(); }
+    // Appends rows already in the cache's 16-bit type(); FP16 rows holding
+    // Inf/NaN (a device-side overflow) are rejected with std::overflow_error.
+    void append_raw(const uint16_t * key, const uint16_t * value, int tokens);
+    ggml_type type() const { return type_; }
+    const uint16_t * keys() const { return keys_.data(); }
+    const uint16_t * values() const { return values_.data(); }
     std::vector<float> attend(const std::vector<float> & query,
                               const std::vector<int32_t> & selected, Profiler * profiler = nullptr,
                               int position = -1, int layer = -1,
@@ -131,8 +134,9 @@ public:
     int size() const { return size_; }
 private:
     int heads_, kv_heads_, dim_, capacity_, threads_, size_ = 0;
+    ggml_type type_;
     std::shared_ptr<WorkerPool> pool_;
-    std::vector<ggml_bf16_t> keys_, values_;
+    std::vector<uint16_t> keys_, values_;
 };
 std::vector<int32_t> expand_blocks(const std::vector<int32_t> & blocks,
                                   int visible, int block_size);

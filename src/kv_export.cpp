@@ -34,15 +34,15 @@ void KVExporter::reap() {
 void KVExporter::finish() { while (!pending_.empty()) finish_front(); }
 void KVExporter::enqueue(std::shared_ptr<void> owner, ggml_tensor * keys, ggml_tensor * values,
                          SparseAttention & destination, int start, int count, int layer) {
-    if (count <= 0 || start != destination.size() || keys->type != GGML_TYPE_BF16 || values->type != GGML_TYPE_BF16 ||
+    if (count <= 0 || start != destination.size() || keys->type != destination.type() || values->type != destination.type() ||
         !ggml_is_contiguous(keys) || !ggml_is_contiguous(values) || !ggml_are_same_shape(keys, values) ||
         keys->ne[1] < start + count || keys->ne[2] != 1 || keys->ne[3] != 1)
-        throw std::invalid_argument("Invalid contiguous BF16 KV export range");
+        throw std::invalid_argument("Invalid contiguous 16-bit KV export range");
     reap();
     // Bound both pinned memory and outstanding source buffers. Attention and FFN
     // can still overlap the current layer's transfer on a separate stream.
     if (pending_.size() >= 2) finish_front();
-    const size_t row_bytes = size_t(keys->ne[0]) * sizeof(ggml_bf16_t);
+    const size_t row_bytes = size_t(keys->ne[0]) * sizeof(uint16_t);
     const int chunk_rows = int(std::min<size_t>(size_t(count), std::max<size_t>(1, (32ull * 1024 * 1024) / row_bytes)));
     const size_t half_bytes = size_t(chunk_rows) * row_bytes;
     Pending item;
@@ -68,8 +68,13 @@ void KVExporter::enqueue(std::shared_ptr<void> owner, ggml_tensor * keys, ggml_t
                 transfer_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tick).count();
                 copy.finish();
                 ProfileScope commit(&profiler_, "host", "kv_commit_bf16", "prefill.kv", start + offset, layer, "CPU");
-                destination.append_bf16(reinterpret_cast<const ggml_bf16_t *>(host),
-                                        reinterpret_cast<const ggml_bf16_t *>(host + half_bytes), rows);
+                try {
+                    destination.append_raw(reinterpret_cast<const uint16_t *>(host),
+                                           reinterpret_cast<const uint16_t *>(host + half_bytes), rows);
+                } catch (const std::overflow_error & error) {
+                    throw std::overflow_error(std::string(error.what()) + " in layer " + std::to_string(layer) +
+                        " during prefill; use --cpu-kv-precision bf16 for this model");
+                }
             }
         } catch (...) { ggml_backend_synchronize(transfer_.get()); throw; }
         return transfer_ms;

@@ -112,6 +112,54 @@ int main() {
             }
         }
         {
+            // FP16 CPU KV: same grouped kernel over FP16-rounded K/V, and range checks.
+            const int heads = 6, kv = 2, dim = 64, tokens = 70;
+            tidal::SparseAttention h(heads, kv, dim, tokens + 1, 3, nullptr, GGML_TYPE_F16);
+            uint32_t seed = 11;
+            auto next = [&] { seed = seed * 1664525u + 1013904223u; return float(int(seed >> 9) % 2001 - 1000) / 125.0f; };
+            std::vector<std::vector<float>> keys, values;
+            for (int t = 0; t < tokens; ++t) {
+                std::vector<float> k(size_t(kv) * dim), v(size_t(kv) * dim);
+                for (auto & x : k) x = next(); for (auto & x : v) x = next();
+                h.append(k, v); keys.push_back(k); values.push_back(v);
+            }
+            std::vector<float> query(size_t(heads) * dim);
+            for (auto & x : query) x = next() / 16;
+            std::vector<int32_t> all(tokens); std::iota(all.begin(), all.end(), 0);
+            const auto out = h.attend(query, all);
+            auto half = [](float x) { return ggml_fp16_to_fp32(ggml_fp32_to_fp16(x)); };
+            for (int r = 0; r < heads; ++r) {
+                const int g = r / (heads / kv);
+                std::vector<double> score;
+                for (int t = 0; t < tokens; ++t) {
+                    double dot = 0;
+                    for (int d = 0; d < dim; ++d) dot += double(query[size_t(r) * dim + d]) * half(keys[t][size_t(g) * dim + d]);
+                    score.push_back(dot / std::sqrt(double(dim)));
+                }
+                const double top = *std::max_element(score.begin(), score.end());
+                double sum = 0; for (auto & x : score) sum += (x = std::exp(x - top));
+                for (int d = 0; d < dim; ++d) {
+                    double expected = 0;
+                    for (int t = 0; t < tokens; ++t) expected += score[t] / sum * half(values[t][size_t(g) * dim + d]);
+                    require(std::abs(out[size_t(r) * dim + d] - expected) <= 1e-4 + 1e-4 * std::abs(expected), "FP16 KV attention differs from the reference");
+                }
+            }
+            std::vector<float> big(size_t(kv) * dim, 1.0f); big[3] = 70000.0f;
+            bool rejected = false;
+            try { h.append(std::vector<float>(size_t(kv) * dim, 1.0f), big); } catch (const std::overflow_error &) { rejected = true; }
+            require(rejected && h.size() == tokens, "FP16 KV accepted a value above 65504");
+            std::vector<float> nan(size_t(kv) * dim, std::nanf(""));
+            rejected = false;
+            try { h.append(nan, std::vector<float>(size_t(kv) * dim)); } catch (const std::overflow_error &) { rejected = true; }
+            require(rejected && h.size() == tokens, "FP16 KV accepted NaN");
+            std::vector<uint16_t> raw(size_t(kv) * dim, 0x3c00), inf = raw; inf[7] = 0xfc00;
+            rejected = false;
+            try { h.append_raw(raw.data(), inf.data(), 1); } catch (const std::overflow_error &) { rejected = true; }
+            require(rejected && h.size() == tokens, "FP16 KV accepted an Inf row");
+            h.append(std::vector<float>(size_t(kv) * dim, 65504.0f), std::vector<float>(size_t(kv) * dim, -65504.0f));
+            require(h.size() == tokens + 1, "FP16 KV rejected the largest finite value");
+        }
+        {
             // Every task of every run executes exactly once, including runs with
             // fewer tasks than workers and back-to-back runs on the same pool.
             tidal::WorkerPool pool(4);

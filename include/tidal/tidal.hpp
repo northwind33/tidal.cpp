@@ -69,6 +69,8 @@ enum class ProfileMode { Off, Phases, Nodes };
 
 enum class SamplingBackend { Device, CPU };
 enum class PrefillPrecision { FP16, BF16 };
+// 16-bit type of the CPU-resident KV cache (default CPU KV placement).
+enum class CpuKVPrecision { BF16, FP16 };
 enum class KVPlacement { CPU, GPU };
 
 struct SamplingConfig {
@@ -120,6 +122,10 @@ struct Options {
     // Benchmark alternative: persistent CUDA KV and attention in both phases.
     // GPU KV uses prefill_precision directly; CPU KV remains canonical BF16.
     KVPlacement kv_placement = KVPlacement::CPU;
+    // BF16 keeps the F32 exponent range. FP16 has a 10-bit mantissa and matches
+    // the FP16 prefill/attention format, but rejects |K| or |V| above 65504 with
+    // an error (no silent saturation or fallback).
+    CpuKVPrecision cpu_kv_precision = CpuKVPrecision::BF16;
 };
 
 struct Selection {

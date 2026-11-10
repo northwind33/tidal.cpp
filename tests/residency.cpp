@@ -179,7 +179,8 @@ int main(int argc, char ** argv) {
             ggml_backend_tensor_set(keys,original_keys.data(),0,ggml_nbytes(keys));
             ggml_backend_tensor_set(values,original_values.data(),0,ggml_nbytes(values));
             tidal::SparseAttention destination(1,1,width,count,1);
-            destination.append_bf16(original_keys.data(),original_values.data(),prefix);
+            destination.append_raw(reinterpret_cast<const uint16_t*>(original_keys.data()),
+                                   reinterpret_cast<const uint16_t*>(original_values.data()),prefix);
             const auto before=stats.prefill_kv_to_host_bytes;
             std::weak_ptr<tidal::PrefillTensorStorage> lifetime=source;
             tidal::KVExporter exporter(0,stats,profile);
@@ -193,6 +194,21 @@ int main(int argc, char ** argv) {
                 std::memcmp(destination.keys(),original_keys.data(),original_keys.size()*sizeof(ggml_bf16_t)) ||
                 std::memcmp(destination.values(),original_values.data(),original_values.size()*sizeof(ggml_bf16_t)))
                 throw std::runtime_error("Chunked asynchronous KV export changed bytes, prefix or lifetime");
+            // FP16 CPU KV: a device-side overflow (Inf) must fail the export, not be stored.
+            auto f16 = std::make_shared<tidal::PrefillTensorStorage>(export_memory, backend.get());
+            auto * fk=f16->tensor(GGML_TYPE_F16,width,4), * fv=f16->tensor(GGML_TYPE_F16,width,4);
+            f16->allocate();
+            std::vector<uint16_t> half_keys(size_t(width)*4, 0x3c00), half_values(half_keys.size(), 0xbc00);
+            half_values[size_t(width)*2+5]=0x7c00;
+            ggml_backend_tensor_set(fk,half_keys.data(),0,ggml_nbytes(fk));
+            ggml_backend_tensor_set(fv,half_values.data(),0,ggml_nbytes(fv));
+            tidal::SparseAttention half(1,1,width,4,1,nullptr,GGML_TYPE_F16);
+            bool rejected=false;
+            exporter.enqueue(f16,fk,fv,half,0,4,5);
+            try { exporter.finish(); } catch (const std::overflow_error & e) {
+                rejected=std::string(e.what()).find("layer 5")!=std::string::npos && half.size()==0;
+            }
+            if (!rejected) throw std::runtime_error("FP16 KV export accepted an overflowed row");
         }
         std::cout << "Residency priority, release/reload bytes, pending-copy lifetime and aliases passed\n";
     } catch (const std::exception & e) { std::cerr << e.what() << '\n'; return 1; }

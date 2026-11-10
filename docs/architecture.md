@@ -149,7 +149,8 @@ and FP16/BF16 working storage for FlashAttention.
 | Matrix weights, including expert stacks | Any supported weight storage format |
 | Norm gamma, convolution weights, A-log and dt bias | F32 |
 | Graph activations, GDN recurrent/conv state, PLE conv state, raw index ring | F32 |
-| Compressed index cache, host main KV cache | BF16 |
+| Compressed index cache | BF16 |
+| Host main KV cache | BF16 (default) or FP16 with `cpu_kv_precision` |
 | Full or sparse attention scores, softmax, weighted values | F32 |
 
 GGUF norm tensors contain the effective gamma, i.e. the reference's `(1 + weight)`
