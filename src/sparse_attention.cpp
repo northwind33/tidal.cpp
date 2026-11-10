@@ -108,16 +108,25 @@ __attribute__((target("avx2,fma"))) inline __m256 hsum8(const __m256 * v) {
     const __m256 b = _mm256_hadd_ps(_mm256_hadd_ps(v[4], v[5]), _mm256_hadd_ps(v[6], v[7]));
     return _mm256_add_ps(_mm256_permute2f128_ps(a, b, 0x20), _mm256_permute2f128_ps(a, b, 0x31));
 }
+// KV rows of one head are 256-512 B spread at kv_heads * width strides, so the
+// hardware prefetcher (bounded by 4-KiB pages) cannot run ahead; prefetch rows.
+inline void prefetch_row(const uint16_t * row, int dim) {
+    const char * p = reinterpret_cast<const char *>(row);
+    for (int b = 0; b < dim * 2; b += 64) _mm_prefetch(p + b, _MM_HINT_T0);
+}
 template<bool F16> __attribute__((target("avx2,fma,f16c"))) void widen_row(const uint16_t * x, float * out, int dim) {
     for (int d = 0; d < dim; d += 8) _mm256_storeu_ps(out + d, load16<F16>(x + d));
 }
 // QK for 4 tokens (pre-widened rows kf[4][dim]) and heads h, h+1 -> scores.
 __attribute__((target("avx2,fma"))) inline void qk_tile(const float * q0, const float * q1, const float * kf, int dim,
                                                        float inv_scale, float * s0, float * s1, int valid) {
+    // The unroll pragmas keep the accumulator arrays in registers at -O2.
     __m256 acc[8];
-    for (auto & a : acc) a = _mm256_setzero_ps();
+#pragma GCC unroll 8
+    for (int j = 0; j < 8; ++j) acc[j] = _mm256_setzero_ps();
     for (int d = 0; d < dim; d += 8) {
         const __m256 a = _mm256_loadu_ps(q0 + d), b = _mm256_loadu_ps(q1 + d);
+#pragma GCC unroll 4
         for (int j = 0; j < 4; ++j) {
             const __m256 k = _mm256_loadu_ps(kf + size_t(j) * dim + d);
             acc[j] = _mm256_fmadd_ps(a, k, acc[j]);
@@ -134,16 +143,25 @@ template<bool F16, int H, int TW> __attribute__((target("avx2,fma,f16c")))
 void v_tile(float * acc, int dim, const float * prob, size_t pstride, const uint16_t * const * rows, int count) {
     for (int d0 = 0; d0 < dim; d0 += 8 * TW) {
         __m256 a[H][TW];
-        for (int h = 0; h < H; ++h) for (int w = 0; w < TW; ++w) a[h][w] = _mm256_loadu_ps(acc + size_t(h) * dim + d0 + 8 * w);
+#pragma GCC unroll 16
+        for (int h = 0; h < H; ++h)
+#pragma GCC unroll 2
+            for (int w = 0; w < TW; ++w) a[h][w] = _mm256_loadu_ps(acc + size_t(h) * dim + d0 + 8 * w);
         for (int t = 0; t < count; ++t) {
             __m256 v[TW];
+#pragma GCC unroll 2
             for (int w = 0; w < TW; ++w) v[w] = load16<F16>(rows[t] + d0 + 8 * w);
+#pragma GCC unroll 16
             for (int h = 0; h < H; ++h) {
                 const __m256 p = _mm256_broadcast_ss(prob + size_t(h) * pstride + t);
+#pragma GCC unroll 2
                 for (int w = 0; w < TW; ++w) a[h][w] = _mm256_fmadd_ps(p, v[w], a[h][w]);
             }
         }
-        for (int h = 0; h < H; ++h) for (int w = 0; w < TW; ++w) _mm256_storeu_ps(acc + size_t(h) * dim + d0 + 8 * w, a[h][w]);
+#pragma GCC unroll 16
+        for (int h = 0; h < H; ++h)
+#pragma GCC unroll 2
+            for (int w = 0; w < TW; ++w) _mm256_storeu_ps(acc + size_t(h) * dim + d0 + 8 * w, a[h][w]);
     }
 }
 template<bool F16> using VTile = void (*)(float *, int, const float *, size_t, const uint16_t * const *, int);
@@ -174,8 +192,11 @@ void tiled_task(const float * q, int group, int dim, const uint16_t * const * kr
     const float inv_scale = 1.0f / std::sqrt(float(dim));
     ProfileScope qk(profiler, "cpu_head", "qk", phase, position, layer, "CPU", head);
     qk.event.bytes = size_t(count) * dim * sizeof(uint16_t);
+    constexpr int ahead = 16;
+    for (int t = 0; t < std::min(count, ahead); ++t) prefetch_row(krows[t], dim);
     for (int t0 = 0; t0 < count; t0 += 4) {
         const int valid = std::min(4, count - t0);
+        for (int t = t0 + ahead; t < std::min(count, t0 + ahead + 4); ++t) prefetch_row(krows[t], dim);
         for (int j = 0; j < 4; ++j) {
             if (j < valid) widen_row<F16>(krows[t0 + j], widened.data() + size_t(j) * dim, dim);
             else std::fill(widened.begin() + size_t(j) * dim, widened.begin() + size_t(j + 1) * dim, 0.0f);
@@ -215,8 +236,11 @@ void tiled_task(const float * q, int group, int dim, const uint16_t * const * kr
     for (int h0 = 0; h0 < group; h0 += 12) {
         const int heads = std::min(12, group - h0);
         const auto tile = v_tile_select<F16>(heads, dim);
-        for (int t0 = 0; t0 < count; t0 += block)
+        if (!h0) for (int t = 0; t < std::min(count, block); ++t) prefetch_row(vrows[t], dim);
+        for (int t0 = 0; t0 < count; t0 += block) {
+            if (!h0) for (int t = t0 + block; t < std::min(count, t0 + 2 * block); ++t) prefetch_row(vrows[t], dim);
             tile(acc + size_t(h0) * dim, dim, scores.data() + size_t(h0) * stride + t0, stride, vrows + t0, std::min(block, count - t0));
+        }
     }
 }
 #endif
