@@ -360,7 +360,9 @@ struct Engine::Impl {
                                   ggml_tensor * mask, int count, int visible) {
         q = ggml_cont(g.c(), ggml_permute(g.c(), q, 0, 2, 1, 3));
         q = ggml_pad(g.c(), q, attention_dim()-c.head_dim, 0, 0, 0);
-        mask = ggml_cast(g.c(), ggml_pad(g.c(), mask, 0, (64-count%64)%64, 0, 0), GGML_TYPE_F16);
+        // A decode graph passes one ready F16 mask shared by every layer.
+        if (mask->type != GGML_TYPE_F16)
+            mask = ggml_cast(g.c(), ggml_pad(g.c(), mask, 0, (64-count%64)%64, 0, 0), GGML_TYPE_F16);
         auto prefix = [&](ggml_tensor * t) {
             return ggml_view_3d(g.c(), t, attention_dim(), (visible+255)/256*256, c.kv_heads, t->nb[1], t->nb[2], 0);
         };
@@ -1318,7 +1320,9 @@ struct Engine::Impl {
             g.token_input = g.input(GGML_TYPE_I32, 1);
             g.position_input = g.input(GGML_TYPE_I32, 1);
             g.kv_row_input = g.input(GGML_TYPE_I64, 1);
-            g.mask_input = g.input(GGML_TYPE_F32, padded);
+            // Qwen3.5 consumes the mask directly as F16; QSA derives its sparse
+            // mask from an F32 causal mask.
+            g.mask_input = g.input(reusable ? GGML_TYPE_F16 : GGML_TYPE_F32, padded);
             // Only one mask entry is updated per token, so the allocator must not
             // reuse this tensor's memory for intermediates after its last reader.
             ggml_set_output(g.mask_input);
@@ -1339,10 +1343,16 @@ struct Engine::Impl {
             g.reserve();
             std::vector<float> mask(padded, -INFINITY);
             std::fill(mask.begin(), mask.begin()+position+1, 0.0f);
-            g.put(g.mask_input, mask.data(), mask.size()*sizeof(float));
+            if (g.mask_input->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> half(mask.size());
+                ggml_fp32_to_fp16_row(mask.data(), half.data(), int64_t(mask.size()));
+                g.put(g.mask_input, half.data(), half.size()*sizeof(ggml_fp16_t));
+            } else {
+                g.put(g.mask_input, mask.data(), mask.size()*sizeof(float));
+            }
         } else {
-            const float unmasked = 0.0f;
-            decode_graph->put_at(decode_graph->mask_input, &unmasked, size_t(position)*sizeof(float), sizeof(float));
+            const ggml_fp16_t unmasked = ggml_fp32_to_fp16(0.0f);
+            decode_graph->put_at(decode_graph->mask_input, &unmasked, size_t(position)*sizeof(unmasked), sizeof(unmasked));
         }
         auto & g = *decode_graph;
         const int64_t row = position;
