@@ -59,6 +59,17 @@ blocks and the incomplete tail; its finite-entry bound allows ggml to select a
 sparse-gather kernel when supported. Prefix extension, decode-to-prefill and reset
 use the same persistent cache. No implicit switch to CPU occurs on exhaustion.
 
+Because no decode work leaves the device in this mode, a compact decode step
+(`decode(token, false)`) builds a single graph from the embedding to the logits,
+allocates it from a compute buffer kept across tokens and synchronizes once. For
+Qwen3.5 the token ID, RoPE position, KV destination row and an F16 causal mask
+shared by all attention layers are graph inputs, so the graph is reused until
+the 256-token KV bucket grows, a prefill runs (it may reload weights) or the
+engine is reset; ggml may then replay it as a CUDA graph. `decode_graph_reuses`
+counts reused tokens. QSA and PLE graphs contain position-dependent structure
+and are rebuilt per token. Decode that captures logits keeps the per-layer
+graphs used for diagnostics.
+
 For example:
 
 ```sh

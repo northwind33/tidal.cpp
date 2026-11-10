@@ -84,5 +84,6 @@ inline void prefill_stats(std::ostream & out, const tidal::Statistics & s) {
         << ",\"prefill_attention_max_tile\":" << s.prefill_attention_max_tile
         << ",\"prefill_reserve_bytes\":" << s.prefill_reserve_bytes
         << ",\"gpu_attention_calls\":" << s.gpu_attention_calls
+        << ",\"decode_graph_reuses\":" << s.decode_graph_reuses
         << ",\"gpu_kv_bytes\":" << s.gpu_kv_bytes;
 }
