@@ -1548,10 +1548,10 @@ struct Engine::Impl {
                 }
             }
         }
-        std::vector<float> output(qn * n);
+        std::vector<std::vector<int32_t>> selections(n);
         for (int i = 0; i < n; ++i) {
             const int visible = start + i + 1;
-            std::vector<int32_t> selected;
+            auto & selected = selections[i];
             if (sparse) {
                 std::vector<int32_t> chosen;
                 const int k = seg.top ? int(seg.top->ne[0]) : 0;
@@ -1564,13 +1564,13 @@ struct Engine::Impl {
                 selected.resize(visible);
                 std::iota(selected.begin(), selected.end(), 0);
             }
-            ProfileScope attention_scope(&profiler, "cpu", sparse ? "sparse_attention" : "full_attention", phase, start + i, layer, "CPU");
-            const std::vector<float> query(packed.begin() + qn * i, packed.begin() + qn * (i + 1));
-            const auto result = s.attention->attend(query, selected, &profiler, start + i, layer, phase);
-            std::copy(result.begin(), result.end(), output.begin() + qn * i);
-            ++(sparse ? stats.sparse_attention_calls : stats.full_attention_calls);
-            if (capture) steps[i].selections.push_back({layer, std::move(selected)});
         }
+        ProfileScope attention_scope(&profiler, "cpu", sparse ? "sparse_attention" : "full_attention", phase, start, layer, "CPU");
+        const std::vector<float> queries(packed.begin(), packed.begin() + qn * n);
+        auto output = s.attention->attend_batch(queries, selections, &profiler, start, layer, phase);
+        attention_scope.finish();
+        (sparse ? stats.sparse_attention_calls : stats.full_attention_calls) += uint64_t(n);
+        if (capture) for (int i = 0; i < n; ++i) steps[i].selections.push_back({layer, std::move(selections[i])});
         stats.attention_ms += elapsed(begin);
         return output;
     }

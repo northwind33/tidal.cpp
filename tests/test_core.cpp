@@ -159,6 +159,40 @@ int main() {
             h.append(std::vector<float>(size_t(kv) * dim, 65504.0f), std::vector<float>(size_t(kv) * dim, -65504.0f));
             require(h.size() == tokens + 1, "FP16 KV rejected the largest finite value");
         }
+        for (auto type : {GGML_TYPE_BF16, GGML_TYPE_F16}) {
+            // Multi-query batches over the union of overlapping causal selections
+            // must equal one attend() per query, including queries that select no
+            // token of some union chunk.
+            const int heads = 12, kv = 2, dim = 128, tokens = 900;
+            tidal::SparseAttention m(heads, kv, dim, tokens, 4, nullptr, type);
+            uint32_t seed = 5;
+            auto next = [&] { seed = seed * 1664525u + 1013904223u; return float(int(seed >> 9) % 2001 - 1000) / 250.0f; };
+            for (int t = 0; t < tokens; ++t) {
+                std::vector<float> k(size_t(kv) * dim), v(size_t(kv) * dim);
+                for (auto & x : k) x = next(); for (auto & x : v) x = next();
+                m.append(k, v);
+            }
+            const int n = 5;
+            std::vector<float> queries(size_t(n) * heads * dim);
+            for (auto & x : queries) x = next() / 8;
+            std::vector<std::vector<int32_t>> selections(n);
+            for (int i = 0; i < n; ++i) {
+                const int visible = 700 + i;
+                for (int t = 0; t < visible; ++t)
+                    if (i == 0 ? t < 3 : (t % (i + 2) == 0 || t >= visible - 5)) selections[i].push_back(t);
+            }
+            const auto batch = m.attend_batch(queries, selections);
+            for (int i = 0; i < n; ++i) {
+                const std::vector<float> q(queries.begin() + size_t(i) * heads * dim, queries.begin() + size_t(i + 1) * heads * dim);
+                const auto single = m.attend(q, selections[i]);
+                for (size_t d = 0; d < single.size(); ++d)
+                    require(std::abs(batch[size_t(i) * heads * dim + d] - single[d]) <= 1e-5f + 1e-5f * std::abs(single[d]),
+                            "Multi-query attention differs from per-query attention");
+            }
+            rejects([&] { m.attend_batch(queries, {selections.begin(), selections.end() - 1}); });
+            auto bad = selections; bad[2].push_back(tokens);
+            rejects([&] { m.attend_batch(queries, bad); });
+        }
         {
             // Every task of every run executes exactly once, including runs with
             // fewer tasks than workers and back-to-back runs on the same pool.

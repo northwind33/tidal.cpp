@@ -130,6 +130,12 @@ public:
                               const std::vector<int32_t> & selected, Profiler * profiler = nullptr,
                               int position = -1, int layer = -1,
                               const std::string & phase = "qsa.attention") const;
+    // Queries [n][heads][dim], each with its own sorted causal selection: one
+    // pass over the union of the selections reads each K/V row once.
+    std::vector<float> attend_batch(const std::vector<float> & queries,
+                                    const std::vector<std::vector<int32_t>> & selections, Profiler * profiler = nullptr,
+                                    int position = -1, int layer = -1,
+                                    const std::string & phase = "qsa.attention") const;
     void reset() { size_ = 0; }
     // Drops rows [tokens, size()); prompt-cache rollback rewrites them later.
     void truncate(int tokens) {

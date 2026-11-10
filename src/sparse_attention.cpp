@@ -102,40 +102,42 @@ __attribute__((target("avx2,fma"))) inline __m256 exp256(__m256 x) {
     const __m256i e = _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvtps_epi32(n), _mm256_set1_epi32(127)), 23);
     return _mm256_mul_ps(y, _mm256_castsi256_ps(e));
 }
-// Eight accumulators -> one vector of their horizontal sums, in order.
-__attribute__((target("avx2,fma"))) inline __m256 hsum8(const __m256 * v) {
-    const __m256 a = _mm256_hadd_ps(_mm256_hadd_ps(v[0], v[1]), _mm256_hadd_ps(v[2], v[3]));
-    const __m256 b = _mm256_hadd_ps(_mm256_hadd_ps(v[4], v[5]), _mm256_hadd_ps(v[6], v[7]));
-    return _mm256_add_ps(_mm256_permute2f128_ps(a, b, 0x20), _mm256_permute2f128_ps(a, b, 0x31));
-}
 // KV rows of one head are 256-512 B spread at kv_heads * width strides, so the
 // hardware prefetcher (bounded by 4-KiB pages) cannot run ahead; prefetch rows.
 inline void prefetch_row(const uint16_t * row, int dim) {
     const char * p = reinterpret_cast<const char *>(row);
     for (int b = 0; b < dim * 2; b += 64) _mm_prefetch(p + b, _MM_HINT_T0);
 }
-template<bool F16> __attribute__((target("avx2,fma,f16c"))) void widen_row(const uint16_t * x, float * out, int dim) {
-    for (int d = 0; d < dim; d += 8) _mm256_storeu_ps(out + d, load16<F16>(x + d));
-}
-// QK for 4 tokens (pre-widened rows kf[4][dim]) and heads h, h+1 -> scores.
-__attribute__((target("avx2,fma"))) inline void qk_tile(const float * q0, const float * q1, const float * kf, int dim,
-                                                       float inv_scale, float * s0, float * s1, int valid) {
-    // The unroll pragmas keep the accumulator arrays in registers at -O2.
-    __m256 acc[8];
-#pragma GCC unroll 8
-    for (int j = 0; j < 8; ++j) acc[j] = _mm256_setzero_ps();
+// QK for 2 tokens and H <= 6 query heads, converting the 16-bit K rows on
+// load: 2H accumulators plus two K vectors stay in registers, and each K
+// conversion feeds H FMAs.
+template<bool F16, int H> __attribute__((target("avx2,fma,f16c")))
+void qk_pair(const float * q, int dim, const uint16_t * k0, const uint16_t * k1, float inv_scale,
+             float * scores, size_t stride, int valid) {
+    __m256 a[H][2];
+#pragma GCC unroll 6
+    for (int h = 0; h < H; ++h) { a[h][0] = _mm256_setzero_ps(); a[h][1] = _mm256_setzero_ps(); }
     for (int d = 0; d < dim; d += 8) {
-        const __m256 a = _mm256_loadu_ps(q0 + d), b = _mm256_loadu_ps(q1 + d);
-#pragma GCC unroll 4
-        for (int j = 0; j < 4; ++j) {
-            const __m256 k = _mm256_loadu_ps(kf + size_t(j) * dim + d);
-            acc[j] = _mm256_fmadd_ps(a, k, acc[j]);
-            acc[4 + j] = _mm256_fmadd_ps(b, k, acc[4 + j]);
+        const __m256 x = load16<F16>(k0 + d), y = load16<F16>(k1 + d);
+#pragma GCC unroll 6
+        for (int h = 0; h < H; ++h) {
+            const __m256 w = _mm256_loadu_ps(q + size_t(h) * dim + d);
+            a[h][0] = _mm256_fmadd_ps(w, x, a[h][0]);
+            a[h][1] = _mm256_fmadd_ps(w, y, a[h][1]);
         }
     }
-    alignas(32) float out[8];
-    _mm256_store_ps(out, _mm256_mul_ps(hsum8(acc), _mm256_set1_ps(inv_scale)));
-    for (int j = 0; j < valid; ++j) { s0[j] = out[j]; if (s1) s1[j] = out[4 + j]; }
+#pragma GCC unroll 6
+    for (int h = 0; h < H; ++h) {
+        scores[size_t(h) * stride] = hsum(a[h][0]) * inv_scale;
+        if (valid > 1) scores[size_t(h) * stride + 1] = hsum(a[h][1]) * inv_scale;
+    }
+}
+template<bool F16> using QKPair = void (*)(const float *, int, const uint16_t *, const uint16_t *, float, float *, size_t, int);
+template<bool F16> QKPair<F16> qk_pair_select(int heads) {
+    switch (heads) {
+        case 1: return qk_pair<F16, 1>; case 2: return qk_pair<F16, 2>; case 3: return qk_pair<F16, 3>;
+        case 4: return qk_pair<F16, 4>; case 5: return qk_pair<F16, 5>; default: return qk_pair<F16, 6>;
+    }
 }
 // V accumulation for H heads over a TW*8-wide slice of the head dimension;
 // the H*TW accumulators stay in registers across the token loop.
@@ -185,26 +187,22 @@ template<bool F16> VTile<F16> v_tile_select(int heads, int dim) {
 template<bool F16> __attribute__((target("avx2,fma,f16c")))
 void tiled_task(const float * q, int group, int dim, const uint16_t * const * krows, const uint16_t * const * vrows,
                 int count, float * result, Profiler * profiler, const std::string & phase, int position, int layer, int head) {
-    thread_local std::vector<float> scores, widened;
+    thread_local std::vector<float> scores;
     const size_t stride = (size_t(count) + 7) / 8 * 8;
     scores.assign(stride * group, 0.0f);
-    widened.resize(size_t(4) * dim);
     const float inv_scale = 1.0f / std::sqrt(float(dim));
     ProfileScope qk(profiler, "cpu_head", "qk", phase, position, layer, "CPU", head);
     qk.event.bytes = size_t(count) * dim * sizeof(uint16_t);
     constexpr int ahead = 16;
     for (int t = 0; t < std::min(count, ahead); ++t) prefetch_row(krows[t], dim);
-    for (int t0 = 0; t0 < count; t0 += 4) {
-        const int valid = std::min(4, count - t0);
-        for (int t = t0 + ahead; t < std::min(count, t0 + ahead + 4); ++t) prefetch_row(krows[t], dim);
-        for (int j = 0; j < 4; ++j) {
-            if (j < valid) widen_row<F16>(krows[t0 + j], widened.data() + size_t(j) * dim, dim);
-            else std::fill(widened.begin() + size_t(j) * dim, widened.begin() + size_t(j + 1) * dim, 0.0f);
-        }
-        for (int h = 0; h < group; h += 2) {
-            const bool pair = h + 1 < group;
-            qk_tile(q + size_t(h) * dim, q + size_t(pair ? h + 1 : h) * dim, widened.data(), dim, inv_scale,
-                    scores.data() + size_t(h) * stride + t0, pair ? scores.data() + size_t(h + 1) * stride + t0 : nullptr, valid);
+    for (int t0 = 0; t0 < count; t0 += 2) {
+        const int valid = std::min(2, count - t0);
+        for (int t = t0 + ahead; t < std::min(count, t0 + ahead + 2); ++t) prefetch_row(krows[t], dim);
+        const uint16_t * k1 = krows[valid > 1 ? t0 + 1 : t0];
+        for (int h0 = 0; h0 < group; h0 += 6) {
+            const int heads = std::min(6, group - h0);
+            qk_pair_select<F16>(heads)(q + size_t(h0) * dim, dim, krows[t0], k1, inv_scale,
+                                       scores.data() + size_t(h0) * stride + t0, stride, valid);
         }
     }
     qk.finish();
@@ -484,6 +482,135 @@ std::vector<float> SparseAttention::attend(const std::vector<float> & query,
             }
             for (int d = 0; d < dim_; ++d) out[d] /= denominator;
         }
+    return result;
+}
+
+std::vector<float> SparseAttention::attend_batch(const std::vector<float> & queries,
+                                                const std::vector<std::vector<int32_t>> & selections, Profiler * profiler,
+                                                int position, int layer, const std::string & phase) const {
+    const int n = int(selections.size());
+    const size_t width = size_t(heads_) * dim_;
+    if (!n || queries.size() != width * n) throw std::invalid_argument("Wrong batch query width");
+    // Below four queries the union rarely saves enough DRAM traffic to pay for
+    // the chunked pass; attend each query on its own.
+    if (n < 4) {
+        std::vector<float> result;
+        result.reserve(width * n);
+        for (int i = 0; i < n; ++i) {
+            const std::vector<float> query(queries.begin() + i * width, queries.begin() + (i + 1) * width);
+            const auto out = attend(query, selections[i], profiler, position + i, layer, phase);
+            result.insert(result.end(), out.begin(), out.end());
+        }
+        return result;
+    }
+    // Union of the causal selections; each query masks tokens outside its own.
+    std::vector<int32_t> tokens;
+    for (const auto & selected : selections) {
+        if (selected.empty()) throw std::invalid_argument("Empty attention selection");
+        int previous = -1;
+        for (auto token : selected) {
+            if (token <= previous || token >= size_) throw std::invalid_argument("Non-causal, duplicate or unsorted KV index");
+            previous = token;
+        }
+        tokens.insert(tokens.end(), selected.begin(), selected.end());
+    }
+    std::sort(tokens.begin(), tokens.end());
+    tokens.erase(std::unique(tokens.begin(), tokens.end()), tokens.end());
+    const int64_t u = int64_t(tokens.size());
+    const auto kernel = kernels(dim_, type_ == GGML_TYPE_F16);
+#ifdef TIDAL_X86_KERNELS
+    if (std::string_view(kernel.name) == "avx2") {
+        // Union chunks small enough for their K/V rows to stay in L2 while each
+        // query attends to its own tokens of the chunk: rows shared by several
+        // queries are read from DRAM once, and no query computes extra scores.
+        // A task walks consecutive chunks of one KV head and folds each chunk
+        // into per-query running softmax state (max, sum, unnormalized V).
+        const int group = heads_ / kv_heads_;
+        constexpr int64_t chunk_tokens = 128;
+        const int64_t chunks = (u + chunk_tokens - 1) / chunk_tokens;
+        const int workers = std::min(threads_, pool_->threads());
+        const int spans = int(std::max<int64_t>(1, std::min<int64_t>(chunks, (2 * workers + kv_heads_ - 1) / kv_heads_)));
+        const int tasks = kv_heads_ * spans;
+        const size_t stride = size_t(group) * (dim_ + 2);
+        std::vector<float> partial(size_t(tasks) * n * stride);
+        std::vector<uint8_t> present(size_t(tasks) * n, 0);
+        const bool f16 = type_ == GGML_TYPE_F16;
+        auto task = [&](int t) {
+            const int g = t / spans, span = t % spans;
+            const int64_t begin_chunk = chunks * span / spans, end_chunk = chunks * (span + 1) / spans;
+            thread_local std::vector<const uint16_t *> krows, vrows;
+            thread_local std::vector<float> piece;
+            piece.resize(stride);
+            std::vector<size_t> cursor(n);
+            for (int i = 0; i < n; ++i)
+                cursor[i] = size_t(std::lower_bound(selections[i].begin(), selections[i].end(), tokens[begin_chunk * chunk_tokens]) - selections[i].begin());
+            for (int64_t c = begin_chunk; c < end_chunk; ++c) {
+                const int32_t high = tokens[std::min(u, (c + 1) * chunk_tokens) - 1];
+                for (int i = 0; i < n; ++i) {
+                    const auto & selected = selections[i];
+                    size_t end = cursor[i];
+                    while (end < selected.size() && selected[end] <= high) ++end;
+                    const int count = int(end - cursor[i]);
+                    if (!count) continue;
+                    krows.resize(size_t(count)); vrows.resize(size_t(count));
+                    for (int j = 0; j < count; ++j) {
+                        const size_t offset = row_offset(g, selected[cursor[i] + j]);
+                        krows[j] = keys_.data() + offset; vrows[j] = values_.data() + offset;
+                    }
+                    cursor[i] = end;
+                    const size_t slot = size_t(t) * n + i;
+                    float * state = partial.data() + slot * stride;
+                    float * target = present[slot] ? piece.data() : state;
+                    (f16 ? tiled_task<true> : tiled_task<false>)(queries.data() + i * width + size_t(g) * group * dim_, group, dim_,
+                        krows.data(), vrows.data(), count, target, profiler, phase, position + i, layer, g * group);
+                    if (!present[slot]) { present[slot] = 1; continue; }
+                    for (int r = 0; r < group; ++r) {
+                        const float top = std::max(state[r], piece[r]);
+                        const float old_weight = std::exp(state[r] - top), new_weight = std::exp(piece[r] - top);
+                        state[r] = top;
+                        state[group + r] = state[group + r] * old_weight + piece[group + r] * new_weight;
+                        float * acc = state + 2 * size_t(group) + size_t(r) * dim_;
+                        const float * add = piece.data() + 2 * size_t(group) + size_t(r) * dim_;
+                        for (int d = 0; d < dim_; ++d) acc[d] = acc[d] * old_weight + add[d] * new_weight;
+                    }
+                }
+            }
+        };
+        {
+            ProfileScope dispatch(profiler, "host", "worker_dispatch", phase, position, layer, "CPU");
+            pool_->run(tasks, task);
+        }
+        std::vector<float> result(width * n);
+        for (int g = 0; g < kv_heads_; ++g)
+            for (int i = 0; i < n; ++i)
+                for (int r = 0; r < group; ++r) {
+                    float maximum = -std::numeric_limits<float>::infinity(), denominator = 0;
+                    for (int span = 0; span < spans; ++span) {
+                        const size_t slot = size_t(g * spans + span) * n + i;
+                        if (present[slot]) maximum = std::max(maximum, partial[slot * stride + r]);
+                    }
+                    float * out = result.data() + i * width + size_t(g * group + r) * dim_;
+                    for (int span = 0; span < spans; ++span) {
+                        const size_t slot = size_t(g * spans + span) * n + i;
+                        if (!present[slot]) continue;
+                        const float * part = partial.data() + slot * stride;
+                        const float weight = std::exp(part[r] - maximum);
+                        denominator += weight * part[group + r];
+                        const float * acc = part + 2 * size_t(group) + size_t(r) * dim_;
+                        for (int d = 0; d < dim_; ++d) out[d] += weight * acc[d];
+                    }
+                    for (int d = 0; d < dim_; ++d) out[d] /= denominator;
+                }
+        return result;
+    }
+#endif
+    std::vector<float> result;
+    result.reserve(width * n);
+    for (int i = 0; i < n; ++i) {
+        const std::vector<float> query(queries.begin() + i * width, queries.begin() + (i + 1) * width);
+        const auto out = attend(query, selections[i], profiler, position + i, layer, phase);
+        result.insert(result.end(), out.begin(), out.end());
+    }
     return result;
 }
 
