@@ -191,8 +191,12 @@ int main(int argc, char ** argv) {
             exporter.finish();
             if (!lifetime.expired() || export_memory.workspace_bytes() || destination.size()!=count ||
                 stats.prefill_kv_to_host_bytes-before!=uint64_t(count-prefix)*width*4 ||
-                std::memcmp(destination.keys(),original_keys.data(),original_keys.size()*sizeof(ggml_bf16_t)) ||
-                std::memcmp(destination.values(),original_values.data(),original_values.size()*sizeof(ggml_bf16_t)))
+                [&] {
+                    std::vector<ggml_bf16_t> k(original_keys.size()), v(original_values.size());
+                    destination.copy_rows(0,count,reinterpret_cast<uint16_t*>(k.data()),reinterpret_cast<uint16_t*>(v.data()));
+                    return std::memcmp(k.data(),original_keys.data(),k.size()*sizeof(ggml_bf16_t)) ||
+                           std::memcmp(v.data(),original_values.data(),v.size()*sizeof(ggml_bf16_t));
+                }())
                 throw std::runtime_error("Chunked asynchronous KV export changed bytes, prefix or lifetime");
             // FP16 CPU KV: a device-side overflow (Inf) must fail the export, not be stored.
             auto f16 = std::make_shared<tidal::PrefillTensorStorage>(export_memory, backend.get());

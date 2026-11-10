@@ -124,8 +124,8 @@ public:
     // Inf/NaN (a device-side overflow) are rejected with std::overflow_error.
     void append_raw(const uint16_t * key, const uint16_t * value, int tokens);
     ggml_type type() const { return type_; }
-    const uint16_t * keys() const { return keys_.data(); }
-    const uint16_t * values() const { return values_.data(); }
+    // Copies rows [first, first + count) out in token-major [token][kv_head][dim] order.
+    void copy_rows(int first, int count, uint16_t * key, uint16_t * value) const;
     std::vector<float> attend(const std::vector<float> & query,
                               const std::vector<int32_t> & selected, Profiler * profiler = nullptr,
                               int position = -1, int layer = -1,
@@ -133,6 +133,8 @@ public:
     void reset() { size_ = 0; }
     int size() const { return size_; }
 private:
+    void store(const uint16_t * key, const uint16_t * value, int tokens);
+    size_t row_offset(int head, int token) const { return (size_t(head) * capacity_ + token) * dim_; }
     int heads_, kv_heads_, dim_, capacity_, threads_, size_ = 0;
     ggml_type type_;
     std::shared_ptr<WorkerPool> pool_;

@@ -331,20 +331,45 @@ void SparseAttention::append(const std::vector<float> & key, const std::vector<f
     const auto width = size_t(kv_heads_) * dim_;
     if (key.size() != width || value.size() != width) throw std::invalid_argument("Wrong KV width");
     if (size_ >= capacity_) throw std::out_of_range("CPU KV cache is full");
-    auto * k = keys_.data() + size_t(size_) * width, * v = values_.data() + size_t(size_) * width;
+    thread_local std::vector<uint16_t> k, v;
+    k.resize(width); v.resize(width);
     if (type_ == GGML_TYPE_F16) {
         // Reject before storing: an infinite FP16 K/V would silently corrupt attention.
         for (size_t i = 0; i < width; ++i)
             if (!(std::abs(key[i]) <= fp16_max) || !(std::abs(value[i]) <= fp16_max))
                 throw std::overflow_error("KV value " + std::to_string(std::abs(key[i]) <= fp16_max ? value[i] : key[i]) +
                                           " is outside the FP16 range");
-        ggml_fp32_to_fp16_row(key.data(), reinterpret_cast<ggml_fp16_t *>(k), int64_t(width));
-        ggml_fp32_to_fp16_row(value.data(), reinterpret_cast<ggml_fp16_t *>(v), int64_t(width));
+        ggml_fp32_to_fp16_row(key.data(), reinterpret_cast<ggml_fp16_t *>(k.data()), int64_t(width));
+        ggml_fp32_to_fp16_row(value.data(), reinterpret_cast<ggml_fp16_t *>(v.data()), int64_t(width));
     } else {
-        ggml_fp32_to_bf16_row_ref(key.data(), reinterpret_cast<ggml_bf16_t *>(k), int64_t(width));
-        ggml_fp32_to_bf16_row_ref(value.data(), reinterpret_cast<ggml_bf16_t *>(v), int64_t(width));
+        ggml_fp32_to_bf16_row_ref(key.data(), reinterpret_cast<ggml_bf16_t *>(k.data()), int64_t(width));
+        ggml_fp32_to_bf16_row_ref(value.data(), reinterpret_cast<ggml_bf16_t *>(v.data()), int64_t(width));
     }
-    ++size_;
+    store(k.data(), v.data(), 1);
+}
+
+// Inputs are token-major rows [token][kv_head][dim]; the cache is head-major
+// [kv_head][capacity][dim], so one head's rows are contiguous for attention.
+void SparseAttention::store(const uint16_t * key, const uint16_t * value, int tokens) {
+    const size_t row = size_t(dim_) * sizeof(uint16_t);
+    for (int t = 0; t < tokens; ++t)
+        for (int g = 0; g < kv_heads_; ++g) {
+            const size_t source = (size_t(t) * kv_heads_ + g) * dim_, target = row_offset(g, size_ + t);
+            std::memcpy(keys_.data() + target, key + source, row);
+            std::memcpy(values_.data() + target, value + source, row);
+        }
+    size_ += tokens;
+}
+
+void SparseAttention::copy_rows(int first, int count, uint16_t * key, uint16_t * value) const {
+    if (first < 0 || count < 0 || first + count > size_) throw std::out_of_range("CPU KV row range");
+    const size_t row = size_t(dim_) * sizeof(uint16_t);
+    for (int t = 0; t < count; ++t)
+        for (int g = 0; g < kv_heads_; ++g) {
+            const size_t target = (size_t(t) * kv_heads_ + g) * dim_, source = row_offset(g, first + t);
+            std::memcpy(key + target, keys_.data() + source, row);
+            std::memcpy(value + target, values_.data() + source, row);
+        }
 }
 
 void SparseAttention::append_raw(const uint16_t * key, const uint16_t * value, int tokens) {
@@ -355,9 +380,7 @@ void SparseAttention::append_raw(const uint16_t * key, const uint16_t * value, i
         for (size_t i = 0; i < count; ++i)
             if ((key[i] & 0x7c00) == 0x7c00 || (value[i] & 0x7c00) == 0x7c00)
                 throw std::overflow_error("KV row " + std::to_string(size_ + int(i / width)) + " is outside the FP16 range");
-    std::memcpy(keys_.data() + size_t(size_) * width, key, count * sizeof(uint16_t));
-    std::memcpy(values_.data() + size_t(size_) * width, value, count * sizeof(uint16_t));
-    size_ += tokens;
+    store(key, value, tokens);
 }
 
 std::vector<float> SparseAttention::attend(const std::vector<float> & query,
@@ -399,7 +422,7 @@ std::vector<float> SparseAttention::attend(const std::vector<float> & query,
             thread_local std::vector<const uint16_t *> krows, vrows;
             krows.resize(size_t(count)); vrows.resize(size_t(count));
             for (int64_t i = 0; i < count; ++i) {
-                const size_t offset = (size_t(selected[first + i]) * kv_heads_ + g) * dim_;
+                const size_t offset = row_offset(g, selected[first + i]);
                 krows[i] = keys_.data() + offset; vrows[i] = values_.data() + offset;
             }
             (f16 ? tiled_task<true> : tiled_task<false>)(query.data() + size_t(g) * group * dim_, group, dim_, krows.data(), vrows.data(),
@@ -420,7 +443,7 @@ std::vector<float> SparseAttention::attend(const std::vector<float> & query,
         qk.event.bytes = size_t(count) * dim_ * sizeof(uint16_t);
         for (int64_t i = 0; i < count; ++i) {
             float * out = scores.data() + size_t(i) * group;
-            kernel.dot(q, group, dim_, keys_.data() + (size_t(selected[first + i]) * kv_heads_ + g) * dim_, out);
+            kernel.dot(q, group, dim_, keys_.data() + row_offset(g, selected[first + i]), out);
             for (int r = 0; r < group; ++r) out[r] /= scale;
         }
         qk.finish();
@@ -441,7 +464,7 @@ std::vector<float> SparseAttention::attend(const std::vector<float> & query,
         std::fill(acc, acc + size_t(group) * dim_, 0.0f);
         for (int64_t i = 0; i < count; ++i)
             kernel.axpy(acc, scores.data() + size_t(i) * group, group, dim_,
-                        values_.data() + (size_t(selected[first + i]) * kv_heads_ + g) * dim_);
+                        values_.data() + row_offset(g, selected[first + i]));
     };
     ProfileScope dispatch(profiler, "host", "worker_dispatch", phase, position, layer, "CPU");
     pool_->run(tasks, task);

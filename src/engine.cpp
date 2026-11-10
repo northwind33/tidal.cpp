@@ -1084,8 +1084,10 @@ struct Engine::Impl {
             if (state.attention->size() != position) throw std::logic_error("Prefill KV prefix is inconsistent");
             auto g = graph("prefill.attention.prefix", layer);
             const size_t bytes = size_t(position)*kvwidth*sizeof(uint16_t);
-            g.put(keys, state.attention->keys(), bytes);
-            g.put(values, state.attention->values(), bytes);
+            std::vector<uint16_t> prefix_keys(size_t(position)*kvwidth), prefix_values(prefix_keys.size());
+            state.attention->copy_rows(0, position, prefix_keys.data(), prefix_values.data());
+            g.put(keys, prefix_keys.data(), bytes);
+            g.put(values, prefix_values.data(), bytes);
             convert(0, position);
         }
         std::unique_ptr<PrefillTensorStorage> part;
