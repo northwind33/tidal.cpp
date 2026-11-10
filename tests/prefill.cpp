@@ -26,6 +26,7 @@ int main(int argc, char ** argv) {
     try {
         if (argc != 3) throw std::runtime_error("Usage: tidal-prefill-test f32-model.gguf cpu|cuda");
         tidal::Options options{argv[2],0,2}; options.prefill_attention_tile=7; options.profile=tidal::ProfileMode::Nodes;
+        options.hybrid_batch_tokens=0; // Layer-major checks; hybrid batches are checked below.
         tidal::Engine engine(argv[1],options);
         const std::vector<int32_t> tokens{1,7,23,9,42,5,6,2,77,13,84,11,90,3,42,28,61,7,0,93,34,22,1,255};
         auto expected=engine.prefill(tokens);
@@ -141,6 +142,54 @@ int main(int argc, char ** argv) {
             try { tiny.decode(1); } catch(const std::runtime_error &) { poisoned=true; }
             require(poisoned,"Failed prefill did not poison partial state");
             tiny.reset(); engine.reset(); close(engine.decode(1),tiny.decode(1),0);
+        }
+        if (gpu) {
+            // Hybrid batches: batched GPU sublayers with resident weights and CPU
+            // attention over the CPU KV, matching layer-major prefill and decode.
+            auto hybrid_options=options;
+            hybrid_options.hybrid_batch_tokens=int(tokens.size());
+            hybrid_options.prefill_memory_limit=0;
+            hybrid_options.profile=tidal::ProfileMode::Phases;
+            auto sequential_options=hybrid_options; sequential_options.profile=tidal::ProfileMode::Off;
+            tidal::Engine hybrid(argv[1],hybrid_options), sequential(argv[1],sequential_options);
+            const auto actual=hybrid.prefill(tokens);
+            int attention_layers=0;
+            for (int l=0;l<hybrid.config().layers;++l) attention_layers += !hybrid.config().is_recurrent(l);
+            const auto s=hybrid.statistics();
+            require(s.prefill_tokens==tokens.size() && !s.prefill_layers && !s.prefill_gpu_attention_calls && !s.prefill_kv_to_host_bytes,
+                    "Hybrid batch ran layer-major prefill");
+            require(s.full_attention_calls+s.sparse_attention_calls==uint64_t(attention_layers)*tokens.size(), "Hybrid batch attention calls");
+            for (const auto & e:hybrid.profile_events())
+                require(!(e.category=="graph" && e.phase.rfind("prefill.",0)==0), "Hybrid batch built a layer-major graph");
+            for (size_t i=0;i<tokens.size();++i) {
+                close(expected[i],actual[i],.004f);
+                close(sequential.decode(tokens[i]),actual[i],.004f);
+            }
+            const auto hybrid_continuation=hybrid.decode(17);
+            close(continuation,hybrid_continuation,.004f);
+            close(sequential.decode(17),hybrid_continuation,.004f);
+            // Batches continue any prefix, including ones written by decode.
+            hybrid.reset();
+            size_t offset=0;
+            for (int n:{1,3,-1,6,13}) {
+                if (n<0) { close(expected[offset],hybrid.decode(tokens[offset]),.004f); ++offset; continue; }
+                for (const auto & step:hybrid.prefill({tokens.begin()+offset,tokens.begin()+offset+n})) close(expected[offset++],step,.004f);
+            }
+            require(offset==tokens.size(),"Hybrid partition must cover the prompt");
+            close(continuation,hybrid.decode(17),.004f);
+            hybrid.reset();
+            const auto replay=hybrid.prefill(tokens);
+            for (size_t i=0;i<tokens.size();++i) close(actual[i],replay[i],0);
+            const auto hybrid_sampled=hybrid.sample();
+            hybrid.reset();
+            const auto quiet=hybrid.prefill(tokens,false);
+            require(hybrid.sample()==hybrid_sampled,"Compact hybrid batch changed token selection");
+            for (const auto & step:quiet) require(step.logits.empty() && step.selections.empty(),"Compact hybrid batch downloaded diagnostics");
+            // Above the bound, prefill stays layer-major.
+            hybrid_options.hybrid_batch_tokens=int(tokens.size())-1;
+            tidal::Engine bounded(argv[1],hybrid_options);
+            bounded.prefill(tokens);
+            require(bounded.statistics().prefill_layers==uint64_t(bounded.config().layers),"Oversized hybrid batch was not layer-major");
         }
         if (gpu && engine.config().context>=514) {
             auto extended_options=options;

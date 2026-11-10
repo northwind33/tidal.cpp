@@ -99,7 +99,7 @@ int main(int argc, char ** argv) {
             if (!full) out << ",\"sparse_attention_backend\":\"" << decode_attention_backend(options) << '"';
             out << ",\"architecture\":\"" << (full ? "qwen35" : "tidal-qwen4exp")
                 << "\",\"attention_kind\":\"" << (full ? "full" : "sparse") << "\",\"attention_backend\":\"" << decode_attention_backend(options) << '"';
-            out << ",\"prefill\":"; prefill_json(out, options);
+            out << ",\"prefill\":"; prefill_json(out, options, prompt.size());
             out << ",\"sampling\":"; sampling_json(out, options.sampling);
             out << ",\"sampling_backend\":"; report::string(out, engine.sampling_backend_name());
             out << ",\"capture_logits\":" << (capture ? "true" : "false");

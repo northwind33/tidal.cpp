@@ -154,6 +154,34 @@ After temporary storage and the prefill kernel pool are released, restoring the
 original decode weights uses actual free device memory rather than retaining the
 prefill-only reserve.
 
+## Hybrid batches
+
+With CPU KV on CUDA, a prefill of at most `Options::hybrid_batch_tokens`
+tokens (default 96, CLI `--hybrid-batch-tokens`, zero disables) does not use
+layer-major prefill. Layer-major prefill has a fixed cost per call: it
+rebuilds the prefill backend and memory plan and allocates one graph per
+sublayer and chunk. It also uploads and relayouts the whole KV prefix for every
+attention layer, so a few appended tokens (an agent's tool result, a chat
+turn, later MTP verification) cost roughly as much as hundreds.
+
+A hybrid batch runs like CPU-KV decode, but over every token at once:
+
+- The GPU sublayers between two attention layers form one segment graph on the
+  decode allocators, using the batched builders shared with layer-major prefill
+  (GDN chunk recurrence, PLE n-grams/convolution, FFN/MoE, HC mixing). Weights
+  stay in the decode layout, so reusable decode segments survive the batch.
+- A segment ends with the next attention layer's Q/K/V for all tokens. For QSA
+  it also ends with the index-cache rows of the blocks the batch completes and
+  each query's top-k over the blocks complete before it.
+- The CPU appends the batch's K/V and attends each query to its own causal
+  selection. The outputs feed the next segment, which the host builds and
+  allocates while the current one runs.
+- The last position uses the single-column head projection, as in layer-major
+  prefill, so its logits do not depend on `capture_logits`.
+
+Matrix products are batched, so they round like layer-major prefill. Attention
+uses the CPU kernel and the 16-bit CPU KV, so it rounds like decode.
+
 ## Prompt cache
 
 `Engine::prefill_cached(tokens)` treats `tokens` as the whole sequence and

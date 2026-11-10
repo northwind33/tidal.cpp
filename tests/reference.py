@@ -330,7 +330,10 @@ class Reference:
         selected.sort()
         keys = np.stack(state["keys"])[selected]
         values = np.stack(state["values"])[selected]
-        if self.backend == "cuda" and self.prefill_columns > 8 and not self.gpu_attention:
+        # Layer-major prefill attends with FP16 FlashAttention; hybrid batches
+        # attend on the CPU KV like decode.
+        if self.backend == "cuda" and self.prefill_columns > 8 and not self.gpu_attention and \
+                not getattr(self, "cpu_batch_attention", False):
             q = q.astype(np.float16).astype(np.float32)
             keys = keys.astype(np.float16).astype(np.float32)
             values = values.astype(np.float16).astype(np.float32)

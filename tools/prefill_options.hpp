@@ -4,7 +4,7 @@
 #include <ostream>
 
 inline std::vector<std::string> prefill_options(std::vector<std::string> names) {
-    for (const char * name : {"--kv-placement", "--cpu-kv-precision", "--prefill-precision", "--prefill-chunk", "--prefill-tile", "--prefill-memory-mib", "--prefill-reserve-mib", "--prompt-cache-checkpoints"}) names.emplace_back(name);
+    for (const char * name : {"--kv-placement", "--cpu-kv-precision", "--prefill-precision", "--prefill-chunk", "--prefill-tile", "--prefill-memory-mib", "--prefill-reserve-mib", "--prompt-cache-checkpoints", "--hybrid-batch-tokens"}) names.emplace_back(name);
     return names;
 }
 inline void configure_prefill(const Args & args, tidal::Options & options) {
@@ -38,11 +38,15 @@ inline void configure_prefill(const Args & args, tidal::Options & options) {
     options.prefill_memory_reserve = reserve_text == "auto" ? UINT64_MAX : uint64_t(reserve)*1024*1024;
     options.prompt_cache_checkpoints = args.integer("--prompt-cache-checkpoints", options.prompt_cache_checkpoints);
     if (options.prompt_cache_checkpoints < 0) throw std::invalid_argument("--prompt-cache-checkpoints must be non-negative");
+    options.hybrid_batch_tokens = args.integer("--hybrid-batch-tokens", options.hybrid_batch_tokens);
+    if (options.hybrid_batch_tokens < 0 || options.hybrid_batch_tokens > 4096)
+        throw std::invalid_argument("--hybrid-batch-tokens must be within 0-4096");
 }
 inline void prefill_help(std::ostream & out) {
     out << "  [--kv-placement cpu|gpu] [--cpu-kv-precision bf16|fp16] [--prefill-precision fp16|bf16]\n"
            "  [--prefill-chunk auto|N] [--prefill-tile auto|N]\n"
            "  [--prefill-memory-mib 0] [--prefill-reserve-mib auto|MiB] [--prompt-cache-checkpoints 4]\n"
+           "  [--hybrid-batch-tokens 96]\n"
            "CUDA prefill processes all prompt tokens in each layer before advancing.\n"
            "Chunks bound intermediate tensors; tiles bound attention queries (1-4096).\n"
            "Auto sizes shrink on pre-compute allocation failure; explicit sizes fail.\n"
@@ -51,7 +55,9 @@ inline void prefill_help(std::ostream & out) {
            "on |K| or |V| > 65504. GPU KV requires CUDA, stays on GPU during decode,\n"
            "and uses --prefill-precision for persistent KV as well. Set --context to fit VRAM.\n"
            "Prompt-cache checkpoints bound the host snapshots Engine::prefill_cached keeps\n"
-           "for rolling back to an earlier prompt end (recurrent state cannot be truncated).\n";
+           "for rolling back to an earlier prompt end (recurrent state cannot be truncated).\n"
+           "With CPU KV on CUDA, prefills of at most --hybrid-batch-tokens tokens batch the GPU\n"
+           "sublayers and attend on the CPU KV, without layer-major prefill (0 disables).\n";
 }
 inline const char * kv_type_name(const tidal::Options & o) {
     if (o.kv_placement == tidal::KVPlacement::CPU) return o.cpu_kv_precision == tidal::CpuKVPrecision::FP16 ? "F16" : "BF16";
@@ -60,8 +66,14 @@ inline const char * kv_type_name(const tidal::Options & o) {
 inline const char * decode_attention_backend(const tidal::Options & o) {
     return o.kv_placement == tidal::KVPlacement::GPU ? "CUDA" : "CPU";
 }
-inline void prefill_json(std::ostream & out, const tidal::Options & o) {
-    out << "{\"execution\":\"" << (o.backend == "cuda" ? "layer_major" : "sequential_reference")
+// Execution of a prefill of `tokens` tokens from an empty sequence.
+inline const char * prefill_execution(const tidal::Options & o, size_t tokens) {
+    if (o.backend != "cuda") return "sequential_reference";
+    if (o.kv_placement == tidal::KVPlacement::CPU && tokens <= size_t(o.hybrid_batch_tokens)) return "hybrid_batch";
+    return "layer_major";
+}
+inline void prefill_json(std::ostream & out, const tidal::Options & o, size_t tokens) {
+    out << "{\"execution\":\"" << prefill_execution(o, tokens)
         << "\",\"kv_placement\":\"" << (o.kv_placement == tidal::KVPlacement::GPU ? "gpu" : "cpu")
         << "\",\"kv_type\":\"" << kv_type_name(o)
         << "\",\"decode_attention_backend\":\"" << decode_attention_backend(o)
@@ -72,6 +84,7 @@ inline void prefill_json(std::ostream & out, const tidal::Options & o) {
         << ",\"attention_tile\":" << o.prefill_attention_tile
         << ",\"attention_tile_mode\":\"" << (o.prefill_attention_tile ? "explicit" : "auto") << '"'
         << ",\"memory_limit_bytes\":" << o.prefill_memory_limit
+        << ",\"hybrid_batch_tokens\":" << o.hybrid_batch_tokens
         << ",\"memory_reserve_bytes\":";
     if (o.prefill_memory_reserve == UINT64_MAX) out << "null";
     else out << o.prefill_memory_reserve;

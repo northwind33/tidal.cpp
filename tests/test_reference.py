@@ -127,7 +127,9 @@ def check_trace(result, reference, tolerance, label, prompt=PROMPT):
     assert len(result["trace"]) == len(sequence)
     max_error, max_nrmse = 0, 0
     for i, token in enumerate(sequence):
-        reference.prefill_columns = len(prompt) if result.get("prefill",{}).get("execution")=="layer_major" and i<len(prompt) else 0
+        execution = result.get("prefill",{}).get("execution")
+        reference.prefill_columns = len(prompt) if execution in ("layer_major","hybrid_batch") and i<len(prompt) else 0
+        reference.cpu_batch_attention = execution == "hybrid_batch"
         reference.prefill_head_columns = reference.prefill_columns if i!=len(prompt)-1 else 0
         expected, selected = reference.decode(token)
         step = result["trace"][i]

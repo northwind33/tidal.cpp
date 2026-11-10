@@ -227,7 +227,7 @@ int main(int argc, char ** argv) {
         out << ",\"steps\":" << steps << ",\"warmup\":" << warmup << ",\"repetitions\":" << repetitions
             << ",\"capture_logits\":" << (capture ? "true" : "false") << ",\"sampling\":";
         sampling_json(out, options.sampling);
-        out << ",\"prefill\":"; prefill_json(out, options);
+        out << ",\"prefill\":"; prefill_json(out, options, prompt.size());
         out << ",\"sampling_backend\":"; report::string(out, engine.sampling_backend_name()); out << '}'
             << ",\"timing\":{\"clock\":\"steady_clock\",\"unit\":\"milliseconds\",\"includes\":\"prefill API including configured KV placement and weight restoration; decode API including configured attention, transfers and sampling\","
                "\"prefill_latency_semantics\":\"batch completion in run_ms; no per-token samples\",\"excludes\":\"model load, reset, warmup, checksum, serialization, diagnostic replay\"}"

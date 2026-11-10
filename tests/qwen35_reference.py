@@ -142,7 +142,8 @@ class Qwen35Reference:
         state["values"].append(self.kv_round(self.mm(p+"attn_v.weight", x).reshape(hk, d)))
         keys = np.repeat(np.stack(state["keys"]), h//hk, axis=1)
         values = np.repeat(np.stack(state["values"]), h//hk, axis=1)
-        if self.backend == "cuda" and self.prefill_columns > 8 and not self.gpu_attention:
+        if self.backend == "cuda" and self.prefill_columns > 8 and not self.gpu_attention and \
+                not getattr(self, "cpu_batch_attention", False):
             q = q.astype(np.float16).astype(np.float32)
             keys = keys.astype(np.float16).astype(np.float32)
             values = values.astype(np.float16).astype(np.float32)

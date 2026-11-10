@@ -132,6 +132,11 @@ struct Options {
     // The oldest snapshot is dropped beyond this count; zero keeps only reuse of
     // a sequence that the new prompt extends.
     int prompt_cache_checkpoints = 4;
+    // CUDA with CPU KV: prefills of at most this many tokens run as hybrid
+    // batches (GPU sublayers over all tokens at once with resident decode
+    // weights, attention on the CPU KV) instead of layer-major GPU prefill,
+    // which uploads the whole KV prefix per attention layer. Zero disables.
+    int hybrid_batch_tokens = 96;
 };
 
 struct Selection {
