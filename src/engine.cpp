@@ -94,6 +94,15 @@ public:
     void add(ggml_tensor * t) { if (memory) ggml_set_output(t); ggml_build_forward_expand(graph, t); }
     // Read back after run(): a shared allocator may otherwise reuse its memory.
     void output(ggml_tensor * t) { ggml_set_output(t); ggml_build_forward_expand(graph, t); }
+    // Fused graphs attribute node ranges to their original phase and layer so
+    // node profiles stay comparable with per-sublayer graphs.
+    struct Section { int end; std::string phase; int layer; };
+    std::vector<Section> sections;
+    void mark(ggml_tensor * t, std::string ph, int l) {
+        if (t) ggml_build_forward_expand(graph, t);
+        const int n = ggml_graph_n_nodes(graph);
+        if (n > (sections.empty() ? 0 : sections.back().end)) sections.push_back({n, std::move(ph), l});
+    }
     bool allocated_inputs() const { return memory || shared; }
     // Per-token data of a reusable decode graph. Their values change between
     // runs while the graph topology, and thus its captured CUDA graph, does not.
@@ -189,8 +198,10 @@ public:
                 auto * node = ggml_graph_node(graph, i);
                 ggml_graph_clear(single);
                 ggml_graph_add_node(single, node);
+                auto section = std::find_if(sections.begin(), sections.end(), [i](const Section & x) { return i < x.end; });
                 ProfileScope op(&profiler, "node", node->name[0] ? node->name : ggml_op_name(node->op),
-                                phase, position, layer, backend_label);
+                                section == sections.end() ? phase : section->phase, position,
+                                section == sections.end() ? layer : section->layer, backend_label);
                 op.event.node = i;
                 op.event.op = ggml_op_desc(node);
                 op.event.dtype = ggml_type_name(node->type);
@@ -1380,12 +1391,100 @@ struct Engine::Impl {
         if (!std::isfinite(g.get<float>(g.finite)[0])) throw std::runtime_error("Non-finite logits");
         if (!reusable) decode_graph.reset();
     }
+    // CPU KV decode: every GPU sublayer between two CPU attention calls runs in one
+    // graph on the reused decode allocator. Each graph ends with the next attention
+    // layer's projections, downloaded as one Q|K|V vector (plus QSA top-k blocks).
+    void decode_hybrid(int32_t token, bool capture, Step & step) {
+        const int visible = position + 1;
+        auto segment = [&](const char * phase) {
+            return std::make_unique<Graph>(backend.get(), stats, options.backend == "cuda", profiler, phase, position, -1,
+                                           nullptr, decode_allocator_get(), 16384);
+        };
+        auto g = segment("hybrid.segment");
+        ggml_tensor * h = ggml_get_rows(g->c(), weight("token_embd.weight"), g->integer(token));
+        h = c.branches == 1 ? ggml_reshape_2d(g->c(), h, c.hidden, 1) : ggml_repeat(g->c(), h, hidden);
+        g->mark(h, "embedding", -1);
+        for (int layer = 0; layer < c.layers; ++layer) {
+            auto & s = states[layer];
+            if (s.ple) { h = build_ple(*g, layer, token, h); g->mark(h, "ple", layer); }
+            if (c.is_recurrent(layer)) { h = build_linear(*g, layer, h); g->mark(h, "gdn", layer); continue; }
+            const bool sparse = c.architecture == Architecture::Qwen4Exp;
+            auto prepared = sparse ? sparse_prepare(*g, layer, h) : full_prepare(*g, layer, h);
+            // The attention residual input outlives this graph.
+            g->add(ggml_cpy(g->c(), h, hidden));
+            auto * qkv = ggml_concat(g->c(), ggml_concat(g->c(), ggml_reshape_1d(g->c(), prepared.q, ggml_nelements(prepared.q)),
+                ggml_reshape_1d(g->c(), prepared.k, ggml_nelements(prepared.k)), 0),
+                ggml_reshape_1d(g->c(), prepared.v, ggml_nelements(prepared.v)), 0);
+            g->output(qkv);
+            if (prepared.top) g->output(prepared.top);
+            g->mark(nullptr, sparse ? "qsa.prepare" : "full.prepare", layer);
+            g->run();
+            std::vector<int32_t> selected;
+            if (sparse) {
+                auto blocks = prepared.top ? g->get<int32_t>(prepared.top) : std::vector<int32_t>{};
+                ProfileScope expand(&profiler, "cpu", "expand_blocks", "qsa.attention", position, layer, "CPU");
+                selected = expand_blocks(blocks, visible, c.block_size);
+            } else {
+                selected.resize(visible);
+                std::iota(selected.begin(), selected.end(), 0);
+            }
+            const auto packed = g->get<float>(qkv);
+            const size_t qn = size_t(c.q_heads) * c.head_dim, kn = size_t(c.kv_heads) * c.head_dim;
+            const char * phase = sparse ? "qsa.attention" : "full.attention";
+            std::vector<float> queries(packed.begin(), packed.begin() + qn), keys(packed.begin() + qn, packed.begin() + qn + kn),
+                values(packed.begin() + qn + kn, packed.end());
+            auto start = Clock::now();
+            ProfileScope append(&profiler, "cpu", "kv_append_bf16", phase, position, layer, "CPU");
+            append.event.bytes = (keys.size() + values.size()) * sizeof(ggml_bf16_t);
+            s.attention->append(keys, values);
+            append.finish();
+            ProfileScope attention_scope(&profiler, "cpu", sparse ? "sparse_attention" : "full_attention", phase, position, layer, "CPU");
+            auto output = s.attention->attend(queries, selected, &profiler, position, layer, phase);
+            attention_scope.finish();
+            stats.attention_ms += elapsed(start);
+            ++(sparse ? stats.sparse_attention_calls : stats.full_attention_calls);
+            if (capture || options.kv_placement == KVPlacement::CPU) step.selections.push_back({layer, std::move(selected)});
+            g = segment("hybrid.segment");
+            const auto p = "blk." + std::to_string(layer) + ".";
+            auto * attended = ggml_mul(g->c(), g->floats(output), ggml_sigmoid(g->c(), s.gate));
+            auto * projected = mm(*g, p + "attn.out", attended);
+            auto * residual = sparse ? combine(*g, hidden, projected, s.inject) : ggml_add(g->c(), hidden, projected);
+            h = ffn(*g, residual, p);
+            g->mark(h, sparse ? "qsa.finish" : "full.finish", layer);
+        }
+        auto mixed = c.architecture == Architecture::Qwen35
+            ? Mixed{norm(*g, h, "output_norm.weight"), nullptr} : mix(*g, h, "head", false);
+        auto * logits = mm(*g, "output.weight", mixed.value);
+        g->add(ggml_cpy(g->c(), logits, last_logits));
+        g->add(ggml_cpy(g->c(), h, hidden));
+        auto * finite = capture ? nullptr : ggml_sum(g->c(), ggml_sub(g->c(), logits, logits));
+        if (finite) g->output(finite);
+        g->mark(nullptr, "head", -1);
+        g->run();
+        captured_logits.clear();
+        if (capture) step.logits = g->get<float>(last_logits);
+        if ((finite && !std::isfinite(g->get<float>(finite)[0])) ||
+            !std::all_of(step.logits.begin(), step.logits.end(), [](float f) { return std::isfinite(f); }))
+            throw std::runtime_error("Non-finite logits");
+        captured_logits = step.logits;
+    }
     Step decode(int32_t token, bool capture_logits) {
         if (failed) throw std::runtime_error("Previous decode failed; call reset() before reusing the engine");
         if (token < 0 || token >= c.vocab) throw std::out_of_range("Token ID outside vocabulary");
         if (position >= c.context) throw std::out_of_range("Context capacity exceeded; reset before decoding a new sequence");
         try {
             ProfileScope token_scope(&profiler, "token", "decode", "decode", position, -1, "CPU");
+            if (options.kv_placement == KVPlacement::CPU) {
+                Step step{position, {}, {}};
+                decode_hybrid(token, capture_logits, step);
+                if (!c.ple.layers.empty()) {
+                    previous_tokens.push_back(token);
+                    if (previous_tokens.size() >= size_t(c.ple.ngram_size)) previous_tokens.erase(previous_tokens.begin());
+                }
+                sampler->accept(token);
+                ++position;
+                return step;
+            }
             if (single_graph_decode(capture_logits)) {
                 Step step{position, {}, {}};
                 decode_single_graph(token);
