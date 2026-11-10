@@ -84,6 +84,7 @@ public:
           graph(ggml_new_graph_custom(ctx.get(), nodes, false)),
           backend(b), memory(mem), shared(alloc), stats(s), device(d) {}
     ~Graph() {
+        if (launched) ggml_backend_synchronize(backend);
         ProfileScope release(&profiler, "host", "graph_free", phase, position, layer, "CPU");
         storage.reset();
         allocator.reset();
@@ -183,6 +184,31 @@ public:
         allocation.finish();
         reserved = true;
     }
+    // Asynchronous execution: launch() enqueues the graph and returns; wait()
+    // synchronizes. Node profiling keeps its synchronous per-op replay.
+    bool launched = false;
+    ggml_status launch_status = GGML_STATUS_SUCCESS;
+    Clock::time_point launch_start;
+    std::unique_ptr<ProfileScope> launch_scope;
+    void launch() {
+        if (profiler.mode == ProfileMode::Nodes) { run(); return; }
+        reserve();
+        for (auto & upload : uploads) upload();
+        if (before_compute) before_compute();
+        launch_scope = std::make_unique<ProfileScope>(&profiler, "graph", "compute", phase, position, layer, backend_label);
+        launch_start = Clock::now();
+        launch_status = ggml_backend_graph_compute_async(backend, graph);
+        launched = true;
+    }
+    void wait() {
+        if (!launched) return;
+        launched = false;
+        ggml_backend_synchronize(backend);
+        stats.graph_ms += elapsed(launch_start);
+        launch_scope.reset();
+        if (launch_status != GGML_STATUS_SUCCESS) throw std::runtime_error("ggml graph execution failed");
+        stats.device_graph_nodes += ggml_graph_n_nodes(graph);
+    }
     void run() {
         reserve();
         for (auto & upload : uploads) upload();
@@ -266,6 +292,9 @@ struct Engine::Impl {
     PrefillMemory * prefill_memory = nullptr;
     Backend prefill_backend{nullptr, ggml_backend_free};
     std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)> decode_allocator{nullptr, ggml_gallocr_free};
+    // CPU KV decode alternates allocators so the next segment can be allocated
+    // while the current one still executes.
+    std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)> decode_allocator_alt{nullptr, ggml_gallocr_free};
     // Reused while weights stay resident and the KV bucket is unchanged; prefill
     // may evict/reload weights, and reset rewinds the position.
     std::unique_ptr<Graph> decode_graph;
@@ -338,12 +367,13 @@ struct Engine::Impl {
     // Persistent GPU KV keeps every decode operation on the device, so a token
     // runs as one graph with one synchronization on a reused compute buffer.
     bool single_graph_decode(bool capture) const { return options.kv_placement == KVPlacement::GPU && !capture; }
-    ggml_gallocr * decode_allocator_get() {
-        if (!decode_allocator) {
-            decode_allocator.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend.get())));
-            if (!decode_allocator) throw std::runtime_error("Cannot create decode graph allocator");
+    ggml_gallocr * decode_allocator_get(int which = 0) {
+        auto & allocator = which ? decode_allocator_alt : decode_allocator;
+        if (!allocator) {
+            allocator.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend.get())));
+            if (!allocator) throw std::runtime_error("Cannot create decode graph allocator");
         }
-        return decode_allocator.get();
+        return allocator.get();
     }
     int attention_dim() const { return c.head_dim <= 64 ? 64 : c.head_dim <= 128 ? 128 : 256; }
     // Store directly in the persistent working format: GPU FP16 KV must not
@@ -1390,45 +1420,92 @@ struct Engine::Impl {
         if (!reusable) decode_graph.reset();
     }
     // CPU KV decode: every GPU sublayer between two CPU attention calls runs in one
-    // graph on the reused decode allocator. Each graph ends with the next attention
+    // graph on a reused decode allocator. Each graph ends with the next attention
     // layer's projections, downloaded as one Q|K|V vector (plus QSA top-k blocks).
+    // While a segment executes, the host builds and allocates the next one.
+    struct Segment {
+        std::unique_ptr<Graph> g;
+        ggml_tensor * input = nullptr;   // CPU attention output consumed by this segment
+        int attention = -1;              // attention layer whose projections end it; -1: head
+        bool sparse = false;
+        ggml_tensor * qkv = nullptr, * top = nullptr, * finite = nullptr;
+    };
+    Segment build_segment(int finished, int allocator, int32_t token, bool capture) {
+        Segment seg;
+        seg.g = std::make_unique<Graph>(backend.get(), stats, options.backend == "cuda", profiler, "hybrid.segment",
+                                        position, -1, nullptr, decode_allocator_get(allocator), 16384);
+        auto & g = *seg.g;
+        ggml_tensor * h;
+        if (finished < 0) {
+            h = ggml_get_rows(g.c(), weight("token_embd.weight"), g.integer(token));
+            h = c.branches == 1 ? ggml_reshape_2d(g.c(), h, c.hidden, 1) : ggml_repeat(g.c(), h, hidden);
+            g.mark(h, "embedding", -1);
+        } else {
+            auto & s = states[finished];
+            const bool sparse = c.architecture == Architecture::Qwen4Exp;
+            const auto p = "blk." + std::to_string(finished) + ".";
+            seg.input = g.input(GGML_TYPE_F32, int64_t(c.q_heads) * c.head_dim);
+            auto * attended = ggml_mul(g.c(), seg.input, ggml_sigmoid(g.c(), s.gate));
+            auto * projected = mm(g, p + "attn.out", attended);
+            auto * residual = sparse ? combine(g, hidden, projected, s.inject) : ggml_add(g.c(), hidden, projected);
+            h = ffn(g, residual, p);
+            g.mark(h, sparse ? "qsa.finish" : "full.finish", finished);
+        }
+        for (int layer = finished + 1; layer < c.layers; ++layer) {
+            auto & s = states[layer];
+            if (s.ple) { h = build_ple(g, layer, token, h); g.mark(h, "ple", layer); }
+            if (c.is_recurrent(layer)) { h = build_linear(g, layer, h); g.mark(h, "gdn", layer); continue; }
+            seg.sparse = c.architecture == Architecture::Qwen4Exp;
+            auto prepared = seg.sparse ? sparse_prepare(g, layer, h) : full_prepare(g, layer, h);
+            // The attention residual input outlives this graph.
+            g.add(ggml_cpy(g.c(), h, hidden));
+            seg.qkv = ggml_concat(g.c(), ggml_concat(g.c(), ggml_reshape_1d(g.c(), prepared.q, ggml_nelements(prepared.q)),
+                ggml_reshape_1d(g.c(), prepared.k, ggml_nelements(prepared.k)), 0),
+                ggml_reshape_1d(g.c(), prepared.v, ggml_nelements(prepared.v)), 0);
+            g.output(seg.qkv);
+            seg.top = prepared.top;
+            if (seg.top) g.output(seg.top);
+            g.mark(nullptr, seg.sparse ? "qsa.prepare" : "full.prepare", layer);
+            seg.attention = layer;
+            return seg;
+        }
+        auto mixed = c.architecture == Architecture::Qwen35
+            ? Mixed{norm(g, h, "output_norm.weight"), nullptr} : mix(g, h, "head", false);
+        auto * logits = mm(g, "output.weight", mixed.value);
+        g.add(ggml_cpy(g.c(), logits, last_logits));
+        g.add(ggml_cpy(g.c(), h, hidden));
+        seg.finite = capture ? nullptr : ggml_sum(g.c(), ggml_sub(g.c(), logits, logits));
+        if (seg.finite) g.output(seg.finite);
+        g.mark(nullptr, "head", -1);
+        return seg;
+    }
     void decode_hybrid(int32_t token, bool capture, Step & step) {
         const int visible = position + 1;
-        auto segment = [&](const char * phase) {
-            return std::make_unique<Graph>(backend.get(), stats, options.backend == "cuda", profiler, phase, position, -1,
-                                           nullptr, decode_allocator_get(), 16384);
-        };
-        auto g = segment("hybrid.segment");
-        ggml_tensor * h = ggml_get_rows(g->c(), weight("token_embd.weight"), g->integer(token));
-        h = c.branches == 1 ? ggml_reshape_2d(g->c(), h, c.hidden, 1) : ggml_repeat(g->c(), h, hidden);
-        g->mark(h, "embedding", -1);
-        for (int layer = 0; layer < c.layers; ++layer) {
+        int which = 0;
+        auto seg = build_segment(-1, which, token, capture);
+        seg.g->launch();
+        for (;;) {
+            Segment next;
+            if (seg.attention >= 0) {
+                next = build_segment(seg.attention, which ^ 1, token, capture);
+                next.g->reserve();
+            }
+            seg.g->wait();
+            if (seg.attention < 0) break;
+            const int layer = seg.attention;
             auto & s = states[layer];
-            if (s.ple) { h = build_ple(*g, layer, token, h); g->mark(h, "ple", layer); }
-            if (c.is_recurrent(layer)) { h = build_linear(*g, layer, h); g->mark(h, "gdn", layer); continue; }
-            const bool sparse = c.architecture == Architecture::Qwen4Exp;
-            auto prepared = sparse ? sparse_prepare(*g, layer, h) : full_prepare(*g, layer, h);
-            // The attention residual input outlives this graph.
-            g->add(ggml_cpy(g->c(), h, hidden));
-            auto * qkv = ggml_concat(g->c(), ggml_concat(g->c(), ggml_reshape_1d(g->c(), prepared.q, ggml_nelements(prepared.q)),
-                ggml_reshape_1d(g->c(), prepared.k, ggml_nelements(prepared.k)), 0),
-                ggml_reshape_1d(g->c(), prepared.v, ggml_nelements(prepared.v)), 0);
-            g->output(qkv);
-            if (prepared.top) g->output(prepared.top);
-            g->mark(nullptr, sparse ? "qsa.prepare" : "full.prepare", layer);
-            g->run();
             std::vector<int32_t> selected;
-            if (sparse) {
-                auto blocks = prepared.top ? g->get<int32_t>(prepared.top) : std::vector<int32_t>{};
+            if (seg.sparse) {
+                auto blocks = seg.top ? seg.g->get<int32_t>(seg.top) : std::vector<int32_t>{};
                 ProfileScope expand(&profiler, "cpu", "expand_blocks", "qsa.attention", position, layer, "CPU");
                 selected = expand_blocks(blocks, visible, c.block_size);
             } else {
                 selected.resize(visible);
                 std::iota(selected.begin(), selected.end(), 0);
             }
-            const auto packed = g->get<float>(qkv);
+            const auto packed = seg.g->get<float>(seg.qkv);
             const size_t qn = size_t(c.q_heads) * c.head_dim, kn = size_t(c.kv_heads) * c.head_dim;
-            const char * phase = sparse ? "qsa.attention" : "full.attention";
+            const char * phase = seg.sparse ? "qsa.attention" : "full.attention";
             std::vector<float> queries(packed.begin(), packed.begin() + qn), keys(packed.begin() + qn, packed.begin() + qn + kn),
                 values(packed.begin() + qn + kn, packed.end());
             auto start = Clock::now();
@@ -1436,32 +1513,20 @@ struct Engine::Impl {
             append.event.bytes = (keys.size() + values.size()) * sizeof(ggml_bf16_t);
             s.attention->append(keys, values);
             append.finish();
-            ProfileScope attention_scope(&profiler, "cpu", sparse ? "sparse_attention" : "full_attention", phase, position, layer, "CPU");
+            ProfileScope attention_scope(&profiler, "cpu", seg.sparse ? "sparse_attention" : "full_attention", phase, position, layer, "CPU");
             auto output = s.attention->attend(queries, selected, &profiler, position, layer, phase);
             attention_scope.finish();
             stats.attention_ms += elapsed(start);
-            ++(sparse ? stats.sparse_attention_calls : stats.full_attention_calls);
-            if (capture || options.kv_placement == KVPlacement::CPU) step.selections.push_back({layer, std::move(selected)});
-            g = segment("hybrid.segment");
-            const auto p = "blk." + std::to_string(layer) + ".";
-            auto * attended = ggml_mul(g->c(), g->floats(output), ggml_sigmoid(g->c(), s.gate));
-            auto * projected = mm(*g, p + "attn.out", attended);
-            auto * residual = sparse ? combine(*g, hidden, projected, s.inject) : ggml_add(g->c(), hidden, projected);
-            h = ffn(*g, residual, p);
-            g->mark(h, sparse ? "qsa.finish" : "full.finish", layer);
+            ++(seg.sparse ? stats.sparse_attention_calls : stats.full_attention_calls);
+            step.selections.push_back({layer, std::move(selected)});
+            next.g->put(next.input, output.data(), output.size() * sizeof(float));
+            next.g->launch();
+            seg = std::move(next);
+            which ^= 1;
         }
-        auto mixed = c.architecture == Architecture::Qwen35
-            ? Mixed{norm(*g, h, "output_norm.weight"), nullptr} : mix(*g, h, "head", false);
-        auto * logits = mm(*g, "output.weight", mixed.value);
-        g->add(ggml_cpy(g->c(), logits, last_logits));
-        g->add(ggml_cpy(g->c(), h, hidden));
-        auto * finite = capture ? nullptr : ggml_sum(g->c(), ggml_sub(g->c(), logits, logits));
-        if (finite) g->output(finite);
-        g->mark(nullptr, "head", -1);
-        g->run();
         captured_logits.clear();
-        if (capture) step.logits = g->get<float>(last_logits);
-        if ((finite && !std::isfinite(g->get<float>(finite)[0])) ||
+        if (capture) step.logits = seg.g->get<float>(last_logits);
+        if ((seg.finite && !std::isfinite(seg.g->get<float>(seg.finite)[0])) ||
             !std::all_of(step.logits.begin(), step.logits.end(), [](float f) { return std::isfinite(f); }))
             throw std::runtime_error("Non-finite logits");
         captured_logits = step.logits;
