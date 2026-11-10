@@ -190,17 +190,19 @@ Config read_config(const gguf_context * f) {
 }
 
 struct Model::Backing {
-    struct Source { uint64_t offset; ggml_type type; };
-    std::ifstream input;
+    struct Source { int file; uint64_t offset; ggml_type type; };
+    std::vector<std::ifstream> inputs;
     std::map<ggml_tensor *, Source> sources;
     ggml_backend_buffer_type_t buft;
     Backend transfer{nullptr, ggml_backend_free};
     Buffer staging{nullptr, ggml_backend_buffer_free};
     std::mutex mutex;
     static constexpr size_t staging_bytes = 8 * 1024 * 1024;
-    Backing(const std::string & path, ggml_backend_t backend) : input(path, std::ios::binary),
-        buft(ggml_backend_get_default_buffer_type(backend)) {
-        if (!input) throw std::runtime_error("Cannot retain model backing file");
+    Backing(const std::vector<std::string> & paths, ggml_backend_t backend) : buft(ggml_backend_get_default_buffer_type(backend)) {
+        for (const auto & path : paths) {
+            inputs.emplace_back(path, std::ios::binary);
+            if (!inputs.back()) throw std::runtime_error("Cannot retain model backing file: " + path);
+        }
         auto host_type = ggml_backend_cpu_buffer_type();
 #ifdef TIDAL_CUDA
         if (ggml_backend_is_cuda(backend)) {
@@ -228,6 +230,7 @@ struct Model::Backing {
         try {
             for (auto * tensor : group.tensors) {
                 const auto source = sources.at(tensor);
+                auto & input = inputs.at(size_t(source.file));
                 const size_t encoded_row = ggml_row_size(source.type, tensor->ne[0]);
                 const size_t resident_row = ggml_row_size(tensor->type, tensor->ne[0]);
                 const int64_t rows = ggml_nelements(tensor) / tensor->ne[0];
@@ -254,32 +257,64 @@ struct Model::Backing {
     }
 };
 
-Model::Model(const std::string & path, ggml_backend_t backend) {
+namespace {
+struct SourceFile {
+    std::string path;
+    Gguf file{nullptr, gguf_free};
+    Context tensors{nullptr, ggml_free};
+};
+SourceFile open_source(const std::string & path) {
+    SourceFile f; f.path = path;
     ggml_context * raw = nullptr;
-    Gguf file(gguf_init_from_file(path.c_str(), {true, &raw}), gguf_free);
-    Context source(raw, ggml_free);
-    if (!file || !source) throw std::runtime_error("Cannot read GGUF: " + path);
-    config = read_config(file.get());
-    const auto specs = tensor_specs(config);
-    if (config.architecture == Architecture::Qwen4Exp && gguf_get_n_tensors(file.get()) != int64_t(specs.size()))
-        throw std::runtime_error("Unexpected number of model tensors");
+    f.file.reset(gguf_init_from_file(path.c_str(), {true, &raw}));
+    f.tensors.reset(raw);
+    if (!f.file || !f.tensors) throw std::runtime_error("Cannot read GGUF: " + path);
     std::ifstream input(path, std::ios::binary);
     input.seekg(0, std::ios::end);
     const auto length = input.tellg();
     if (length < 0) throw std::runtime_error("Cannot determine model file length");
-    const uint64_t data_offset = gguf_get_data_offset(file.get());
-    for (int64_t id = 0; id < gguf_get_n_tensors(file.get()); ++id) {
-        const uint64_t offset = gguf_get_tensor_offset(file.get(), id);
+    const uint64_t data_offset = gguf_get_data_offset(f.file.get());
+    for (int64_t id = 0; id < gguf_get_n_tensors(f.file.get()); ++id) {
+        const uint64_t offset = gguf_get_tensor_offset(f.file.get(), id);
         if (data_offset > uint64_t(length) || offset > uint64_t(length) - data_offset ||
-            gguf_get_tensor_size(file.get(), id) > uint64_t(length) - data_offset - offset)
-            throw std::runtime_error(std::string("Truncated GGUF tensor: ") + gguf_get_tensor_name(file.get(), id));
+            gguf_get_tensor_size(f.file.get(), id) > uint64_t(length) - data_offset - offset)
+            throw std::runtime_error(std::string("Truncated GGUF tensor: ") + gguf_get_tensor_name(f.file.get(), id));
+    }
+    return f;
+}
+}
+
+Model::Model(const std::string & path, ggml_backend_t backend, bool mtp, const std::string & mtp_path) {
+    std::vector<SourceFile> files;
+    files.push_back(open_source(path));
+    config = read_config(files[0].file.get());
+    auto specs = tensor_specs(config);
+    if (config.architecture == Architecture::Qwen4Exp && gguf_get_n_tensors(files[0].file.get()) != int64_t(specs.size()))
+        throw std::runtime_error("Unexpected number of model tensors");
+    if (!mtp && !mtp_path.empty()) throw std::invalid_argument("An MTP sidecar requires MTP to be enabled");
+    if (mtp) {
+        int file = 0;
+        if (!config.mtp_layers) {
+            if (mtp_path.empty()) throw std::runtime_error("The model has no MTP block; pass an MTP sidecar GGUF");
+            files.push_back(open_source(mtp_path));
+            auto * f = files[1].file.get();
+            auto flag = gguf_find_key(f, "tidal.mtp_sidecar");
+            auto blocks = gguf_find_key(f, "qwen35.block_count");
+            if (flag < 0 || gguf_get_kv_type(f, flag) != GGUF_TYPE_BOOL || !gguf_get_val_bool(f, flag) || blocks < 0 ||
+                gguf_get_kv_type(f, blocks) != GGUF_TYPE_UINT32 || gguf_get_val_u32(f, blocks) != uint32_t(config.layers + 1))
+                throw std::runtime_error("MTP sidecar does not match the model's block count");
+            file = 1;
+        } else if (!mtp_path.empty()) throw std::invalid_argument("The model already contains an MTP block");
+        else if (config.mtp_layers != 1) throw std::runtime_error("Only one MTP block is supported");
+        const auto extra = qwen35_mtp_specs(config, file);
+        specs.insert(specs.end(), extra.begin(), extra.end());
     }
     ctx.reset(ggml_init({specs.size() * ggml_tensor_overhead() + 4096, nullptr, true}));
     if (!ctx) throw std::runtime_error("Cannot allocate weight metadata");
-    std::map<std::string, ggml_tensor *> source_weights;
+    std::map<std::string, ggml_tensor *> source_weights[2];
     for (const auto & spec : specs) {
         const auto & source_name = spec.source_name.empty() ? spec.name : spec.source_name;
-        auto * t = ggml_get_tensor(source.get(), source_name.c_str());
+        auto * t = ggml_get_tensor(files.at(size_t(spec.file)).tensors.get(), source_name.c_str());
         if (!t || t->ne[0] != spec.columns || t->ne[1] != spec.rows || t->ne[2] != spec.slices || t->ne[3] != 1)
             throw std::runtime_error("Missing or invalid tensor shape: " + spec.name);
         if (!storage_type(t->type))
@@ -310,7 +345,7 @@ Model::Model(const std::string & path, ggml_backend_t backend) {
         auto * tensor = ggml_new_tensor_3d(ctx.get(), type, spec.columns, spec.rows, spec.slices);
         ggml_set_name(tensor, spec.name.c_str());
         weights.emplace(spec.name, tensor);
-        source_weights.emplace(source_name, tensor);
+        source_weights[spec.file].emplace(source_name, tensor);
         info.parameters += uint64_t(ggml_nelements(t));
         info.stored_weight_bytes += ggml_nbytes(t);
         info.resident_weight_bytes += ggml_nbytes(tensor);
@@ -320,22 +355,27 @@ Model::Model(const std::string & path, ggml_backend_t backend) {
                       << " -> " << ggml_type_name(type) << " on " << ggml_backend_name(backend) << '\n';
         }
     }
-    for (int64_t id = 0; id < gguf_get_n_tensors(file.get()); ++id) {
-        const std::string name = gguf_get_tensor_name(file.get(), id);
-        if (source_weights.contains(name)) continue;
-        if (!qwen35_mtp_tensor(config, name)) throw std::runtime_error("Unexpected model tensor: " + name);
-        ++info.skipped_tensors;
-        info.skipped_weight_bytes += gguf_get_tensor_size(file.get(), id);
-    }
+    for (size_t f = 0; f < files.size(); ++f)
+        for (int64_t id = 0; id < gguf_get_n_tensors(files[f].file.get()); ++id) {
+            const std::string name = gguf_get_tensor_name(files[f].file.get(), id);
+            if (source_weights[f].contains(name)) continue;
+            if (f || !qwen35_mtp_tensor(config, name)) throw std::runtime_error("Unexpected model tensor: " + name);
+            ++info.skipped_tensors;
+            info.skipped_weight_bytes += gguf_get_tensor_size(files[f].file.get(), id);
+        }
     if (config.tied_embeddings) weights.emplace("output.weight", weights.at("token_embd.weight"));
     std::cerr << "model weight bytes: stored=" << info.stored_weight_bytes << " resident="
               << info.resident_weight_bytes << " converted_tensors=" << info.converted_tensors << '\n';
-    backing = std::make_unique<Backing>(path, backend);
+    std::vector<std::string> paths;
+    for (const auto & f : files) paths.push_back(f.path);
+    backing = std::make_unique<Backing>(paths, backend);
     for (const auto & spec : specs) {
         auto * tensor = at(spec.name);
         int layer = -1;
         WeightPart part = WeightPart::Embedding;
-        if (spec.name.starts_with("blk.")) {
+        if (spec.name.starts_with("mtp.")) {
+            layer = config.layers; part = WeightPart::Attention;
+        } else if (spec.name.starts_with("blk.")) {
             const auto dot = spec.name.find('.', 4);
             layer = std::stoi(spec.name.substr(4, dot - 4));
             const auto suffix = spec.name.substr(dot + 1);
@@ -349,16 +389,18 @@ Model::Model(const std::string & path, ggml_backend_t backend) {
         if (id < 0) {
             id = int(groups.size()); groups.emplace_back();
             auto & g = groups.back(); g.layer = layer; g.part = part;
-            g.name = (layer >= 0 && layer < config.layers ? "blk." + std::to_string(layer) + "." : "") +
+            g.name = (layer >= 0 && layer < config.layers ? "blk." + std::to_string(layer) + "." :
+                      layer == config.layers && part != WeightPart::Head ? "mtp." : "") +
                 (part == WeightPart::Attention ? "attention" : part == WeightPart::FeedForward ? "ffn" :
                  part == WeightPart::PLE ? "ple" : part == WeightPart::Head ? "head" : "embedding");
         }
         auto & g = groups[id]; g.tensors.push_back(tensor); g.payload_bytes += ggml_nbytes(tensor);
         const auto & name = spec.source_name.empty() ? spec.name : spec.source_name;
-        auto * encoded = ggml_get_tensor(source.get(), name.c_str());
-        const int64_t index = gguf_find_tensor(file.get(), name.c_str());
-        backing->sources.emplace(tensor, Backing::Source{
-            gguf_get_data_offset(file.get()) + gguf_get_tensor_offset(file.get(), index), encoded->type});
+        const auto & f = files.at(size_t(spec.file));
+        auto * encoded = ggml_get_tensor(f.tensors.get(), name.c_str());
+        const int64_t index = gguf_find_tensor(f.file.get(), name.c_str());
+        backing->sources.emplace(tensor, Backing::Source{spec.file,
+            gguf_get_data_offset(f.file.get()) + gguf_get_tensor_offset(f.file.get(), index), encoded->type});
     }
     for (auto & g : groups) {
         g.allocation_bytes = ggml_backend_buft_get_alloc_size_n(backing->buft, g.tensors.data(), int(g.tensors.size()));

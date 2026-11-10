@@ -302,11 +302,29 @@ struct Engine::Impl {
     // Hybrid batches: residual input, attention gates and HC injections of the
     // attention layer in flight, for up to options.hybrid_batch_tokens tokens.
     ggml_tensor * batch_hidden = nullptr, * batch_gate = nullptr, * batch_inject = nullptr;
+    // Speculative verification (spec_tokens = max_draft_tokens + 1 positions):
+    // per-position logits and final hidden rows, GDN state snapshots (slot s at
+    // column s - 1), GDN convolution histories and QSA raw-index rows of the
+    // batch, from which a partial acceptance restores the state.
+    int spec_tokens = 0;
+    std::vector<ggml_tensor *> spec_logits;
+    ggml_tensor * spec_hidden = nullptr;
+    std::map<int, ggml_tensor *> spec_states, spec_conv, spec_raw;
+    // MTP: one full-attention block with persistent device KV. Positions below
+    // mtp_next have MTP KV rows; mtp_backlog holds the final hidden row of
+    // position mtp_next while its next token is pending (mtp_next == position - 1).
+    LayerState mtp_state;
+    ggml_tensor * mtp_backlog = nullptr;
+    int mtp_next = 0;
+    int32_t mtp_drafted_for = -1; // token the current MTP row of position - 1 was drafted with
     std::vector<int32_t> previous_tokens;
     // Consumed tokens (prompt-cache prefix matching) and host snapshots of the
     // state KV truncation cannot rewind, ordered by ascending position.
     std::vector<int32_t> sequence;
-    struct Checkpoint { int position; std::vector<std::vector<uint8_t>> state; std::vector<float> captured; };
+    struct Checkpoint {
+        int position; std::vector<std::vector<uint8_t>> state; std::vector<float> captured;
+        int mtp_next = 0; int32_t mtp_drafted_for = -1;
+    };
     std::deque<Checkpoint> checkpoints;
     int position = 0;
     bool failed = false;
@@ -321,7 +339,7 @@ struct Engine::Impl {
     std::unique_ptr<Graph> decode_graph;
 
     Impl(const std::string & path, Options opts)
-        : options(std::move(opts)), backend(make_backend(options)), model(path, backend.get()), c(model.config),
+        : options(std::move(opts)), backend(make_backend(options)), model(path, backend.get(), options.mtp, options.mtp_model), c(model.config),
           profiler(options.profile, options.nvtx, options.profile_event_limit), state_context(context(1024 * 1024)), states(c.layers) {
         if (options.prefill_chunk_tokens < 0 || options.prefill_attention_tile < 0 || options.prefill_attention_tile > 4096 ||
             (options.prefill_precision != PrefillPrecision::FP16 && options.prefill_precision != PrefillPrecision::BF16) ||
@@ -339,6 +357,33 @@ struct Engine::Impl {
             batch_hidden = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.hidden, c.branches, n);
             batch_gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, int64_t(c.q_heads) * c.head_dim, n);
             if (c.architecture == Architecture::Qwen4Exp) batch_inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.branches, n);
+        }
+        if (options.max_draft_tokens < 0 || options.max_draft_tokens > 15)
+            throw std::invalid_argument("Draft token count must be within 0-15");
+        if (options.max_draft_tokens) {
+            spec_tokens = options.max_draft_tokens + 1;
+            if (!batch_hidden || spec_tokens > options.hybrid_batch_tokens)
+                throw std::invalid_argument("Speculative decoding requires CUDA, CPU KV and hybrid batches of at least max_draft_tokens + 1");
+            if (!c.ple.layers.empty()) throw std::invalid_argument("Speculative decoding does not support PLE models");
+            for (int i = 0; i < spec_tokens; ++i) spec_logits.push_back(ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c.vocab));
+            spec_hidden = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, int64_t(c.hidden) * c.branches, spec_tokens);
+            const int channels = (2 * c.gdn_key_heads + c.gdn_value_heads) * c.gdn_dim;
+            for (int l = 0; l < c.layers; ++l) {
+                if (c.is_recurrent(l)) {
+                    spec_states[l] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, int64_t(c.gdn_dim) * c.gdn_dim * c.gdn_value_heads,
+                                                        std::max(1, spec_tokens - 1));
+                    spec_conv[l] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.conv_kernel - 1 + spec_tokens, channels);
+                } else if (c.architecture == Architecture::Qwen4Exp)
+                    spec_raw[l] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.index_dim, c.block_size - 1 + spec_tokens);
+            }
+        }
+        if (options.mtp) {
+            if (!spec_tokens) throw std::invalid_argument("MTP drafting requires max_draft_tokens > 0");
+            const auto type = options.prefill_precision == PrefillPrecision::FP16 ? GGML_TYPE_F16 : GGML_TYPE_BF16;
+            const int dim = attention_dim(), padded = (c.context + 255) / 256 * 256;
+            mtp_state.device_keys = ggml_new_tensor_3d(ctx, type, dim, padded, c.kv_heads);
+            mtp_state.device_values = ggml_new_tensor_3d(ctx, type, dim, padded, c.kv_heads);
+            mtp_backlog = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c.hidden);
         }
         last_logits = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c.vocab);
         for (int i = 0; i < c.layers; ++i) {
@@ -1048,7 +1093,9 @@ struct Engine::Impl {
                                c.gdn_dim, c.gdn_value_heads, count);
     }
     // Updates the convolution and recurrent state after the result is expanded.
-    ggml_tensor * build_batch_gdn(Graph & g, int layer, ggml_tensor * h) {
+    // Speculative batches also keep the state after every position and the
+    // convolution history, for rollback to any accepted length.
+    ggml_tensor * build_batch_gdn(Graph & g, int layer, ggml_tensor * h, bool speculative = false) {
         const int count = int(h->ne[2]);
         auto & state = states[layer];
         const auto p = "blk." + std::to_string(layer) + ".";
@@ -1076,7 +1123,8 @@ struct Engine::Impl {
         auto * beta = ggml_sigmoid(g.c(), mm(g, p + "gdn.b", mixed.value));
         decay = ggml_reshape_4d(g.c(), decay, 1, c.gdn_value_heads, count, 1);
         beta = ggml_reshape_4d(g.c(), beta, 1, c.gdn_value_heads, count, 1);
-        auto * packed = ggml_gated_delta_net(g.c(), q, k, v, decay, beta, state.recurrent, 1);
+        // K = count snapshots (slot s: the state s tokens before the last).
+        auto * packed = ggml_gated_delta_net(g.c(), q, k, v, decay, beta, state.recurrent, speculative ? count : 1);
         ggml_set_name(packed, (p + "gdn.batch_recurrence").c_str());
         auto * output = ggml_reshape_3d(g.c(), ggml_view_2d(g.c(), packed, vd, count, size_t(vd) * sizeof(float), 0),
                                        c.gdn_dim, c.gdn_value_heads, count);
@@ -1091,6 +1139,16 @@ struct Engine::Impl {
         g.add(ggml_cpy(g.c(), tail, state.conv));
         auto * final_state = ggml_view_1d(g.c(), packed, int64_t(c.gdn_dim) * vd, size_t(vd) * count * sizeof(float));
         g.add(ggml_cpy(g.c(), final_state, state.recurrent));
+        if (speculative) {
+            const int64_t slot = int64_t(c.gdn_dim) * vd;
+            if (count > 1) {
+                auto * older = ggml_view_2d(g.c(), packed, slot, count - 1, size_t(slot) * sizeof(float),
+                                            (size_t(vd) * count + size_t(slot)) * sizeof(float));
+                g.add(ggml_cpy(g.c(), older, ggml_view_2d(g.c(), spec_states.at(layer), slot, count - 1, spec_states.at(layer)->nb[1], 0)));
+            }
+            auto * conv = spec_conv.at(layer);
+            g.add(ggml_cpy(g.c(), history, ggml_view_2d(g.c(), conv, history->ne[0], channels, conv->nb[1], 0)));
+        }
         return result;
     }
     void batch_gdn(ggml_tensor * batch, int layer) {
@@ -1380,6 +1438,190 @@ struct Engine::Impl {
         if (exporter) exporter->enqueue(cache, keys, values, *state.attention, position, count, layer);
     }
 
+    // MTP block over m rows at positions first.. (Qwen3-Next/Qwen3.5 MTP): the
+    // final-normed hidden state of position i and the embedding of token i+1
+    // predict token i+2. Appends MTP KV rows [first, first + m) and returns the
+    // block's normed output [hidden, m]; `rows` are main-model final hidden
+    // states (normalized here) unless `normalized` (a previous MTP output).
+    ggml_tensor * build_mtp(Graph & g, ggml_tensor * rows, ggml_tensor * next, int first, bool normalized) {
+        const int m = int(rows->ne[1]);
+        const auto p = "blk." + std::to_string(c.layers) + ".";
+        const int qwidth = c.q_heads * c.head_dim;
+        auto * h = normalized ? rows : norm(g, rows, "output_norm.weight");
+        auto * e = norm(g, ggml_reshape_2d(g.c(), ggml_get_rows(g.c(), weight("token_embd.weight"), next), c.hidden, m), "mtp.enorm");
+        auto * x = mm(g, "mtp.eh_proj", ggml_concat(g.c(), e, norm(g, h, "mtp.hnorm"), 0));
+        auto * a = norm(g, x, p + "attn_norm");
+        auto * qg = mm(g, p + "attn.qg", a);
+        auto * q = ggml_cont(g.c(), ggml_view_3d(g.c(), qg, c.head_dim, c.q_heads, m, size_t(2*c.head_dim)*sizeof(float), qg->nb[1], 0));
+        auto * gate = ggml_cont(g.c(), ggml_view_3d(g.c(), qg, c.head_dim, c.q_heads, m,
+            size_t(2*c.head_dim)*sizeof(float), qg->nb[1], size_t(c.head_dim)*sizeof(float)));
+        q = batch_rope(g, norm(g, q, p + "attn.q_norm"), c.head_dim, c.q_heads, m, first);
+        auto * k = ggml_reshape_3d(g.c(), mm(g, p + "attn.k", a), c.head_dim, c.kv_heads, m);
+        k = batch_rope(g, norm(g, k, p + "attn.k_norm"), c.head_dim, c.kv_heads, m, first);
+        auto * v = mm(g, p + "attn.v", a);
+        // Rows land at [first, first + m); callers commit mtp_state.device_kv_size
+        // after the graph runs, so a rebuilt graph may append at first again.
+        mtp_state.device_kv_size = first;
+        append_device_kv(g, mtp_state, k, v, first, m);
+        const int visible = first + m, padded = (visible + 255) / 256 * 256;
+        auto * mask = ggml_diag_mask_inf(g.c(), ggml_fill(g.c(), ggml_new_tensor_2d(g.c(), GGML_TYPE_F32, padded, m), 0), first);
+        auto * attended = flash_attention(g, q, mtp_state.device_keys, mtp_state.device_values, mask, m, visible);
+        attended = ggml_mul(g.c(), ggml_reshape_2d(g.c(), attended, qwidth, m), ggml_sigmoid(g.c(), ggml_reshape_2d(g.c(), gate, qwidth, m)));
+        x = ggml_add(g.c(), x, mm(g, p + "attn.out", attended));
+        x = build_batch_ffn(g, c.layers, ggml_reshape_3d(g.c(), x, c.hidden, 1, m));
+        return norm(g, ggml_reshape_2d(g.c(), x, c.hidden, m), "mtp.head_norm");
+    }
+    // MTP rows for the positions of a batch [start, start + n) of `tokens` whose
+    // next token is known inside it, preceded by the pending backlog position
+    // (start - 1) when there is one. Rows are written from mtp_next; returns
+    // the row count. `h` holds the batch's final hidden rows [hidden, n].
+    int build_mtp_catch_up(Graph & g, ggml_tensor * h, const std::vector<int32_t> & tokens) {
+        const int n = int(tokens.size()), start = position;
+        const bool backlog = mtp_next == start - 1;
+        if (!backlog && mtp_next != start) throw std::logic_error("MTP rows are inconsistent with the sequence");
+        const int rows = int(backlog) + n - 1;
+        if (rows <= 0) return 0;
+        ggml_tensor * input = n > 1 ? ggml_view_2d(g.c(), h, c.hidden, n - 1, h->nb[1], 0) : nullptr;
+        if (backlog) input = input ? ggml_concat(g.c(), ggml_reshape_2d(g.c(), mtp_backlog, c.hidden, 1), input, 1)
+                                   : ggml_reshape_2d(g.c(), mtp_backlog, c.hidden, 1);
+        std::vector<int32_t> next(tokens.begin() + (backlog ? 0 : 1), tokens.end());
+        g.add(build_mtp(g, input, g.integers(next), mtp_next, false));
+        return rows;
+    }
+    // An MTP row of position - 1 drafted with a different next token is redone.
+    void mtp_sync(int32_t token) {
+        if (!mtp_backlog || !position || mtp_next != position || token == mtp_drafted_for) return;
+        mtp_next = position - 1;
+        mtp_state.device_kv_size = mtp_next;
+    }
+    // After one decoded token (now position - 1): the previous position's MTP
+    // row if still pending, then the new backlog row.
+    void mtp_after_decode(int32_t token) {
+        const int p = position - 1;
+        Graph g(backend.get(), stats, true, profiler, "mtp.catch_up", p, c.layers, nullptr, decode_allocator_get(0), 4096);
+        const bool row = mtp_next == p - 1;
+        if (row) g.add(build_mtp(g, ggml_reshape_2d(g.c(), mtp_backlog, c.hidden, 1), g.integers({token}), p - 1, false));
+        g.add(ggml_cpy(g.c(), ggml_reshape_1d(g.c(), hidden, c.hidden), mtp_backlog));
+        g.run();
+        mtp_state.device_kv_size = p; mtp_next = p; mtp_drafted_for = -1;
+    }
+    std::vector<int32_t> draft(int32_t token, int count) {
+        if (failed) throw std::runtime_error("Previous execution failed; call reset() before drafting");
+        if (!mtp_backlog) throw std::logic_error("MTP drafting requires Options::mtp");
+        if (token < 0 || token >= c.vocab) throw std::out_of_range("Token ID outside vocabulary");
+        if (count < 1 || count > options.max_draft_tokens) throw std::invalid_argument("Draft count must be within 1-max_draft_tokens");
+        if (!position) throw std::logic_error("Consume at least one token before drafting");
+        count = std::min(count, c.context - position - 1);
+        if (count < 1) return {};
+        try {
+            mtp_next = position - 1; mtp_state.device_kv_size = mtp_next; // Redraft from the backlog row.
+            ProfileScope scope(&profiler, "token", "mtp_draft", "mtp", position, -1, "CPU");
+            Graph g(backend.get(), stats, true, profiler, "mtp.draft", position, c.layers, nullptr, decode_allocator_get(0), 8192);
+            ggml_tensor * rows = ggml_reshape_2d(g.c(), mtp_backlog, c.hidden, 1), * next = g.integers({token});
+            ggml_tensor * ids = nullptr;
+            for (int i = 0; i < count; ++i) {
+                // Steps after the first feed the block its own output and greedy draft;
+                // their KV rows (positions >= position) are speculative and dropped.
+                rows = build_mtp(g, rows, next, position - 1 + i, i > 0);
+                next = ggml_argmax(g.c(), mm(g, "output.weight", rows));
+                ids = ids ? ggml_concat(g.c(), ids, next, 0) : next;
+            }
+            g.output(ids);
+            g.run();
+            const auto drafts = g.get<int32_t>(ids);
+            mtp_state.device_kv_size = position; mtp_next = position; mtp_drafted_for = token;
+            ++stats.mtp_drafts;
+            return drafts;
+        } catch (...) { failed = true; throw; }
+    }
+    std::vector<int32_t> verify(int32_t token, const std::vector<int32_t> & drafts) {
+        if (failed) throw std::runtime_error("Previous execution failed; call reset() before verifying");
+        if (!spec_tokens) throw std::logic_error("Speculative decoding requires Options::max_draft_tokens > 0");
+        if (int(drafts.size()) > options.max_draft_tokens) throw std::invalid_argument("Too many drafted tokens");
+        std::vector<int32_t> tokens{token};
+        tokens.insert(tokens.end(), drafts.begin(), drafts.end());
+        for (auto t : tokens) if (t < 0 || t >= c.vocab) throw std::out_of_range("Token ID outside vocabulary");
+        if (position + int(tokens.size()) > c.context) throw std::out_of_range("Context capacity exceeded; reset before decoding a new sequence");
+        try {
+            ProfileScope scope(&profiler, "token", "verify", "decode", position, -1, "CPU");
+            mtp_sync(token);
+            const int n = int(tokens.size()), start = position;
+            std::vector<Step> steps(n);
+            int which = 0;
+            auto seg = build_batch_segment(-1, decode_allocator_get(which), tokens, false, true);
+            seg.g->launch();
+            for (;;) {
+                BatchSegment next;
+                if (seg.attention >= 0) {
+                    next = build_batch_segment(seg.attention, decode_allocator_get(which ^ 1), tokens, false, true);
+                    next.g->reserve();
+                }
+                seg.g->wait();
+                if (seg.attention < 0) break;
+                const auto output = batch_segment_attention(seg, n, steps, false);
+                next.g->put(next.input, output.data(), output.size() * sizeof(float));
+                next.g->launch();
+                seg = std::move(next);
+                which ^= 1;
+            }
+            if (!std::isfinite(seg.g->get<float>(seg.finite)[0])) throw std::runtime_error("Non-finite logits");
+            const int mtp_rows = seg.mtp_rows;
+            seg.g.reset();
+            // Sample position by position as decode + sample would.
+            std::vector<int32_t> emitted;
+            sampler->accept(token);
+            int consumed = 1;
+            for (int i = 0; i < n; ++i) {
+                const int32_t sample = sampler->sample(spec_logits[i], nullptr, start + i);
+                emitted.push_back(sample);
+                if (i + 1 < n && sample == tokens[i + 1]) { sampler->accept(sample); ++consumed; continue; }
+                break;
+            }
+            // Install the state after `consumed` positions.
+            for (auto & s : states) if (s.attention) s.attention->truncate(start + consumed);
+            {
+                Graph g(backend.get(), stats, true, profiler, "verify.rollback", start, -1, nullptr, decode_allocator_get(0), 4096);
+                const int j = consumed;
+                g.add(ggml_cpy(g.c(), spec_logits[j - 1], last_logits));
+                g.add(ggml_cpy(g.c(), ggml_view_1d(g.c(), spec_hidden, spec_hidden->ne[0], size_t(j - 1) * spec_hidden->nb[1]),
+                               ggml_reshape_1d(g.c(), hidden, ggml_nelements(hidden))));
+                if (mtp_backlog) g.add(ggml_cpy(g.c(), ggml_view_1d(g.c(), spec_hidden, c.hidden, size_t(j - 1) * spec_hidden->nb[1]), mtp_backlog));
+                if (j < n)
+                    for (int l = 0; l < c.layers; ++l) {
+                        auto & state = states[l];
+                        if (c.is_recurrent(l)) {
+                            auto * snapshots = spec_states.at(l), * history = spec_conv.at(l);
+                            g.add(ggml_cpy(g.c(), ggml_view_1d(g.c(), snapshots, snapshots->ne[0], size_t(n - j - 1) * snapshots->nb[1]),
+                                           ggml_reshape_1d(g.c(), state.recurrent, ggml_nelements(state.recurrent))));
+                            g.add(ggml_cpy(g.c(), ggml_view_2d(g.c(), history, c.conv_kernel - 1, history->ne[1], history->nb[1], size_t(j) * sizeof(float)),
+                                           state.conv));
+                        } else if (spec_raw.contains(l)) {
+                            const int end = start + j, tail = end % c.block_size;
+                            if (tail) {
+                                auto * raw = spec_raw.at(l);
+                                const int offset = end - tail - (start - start % c.block_size);
+                                g.add(ggml_cpy(g.c(), ggml_view_2d(g.c(), raw, c.index_dim, tail, raw->nb[1], size_t(offset) * raw->nb[1]),
+                                               ggml_view_2d(g.c(), state.raw_index, c.index_dim, tail, state.raw_index->nb[1], 0)));
+                            }
+                        }
+                    }
+                g.run();
+            }
+            if (mtp_backlog) {
+                // Rows through position start + consumed - 2 had accepted next tokens.
+                mtp_next = std::min(mtp_next + mtp_rows, start + consumed - 1);
+                mtp_state.device_kv_size = mtp_next;
+                mtp_drafted_for = -1;
+            }
+            captured_logits.clear();
+            sequence.insert(sequence.end(), tokens.begin(), tokens.begin() + consumed);
+            position += consumed;
+            ++stats.speculative_verifications;
+            stats.speculative_drafted += drafts.size();
+            stats.speculative_accepted += uint64_t(consumed - 1);
+            return emitted;
+        } catch (...) { failed = true; throw; }
+    }
     // Hybrid batch: like CPU-KV decode, GPU sublayers between two attention
     // layers form one segment graph, but over every token at once; the CPU
     // appends the batch's K/V and attends each query to its causal selection.
@@ -1389,13 +1631,15 @@ struct Engine::Impl {
         ggml_tensor * input = nullptr;   // [q_heads * head_dim, n] CPU attention outputs consumed here
         int attention = -1;              // attention layer whose projections end it; -1: head
         ggml_tensor * qkv = nullptr, * top = nullptr, * finite = nullptr, * logits = nullptr, * last = nullptr;
+        int mtp_rows = 0;                // MTP KV rows appended from mtp_next
     };
     // First n tokens of a batch scratch tensor (token is the last dimension).
     ggml_tensor * batch_view(Graph & g, ggml_tensor * t, int n) {
         return t == batch_hidden ? ggml_view_3d(g.c(), t, t->ne[0], t->ne[1], n, t->nb[1], t->nb[2], 0)
                                  : ggml_view_2d(g.c(), t, t->ne[0], n, t->nb[1], 0);
     }
-    BatchSegment build_batch_segment(int finished, ggml_gallocr * allocator, const std::vector<int32_t> & tokens, bool capture) {
+    BatchSegment build_batch_segment(int finished, ggml_gallocr * allocator, const std::vector<int32_t> & tokens, bool capture,
+                                     bool speculative = false) {
         const int n = int(tokens.size()), start = position;
         const bool sparse = c.architecture == Architecture::Qwen4Exp;
         BatchSegment seg;
@@ -1422,7 +1666,7 @@ struct Engine::Impl {
         for (int layer = finished + 1; layer < c.layers; ++layer) {
             if (states[layer].ple) { h = shaped(build_batch_ple(g, layer, h, tokens, 0)); g.mark(h, "ple", layer); }
             if (c.is_recurrent(layer)) {
-                h = shaped(build_batch_gdn(g, layer, h));
+                h = shaped(build_batch_gdn(g, layer, h, speculative));
                 h = shaped(build_batch_ffn(g, layer, h));
                 g.mark(h, "gdn", layer);
                 continue;
@@ -1452,6 +1696,9 @@ struct Engine::Impl {
                 const int old_tail = start % c.block_size;
                 if (old_tail) raw = ggml_concat(g.c(), ggml_view_2d(g.c(), state.raw_index,
                     c.index_dim, old_tail, state.raw_index->nb[1], 0), raw, 1);
+                // Raw rows from the start of the first block, for ring rollback.
+                if (speculative) g.add(ggml_cpy(g.c(), raw, ggml_view_2d(g.c(), spec_raw.at(layer), c.index_dim, old_tail + n,
+                                                                         spec_raw.at(layer)->nb[1], 0)));
                 const int new_blocks = (old_tail + n) / c.block_size;
                 if (new_blocks) {
                     auto * complete = ggml_cont(g.c(), ggml_view_2d(g.c(), raw, c.index_dim,
@@ -1511,6 +1758,25 @@ struct Engine::Impl {
             return mm(g, "output.weight", mixed.value);
         };
         auto * finite = ggml_sum(g.c(), ggml_sub(g.c(), h, h));
+        auto * flat = ggml_reshape_2d(g.c(), h, int64_t(c.hidden) * c.branches, n);
+        if (mtp_backlog) {
+            // MTP rows whose next token is known; in a speculative batch rows past
+            // the accepted length are discarded by truncating MTP KV.
+            seg.mtp_rows = build_mtp_catch_up(g, flat, tokens);
+            if (!speculative) g.add(ggml_cpy(g.c(), ggml_view_1d(g.c(), flat, c.hidden, size_t(n - 1) * flat->nb[1]), mtp_backlog));
+        }
+        if (speculative) {
+            // Every position's logits and final hidden row: sampling decides the
+            // accepted length, after which the last consumed row is installed.
+            auto * all = project(h);
+            for (int i = 0; i < n; ++i)
+                g.add(ggml_cpy(g.c(), ggml_view_1d(g.c(), all, c.vocab, size_t(i) * all->nb[1]), spec_logits[i]));
+            g.add(ggml_cpy(g.c(), flat, ggml_view_2d(g.c(), spec_hidden, flat->ne[0], n, spec_hidden->nb[1], 0)));
+            seg.finite = ggml_add(g.c(), finite, ggml_sum(g.c(), ggml_sub(g.c(), all, all)));
+            g.output(seg.finite);
+            g.mark(nullptr, "head", -1);
+            return seg;
+        }
         if (capture && n > 1) {
             seg.logits = project(h);
             g.output(seg.logits);
@@ -1614,13 +1880,46 @@ struct Engine::Impl {
         }
         sequence.insert(sequence.end(), tokens.begin(), tokens.end());
         position += n; stats.prefill_tokens += uint64_t(n);
+        if (mtp_backlog) { mtp_next = position - 1; mtp_state.device_kv_size = mtp_next; mtp_drafted_for = -1; }
         return result;
+    }
+    // Layer-major prefill: MTP KV rows for every prompt position whose next token
+    // is known, from the batch's final hidden rows; the last becomes the backlog.
+    void prefill_mtp(ggml_tensor * batch, const std::vector<int32_t> & tokens) {
+        prefill_memory->protect(c.layers, {model.group(-1, WeightPart::Embedding), model.group(c.layers, WeightPart::Head),
+                                           model.group(c.layers, WeightPart::Attention), model.group(c.layers, WeightPart::FeedForward)});
+        const int count = int(tokens.size());
+        const bool backlog = mtp_next == position - 1;
+        if (!backlog && mtp_next != position) throw std::logic_error("MTP rows are inconsistent with the sequence");
+        const int rows = int(backlog) + count - 1, padded = (c.context + 255) / 256 * 256;
+        if (rows > 0)
+            chunks("prefill.mtp", c.layers, rows, sizeof(float)*(16*uint64_t(c.hidden)+4*uint64_t(c.ffn)+2*uint64_t(padded)),
+                   options.prefill_chunk_tokens, [&](int first, int n) {
+                auto g = graph("prefill.mtp", c.layers, first);
+                ggml_tensor * input = nullptr;
+                std::vector<int32_t> next;
+                int r = first;
+                if (backlog && r == 0) { input = ggml_reshape_2d(g.c(), mtp_backlog, c.hidden, 1); next.push_back(tokens[0]); ++r; }
+                const int b0 = r - int(backlog), bn = first + n - r;
+                if (bn > 0) {
+                    auto * part = ggml_reshape_2d(g.c(), token_range(g.c(), batch, b0, bn), c.hidden, bn);
+                    input = input ? ggml_concat(g.c(), input, part, 1) : part;
+                    for (int i = 0; i < bn; ++i) next.push_back(tokens[b0 + i + 1]);
+                }
+                g.add(build_mtp(g, input, g.integers(next), mtp_next, false));
+                g.run();
+            }, [&](int, int n) { mtp_next += n; mtp_state.device_kv_size = mtp_next; });
+        auto g = graph("prefill.mtp", c.layers, count - 1);
+        g.add(ggml_cpy(g.c(), ggml_reshape_1d(g.c(), token_range(g.c(), batch, count - 1, 1), c.hidden), mtp_backlog));
+        g.run();
+        mtp_state.device_kv_size = mtp_next; mtp_drafted_for = -1;
     }
     std::vector<Step> prefill(const std::vector<int32_t> & tokens, bool capture) {
         if (failed) throw std::runtime_error("Previous execution failed; call reset() before prefill");
         if (tokens.size() > size_t(c.context-position)) throw std::out_of_range("Prompt exceeds context capacity");
         for (auto token : tokens) if (token < 0 || token >= c.vocab) throw std::out_of_range("Prompt token outside vocabulary");
         if (tokens.empty()) return {};
+        mtp_sync(tokens[0]);
         if (batch_hidden && tokens.size() <= size_t(options.hybrid_batch_tokens)) {
             // Weights stay in the decode layout, so reusable decode segments survive.
             try { return prefill_hybrid(tokens, capture); } catch (...) { failed = true; throw; }
@@ -1704,6 +2003,7 @@ struct Engine::Impl {
                     if (!std::isfinite(g.get<float>(finite)[0])) throw std::runtime_error("Non-finite logits or hidden values during prefill");
                     if (capture) result.back().logits = g.get<float>(last_logits);
                 }
+                if (mtp_backlog) prefill_mtp(batch, tokens);
                 if (exporter) exporter->finish();
             }
             memory.reclaim_completed = {}; memory.wait_transfers = {};
@@ -2015,6 +2315,14 @@ struct Engine::Impl {
         captured_logits = step.logits;
     }
     Step decode(int32_t token, bool capture_logits) {
+        if (!mtp_backlog) return decode_step(token, capture_logits);
+        if (failed) throw std::runtime_error("Previous decode failed; call reset() before reusing the engine");
+        mtp_sync(token);
+        auto step = decode_step(token, capture_logits);
+        try { mtp_after_decode(token); } catch (...) { failed = true; throw; }
+        return step;
+    }
+    Step decode_step(int32_t token, bool capture_logits) {
         if (failed) throw std::runtime_error("Previous decode failed; call reset() before reusing the engine");
         if (token < 0 || token >= c.vocab) throw std::out_of_range("Token ID outside vocabulary");
         if (position >= c.context) throw std::out_of_range("Context capacity exceeded; reset before decoding a new sequence");
@@ -2097,6 +2405,7 @@ struct Engine::Impl {
     // block completes and are masked out of scoring until then.
     std::vector<ggml_tensor *> rollback_tensors() const {
         std::vector<ggml_tensor *> result{hidden, last_logits};
+        if (mtp_backlog) result.push_back(mtp_backlog);
         for (const auto & s : states)
             for (auto * t : {s.conv, s.recurrent, s.ple_conv, s.raw_index}) if (t) result.push_back(t);
         return result;
@@ -2106,7 +2415,7 @@ struct Engine::Impl {
         if (!checkpoints.empty() && checkpoints.back().position == position) checkpoints.pop_back();
         ProfileScope scope(&profiler, "host", "prompt_checkpoint_save", "prompt_cache", position, -1, "CPU");
         ggml_backend_synchronize(backend.get());
-        Checkpoint checkpoint{position, {}, captured_logits};
+        Checkpoint checkpoint{position, {}, captured_logits, mtp_next, mtp_drafted_for};
         for (auto * t : rollback_tensors()) {
             auto & bytes = checkpoint.state.emplace_back(ggml_nbytes(t));
             ggml_backend_tensor_get(t, bytes.data(), 0, bytes.size());
@@ -2146,6 +2455,10 @@ struct Engine::Impl {
             previous_tokens.assign(sequence.end() - std::min<size_t>(sequence.size(), c.ple.ngram_size - 1), sequence.end());
         sampler->rewind(sequence);
         captured_logits = checkpoint ? checkpoint->captured : std::vector<float>{};
+        // MTP KV rows below the snapshot's mtp_next belong to the shared prefix.
+        mtp_next = checkpoint ? checkpoint->mtp_next : 0;
+        mtp_drafted_for = checkpoint ? checkpoint->mtp_drafted_for : -1;
+        mtp_state.device_kv_size = mtp_next;
         position = target;
         while (!checkpoints.empty() && checkpoints.back().position > target) checkpoints.pop_back();
         update_checkpoint_bytes();
@@ -2180,6 +2493,7 @@ struct Engine::Impl {
             if (s.attention) s.attention->reset();
             s.device_kv_size = 0;
         }
+        mtp_state.device_kv_size = 0; mtp_next = 0; mtp_drafted_for = -1;
         if (kv_token_ids) {
             std::vector<int32_t> ids(c.context); std::iota(ids.begin(), ids.end(), 0);
             ggml_backend_tensor_set(kv_token_ids, ids.data(), 0, ids.size()*sizeof(int32_t));
@@ -2210,6 +2524,8 @@ std::vector<Step> Engine::prefill_cached(const std::vector<int32_t> & tokens, bo
     return impl_->prefill_cached(tokens, capture_logits);
 }
 const std::vector<int32_t> & Engine::tokens() const { return impl_->sequence; }
+std::vector<int32_t> Engine::verify(int32_t token, const std::vector<int32_t> & drafts) { return impl_->verify(token, drafts); }
+std::vector<int32_t> Engine::draft(int32_t token, int count) { return impl_->draft(token, count); }
 void Engine::reset() { impl_->reset(); }
 const Config & Engine::config() const { return impl_->c; }
 const Statistics & Engine::statistics() const { return impl_->stats; }

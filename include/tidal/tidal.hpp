@@ -137,6 +137,13 @@ struct Options {
     // weights, attention on the CPU KV) instead of layer-major GPU prefill,
     // which uploads the whole KV prefix per attention layer. Zero disables.
     int hybrid_batch_tokens = 96;
+    // Speculative decoding (CUDA with CPU KV): Engine::verify checks up to this
+    // many drafted tokens per call. Zero disables it and its state snapshots.
+    int max_draft_tokens = 0;
+    // Load the model's MTP block for Engine::draft (Qwen3.5 architecture). A
+    // model file without one needs mtp_model, a sidecar GGUF of the MTP tensors.
+    bool mtp = false;
+    std::string mtp_model;
 };
 
 struct Selection {
@@ -177,6 +184,8 @@ struct Statistics {
     uint64_t prompt_cache_reused_tokens = 0; // prefill_cached positions not re-evaluated.
     uint64_t prompt_cache_restores = 0;      // Rollbacks to a snapshot (or to an empty sequence).
     uint64_t prompt_cache_checkpoint_bytes = 0; // Host memory held by current snapshots.
+    uint64_t speculative_verifications = 0, speculative_drafted = 0, speculative_accepted = 0;
+    uint64_t mtp_drafts = 0; // Engine::draft calls.
 };
 
 struct ModelInfo {
@@ -211,6 +220,17 @@ public:
     std::vector<Step> prefill_cached(const std::vector<int32_t> & tokens, bool capture_logits = true);
     // Every consumed token of the current sequence, in order.
     const std::vector<int32_t> & tokens() const;
+    // Speculative decoding (Options::max_draft_tokens > 0). Consumes `token`
+    // and verifies `drafts` after it in one batch: positions are sampled in
+    // order with the decode sampler (penalties, RNG) and a draft is accepted
+    // while it equals the sample. Returns the accepted drafts followed by the
+    // first sample that is not an accepted draft; that last token is not
+    // consumed and is the next call's `token`. With deterministic drafts the
+    // output distribution equals decode + sample.
+    std::vector<int32_t> verify(int32_t token, const std::vector<int32_t> & drafts);
+    // MTP (Options::mtp): greedy guesses of up to `count` tokens that follow
+    // `token`, the sampled but not yet consumed next token.
+    std::vector<int32_t> draft(int32_t token, int count);
     // Draw from the last decoded position; consumes RNG but no context token.
     int32_t sample();
     std::string sampling_backend_name() const;

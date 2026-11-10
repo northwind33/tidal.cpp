@@ -34,6 +34,7 @@ struct TensorSpec {
     enum Kind { Matrix, Norm, Conv, ALog, Bias, Embedding, Lookup, Router, Expert } kind;
     int64_t slices = 1;
     std::string source_name; // Empty means the engine name is also the GGUF name.
+    int file = 0;            // 0: model GGUF; 1: MTP sidecar GGUF.
 };
 std::vector<TensorSpec> tensor_specs(const Config & c);
 bool storage_type(ggml_type type);
@@ -46,6 +47,9 @@ Config read_qwen35_config(const gguf_context * file);
 void validate_qwen35(const Config & config);
 std::vector<TensorSpec> qwen35_tensor_specs(const Config & config);
 bool qwen35_mtp_tensor(const Config & config, const std::string & name);
+// MTP block of a Qwen3.5 file (blk.<layers>.*, nextn.*) under engine names:
+// blk.<layers>.{attn_norm, attn.*, ffn_norm, ffn.*} and mtp.{eh_proj, enorm, hnorm, head_norm}.
+std::vector<TensorSpec> qwen35_mtp_specs(const Config & config, int file);
 void validate_ple(const Config & config);
 void write_ple(gguf_context * file, const PLEConfig & config);
 void read_ple(const gguf_context * file, Config & config);
@@ -70,7 +74,10 @@ struct Model {
     Context ctx{nullptr, ggml_free};
     std::vector<WeightGroup> groups;
     std::map<std::string, ggml_tensor *> weights;
-    Model(const std::string & path, ggml_backend_t backend);
+    // With mtp, the MTP block is loaded from the model file or, when the model
+    // has none, from mtp_path (a sidecar holding only the MTP tensors).
+    Model(const std::string & path, ggml_backend_t backend, bool mtp = false, const std::string & mtp_path = {});
+    bool has_mtp() const { return weights.contains("mtp.eh_proj"); }
     ~Model();
     Model(const Model &) = delete;
     Model & operator=(const Model &) = delete;

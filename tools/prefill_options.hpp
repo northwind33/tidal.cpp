@@ -111,5 +111,9 @@ inline void prefill_stats(std::ostream & out, const tidal::Statistics & s) {
         << ",\"gpu_kv_bytes\":" << s.gpu_kv_bytes
         << ",\"prompt_cache_reused_tokens\":" << s.prompt_cache_reused_tokens
         << ",\"prompt_cache_restores\":" << s.prompt_cache_restores
-        << ",\"prompt_cache_checkpoint_bytes\":" << s.prompt_cache_checkpoint_bytes;
+        << ",\"prompt_cache_checkpoint_bytes\":" << s.prompt_cache_checkpoint_bytes
+        << ",\"speculative_verifications\":" << s.speculative_verifications
+        << ",\"speculative_drafted\":" << s.speculative_drafted
+        << ",\"speculative_accepted\":" << s.speculative_accepted
+        << ",\"mtp_drafts\":" << s.mtp_drafts;
 }

@@ -156,6 +156,32 @@ std::vector<TensorSpec> qwen35_tensor_specs(const Config & c) {
     return result;
 }
 
+std::vector<TensorSpec> qwen35_mtp_specs(const Config & c, int file) {
+    if (c.architecture != Architecture::Qwen35) throw std::invalid_argument("MTP requires a Qwen3.5-architecture model");
+    std::vector<TensorSpec> result;
+    const auto p = "blk." + std::to_string(c.layers) + ".";
+    auto add = [&](std::string name, std::string source, int64_t in, int64_t out = 1, TensorSpec::Kind kind = TensorSpec::Matrix) {
+        result.push_back({std::move(name), in, out, kind, 1, p + source, file});
+    };
+    add("mtp.eh_proj", "nextn.eh_proj.weight", 2 * c.hidden, c.hidden);
+    add("mtp.enorm", "nextn.enorm.weight", c.hidden, 1, TensorSpec::Norm);
+    add("mtp.hnorm", "nextn.hnorm.weight", c.hidden, 1, TensorSpec::Norm);
+    add("mtp.head_norm", "nextn.shared_head_norm.weight", c.hidden, 1, TensorSpec::Norm);
+    add(p + "attn_norm", "attn_norm.weight", c.hidden, 1, TensorSpec::Norm);
+    add(p + "ffn_norm", "post_attention_norm.weight", c.hidden, 1, TensorSpec::Norm);
+    add(p + "attn.qg", "attn_q.weight", c.hidden, 2*c.q_heads*c.head_dim);
+    add(p + "attn.k", "attn_k.weight", c.hidden, c.kv_heads*c.head_dim);
+    add(p + "attn.v", "attn_v.weight", c.hidden, c.kv_heads*c.head_dim);
+    add(p + "attn.out", "attn_output.weight", c.q_heads*c.head_dim, c.hidden);
+    add(p + "attn.q_norm", "attn_q_norm.weight", c.head_dim, 1, TensorSpec::Norm);
+    add(p + "attn.k_norm", "attn_k_norm.weight", c.head_dim, 1, TensorSpec::Norm);
+    for (const auto * name : {"gate", "up", "down"}) {
+        const bool down = std::string(name) == "down";
+        add(p + "ffn." + name, std::string("ffn_") + name + ".weight", down ? c.ffn : c.hidden, down ? c.hidden : c.ffn);
+    }
+    return result;
+}
+
 bool qwen35_mtp_tensor(const Config & c, const std::string & name) {
     if (c.architecture != Architecture::Qwen35) return false;
     const std::set<std::string> suffixes = {"attn_norm.weight", "post_attention_norm.weight", "attn_q.weight",

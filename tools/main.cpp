@@ -18,10 +18,14 @@ template<class T> void array(std::ostream & out, const std::vector<T> & values) 
 }
 int main(int argc, char ** argv) {
     try {
-        Args args(argc, argv, prefill_options(sampling_options({"--help", "--model", "--backend", "--device", "--threads", "--tokens", "--steps", "--json", "--repeat", "--context", "--stop-at-eos"})));
+        Args args(argc, argv, prefill_options(sampling_options({"--help", "--model", "--backend", "--device", "--threads", "--tokens", "--steps", "--json", "--repeat", "--context", "--stop-at-eos", "--draft-tokens", "--mtp"})));
         if (!args.get("--help").empty()) {
             std::cout << "tidal-cli --model tiny.gguf [--backend cuda|cpu] [--device 0] [--threads 4] "
-                         "[--tokens 1,2,3] [--steps 8] [--json trace.json] [--repeat 1] [--context N] [--stop-at-eos 0|1]\n";
+                         "[--tokens 1,2,3] [--steps 8] [--json trace.json] [--repeat 1] [--context N] [--stop-at-eos 0|1]\n"
+                         "  [--draft-tokens 0] [--mtp mtp|SIDECAR.gguf]\n"
+                         "--draft-tokens N generates speculatively: MTP drafts (--mtp) are verified in one\n"
+                         "CPU-KV hybrid batch per step; it needs --logits 0. --mtp mtp uses the model's own\n"
+                         "MTP block, otherwise a sidecar GGUF holding only the MTP tensors.\n";
             sampling_help(std::cout);
             prefill_help(std::cout);
             return 0;
@@ -40,6 +44,14 @@ int main(int argc, char ** argv) {
         configure_prefill(args, options);
         const bool capture = capture_logits(args, args.contains("--json"));
         options.context = args.integer("--context", 0);
+        const int draft_tokens = args.integer("--draft-tokens", 0);
+        if (draft_tokens) {
+            const auto mtp = args.get("--mtp");
+            if (mtp.empty()) throw std::invalid_argument("--draft-tokens requires --mtp");
+            if (capture) throw std::invalid_argument("Speculative generation does not capture per-step logits; pass --logits 0");
+            options.max_draft_tokens = draft_tokens; options.mtp = true;
+            if (mtp != "mtp") options.mtp_model = mtp;
+        } else if (!args.get("--mtp").empty()) throw std::invalid_argument("--mtp requires --draft-tokens");
         tidal::Engine engine(path, options);
         const int stop_at_eos = args.integer("--stop-at-eos", engine.config().eos_token >= 0 ? 1 : 0);
         if (stop_at_eos != 0 && stop_at_eos != 1) throw std::invalid_argument("--stop-at-eos must be 0 or 1");
@@ -51,6 +63,19 @@ int main(int argc, char ** argv) {
         for (int run = 0; run < repeat; ++run) {
             engine.reset(); generated.clear();
             trace = engine.prefill(prompt, capture);
+            if (draft_tokens) {
+                // The last emitted token is pending; it is consumed by the next verification.
+                int32_t next = engine.sample();
+                generated.push_back(next);
+                while (int(generated.size()) < steps && !(stop_at_eos && next == engine.config().eos_token)) {
+                    for (auto token : engine.verify(next, engine.draft(next, draft_tokens))) {
+                        if (int(generated.size()) == steps) break;
+                        generated.push_back(next = token);
+                        if (stop_at_eos && token == engine.config().eos_token) break;
+                    }
+                }
+                if (!steps) generated.clear();
+            } else
             for (int i = 0; i < steps; ++i) {
                 auto next = engine.sample();
                 generated.push_back(next);
