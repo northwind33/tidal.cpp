@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 
 namespace {
 void equal(const tidal::Step & a, const tidal::Step & b) {
@@ -11,6 +12,67 @@ void equal(const tidal::Step & a, const tidal::Step & b) {
     for (size_t i = 0; i < a.selections.size(); ++i)
         if (a.selections[i].layer != b.selections[i].layer || a.selections[i].tokens != b.selections[i].tokens)
             throw std::runtime_error("QSA replay differs");
+}
+void require(bool value, const char * error) { if (!value) throw std::runtime_error(error); }
+void equal_steps(const std::vector<tidal::Step> & a, const std::vector<tidal::Step> & b) {
+    require(a.size() == b.size(), "Prompt cache evaluated a different number of positions");
+    for (size_t i = 0; i < a.size(); ++i) equal(a[i], b[i]);
+}
+std::vector<int32_t> join(std::vector<int32_t> a, const std::vector<int32_t> & b) {
+    a.insert(a.end(), b.begin(), b.end()); return a;
+}
+// Reuse and rollback must reproduce, bit for bit, a fresh engine that runs the
+// same prefill/decode partition: the restored state is the state at that position.
+void prompt_cache(const char * model, tidal::Options options) {
+    options.prefill_chunk_tokens = 8; options.prefill_attention_tile = 5; // Independent of free memory.
+    options.sampling.repeat_penalty = 1.3f; options.sampling.penalty_last_n = 8; // Rewinds penalty history.
+    tidal::Engine cached(model, options), fresh(model, options);
+    const auto & c = cached.config();
+    const int length = std::min(37, c.context - 11); // Not a block multiple: restores a partial QSA ring.
+    std::vector<int32_t> prompt, extra, other;
+    for (int i = 0; i < length; ++i) prompt.push_back((i * 7 + 3) % c.vocab);
+    for (int i = 0; i < 6; ++i) extra.push_back((i * 5 + 1) % c.vocab);
+    require(cached.prefill_cached(prompt).size() == prompt.size() && !cached.statistics().prompt_cache_reused_tokens,
+            "Cold prompt cache reused state");
+    std::vector<int32_t> generated;
+    for (int i = 0; i < 5; ++i) { generated.push_back(cached.sample()); cached.decode(generated.back()); }
+    // Extension of the consumed sequence (prompt + generated + new turn).
+    const auto extended = cached.prefill_cached(join(join(prompt, generated), extra));
+    require(cached.statistics().prompt_cache_reused_tokens == prompt.size() + generated.size() &&
+            !cached.statistics().prompt_cache_restores, "Extension did not reuse the consumed sequence");
+    fresh.prefill(prompt); for (auto t : generated) fresh.decode(t);
+    equal_steps(fresh.prefill(extra), extended);
+    require(cached.tokens() == join(join(prompt, generated), extra), "Consumed token sequence");
+    // Divergence after the prompt: roll back to the prompt-end snapshot.
+    for (int i = 0; i < 6; ++i) other.push_back((generated[0] + 1 + i) % c.vocab);
+    const auto diverged = cached.prefill_cached(join(prompt, other));
+    require(cached.statistics().prompt_cache_restores == 1 &&
+            cached.statistics().prompt_cache_reused_tokens == 2 * prompt.size() + generated.size(), "Rollback reuse");
+    fresh.reset(); fresh.prefill(prompt);
+    equal_steps(fresh.prefill(other), diverged);
+    require(cached.sample() == fresh.sample(), "Rollback changed sampling");
+    // Regeneration of a prompt that ends at a snapshot evaluates nothing.
+    cached.decode(3); cached.decode(4);
+    require(cached.prefill_cached(prompt).empty() && cached.tokens() == prompt, "Snapshot prompt was re-evaluated");
+    fresh.reset(); fresh.prefill(prompt);
+    require(cached.sample() == fresh.sample(), "Snapshot logits/penalties differ");
+    require(cached.prefill_cached(prompt).empty(), "Identical prompt was re-evaluated");
+    // A divergence before every snapshot recomputes from an empty sequence.
+    const std::vector<int32_t> early = join({prompt.begin(), prompt.begin() + length / 2}, extra);
+    const auto restarted = cached.prefill_cached(early);
+    fresh.reset();
+    equal_steps(fresh.prefill(early), restarted);
+    require(cached.sample() == fresh.sample() && cached.tokens() == early, "Restart from an empty sequence");
+    // Compact (logit-free) requests keep their logits on the device for sample().
+    cached.decode(5);
+    require(cached.prefill_cached(early, false).empty(), "Compact snapshot restore evaluated tokens");
+    require(cached.sample() == fresh.sample(), "Compact restore changed sampling");
+    // Without snapshots only extensions are reused.
+    options.prompt_cache_checkpoints = 0;
+    tidal::Engine bare(model, options);
+    bare.prefill_cached(prompt); bare.decode((extra[0] + 1) % c.vocab);
+    require(bare.prefill_cached(join(prompt, extra)).size() == prompt.size() + extra.size() &&
+            !bare.statistics().prompt_cache_checkpoint_bytes, "Snapshot-free rollback reused state");
 }
 template<class F> void rejects(F f) {
     try { f(); } catch (const std::out_of_range &) { return; }
@@ -77,6 +139,14 @@ int main(int argc, char ** argv) {
                 sampled.decode(token, !pass);
             }
         }
-        std::cout << "Chunked prefill/decode, rejected input and partial reset passed\n";
+        {
+            tidal::Options options{argv[2], 0, 2};
+            prompt_cache(argv[1], options);
+            if (std::string(argv[2]) == "cuda") {
+                options.kv_placement = tidal::KVPlacement::GPU;
+                prompt_cache(argv[1], options);
+            }
+        }
+        std::cout << "Chunked prefill/decode, rejected input, partial reset and prompt cache passed\n";
     } catch (const std::exception & e) { std::cerr << e.what() << '\n'; return 1; }
 }

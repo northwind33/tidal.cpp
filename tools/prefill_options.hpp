@@ -4,7 +4,7 @@
 #include <ostream>
 
 inline std::vector<std::string> prefill_options(std::vector<std::string> names) {
-    for (const char * name : {"--kv-placement", "--cpu-kv-precision", "--prefill-precision", "--prefill-chunk", "--prefill-tile", "--prefill-memory-mib", "--prefill-reserve-mib"}) names.emplace_back(name);
+    for (const char * name : {"--kv-placement", "--cpu-kv-precision", "--prefill-precision", "--prefill-chunk", "--prefill-tile", "--prefill-memory-mib", "--prefill-reserve-mib", "--prompt-cache-checkpoints"}) names.emplace_back(name);
     return names;
 }
 inline void configure_prefill(const Args & args, tidal::Options & options) {
@@ -36,18 +36,22 @@ inline void configure_prefill(const Args & args, tidal::Options & options) {
         throw std::invalid_argument("Invalid prefill tile or memory budget");
     options.prefill_memory_limit = uint64_t(limit)*1024*1024;
     options.prefill_memory_reserve = reserve_text == "auto" ? UINT64_MAX : uint64_t(reserve)*1024*1024;
+    options.prompt_cache_checkpoints = args.integer("--prompt-cache-checkpoints", options.prompt_cache_checkpoints);
+    if (options.prompt_cache_checkpoints < 0) throw std::invalid_argument("--prompt-cache-checkpoints must be non-negative");
 }
 inline void prefill_help(std::ostream & out) {
     out << "  [--kv-placement cpu|gpu] [--cpu-kv-precision bf16|fp16] [--prefill-precision fp16|bf16]\n"
            "  [--prefill-chunk auto|N] [--prefill-tile auto|N]\n"
-           "  [--prefill-memory-mib 0] [--prefill-reserve-mib auto|MiB]\n"
+           "  [--prefill-memory-mib 0] [--prefill-reserve-mib auto|MiB] [--prompt-cache-checkpoints 4]\n"
            "CUDA prefill processes all prompt tokens in each layer before advancing.\n"
            "Chunks bound intermediate tensors; tiles bound attention queries (1-4096).\n"
            "Auto sizes shrink on pre-compute allocation failure; explicit sizes fail.\n"
            "Memory 0 uses live free VRAM; automatic reserve leaves kernel headroom.\n"
            "KV defaults to CPU BF16; --cpu-kv-precision fp16 stores CPU KV as FP16 and fails\n"
            "on |K| or |V| > 65504. GPU KV requires CUDA, stays on GPU during decode,\n"
-           "and uses --prefill-precision for persistent KV as well. Set --context to fit VRAM.\n";
+           "and uses --prefill-precision for persistent KV as well. Set --context to fit VRAM.\n"
+           "Prompt-cache checkpoints bound the host snapshots Engine::prefill_cached keeps\n"
+           "for rolling back to an earlier prompt end (recurrent state cannot be truncated).\n";
 }
 inline const char * kv_type_name(const tidal::Options & o) {
     if (o.kv_placement == tidal::KVPlacement::CPU) return o.cpu_kv_precision == tidal::CpuKVPrecision::FP16 ? "F16" : "BF16";
@@ -91,5 +95,8 @@ inline void prefill_stats(std::ostream & out, const tidal::Statistics & s) {
         << ",\"prefill_reserve_bytes\":" << s.prefill_reserve_bytes
         << ",\"gpu_attention_calls\":" << s.gpu_attention_calls
         << ",\"decode_graph_reuses\":" << s.decode_graph_reuses
-        << ",\"gpu_kv_bytes\":" << s.gpu_kv_bytes;
+        << ",\"gpu_kv_bytes\":" << s.gpu_kv_bytes
+        << ",\"prompt_cache_reused_tokens\":" << s.prompt_cache_reused_tokens
+        << ",\"prompt_cache_restores\":" << s.prompt_cache_restores
+        << ",\"prompt_cache_checkpoint_bytes\":" << s.prompt_cache_checkpoint_bytes;
 }

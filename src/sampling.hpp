@@ -25,6 +25,9 @@ public:
             Statistics &, Profiler &);
     void reset();
     void accept(int32_t token);
+    // Replaces the penalty history with `consumed` (prompt-cache rollback);
+    // the random state continues, as after any other prompt change.
+    void rewind(const std::vector<int32_t> & consumed);
     int32_t sample(ggml_tensor * logits, const std::vector<float> * captured, int position,
                    SamplingDiagnostics * diagnostics = nullptr);
     std::string backend_name() const { return backend_name_; }

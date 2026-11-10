@@ -131,6 +131,11 @@ public:
                               int position = -1, int layer = -1,
                               const std::string & phase = "qsa.attention") const;
     void reset() { size_ = 0; }
+    // Drops rows [tokens, size()); prompt-cache rollback rewrites them later.
+    void truncate(int tokens) {
+        if (tokens < 0 || tokens > size_) throw std::out_of_range("KV truncation beyond the cached rows");
+        size_ = tokens;
+    }
     int size() const { return size_; }
 private:
     void store(const uint16_t * key, const uint16_t * value, int tokens);

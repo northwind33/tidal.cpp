@@ -126,6 +126,12 @@ struct Options {
     // the FP16 prefill/attention format, but rejects |K| or |V| above 65504 with
     // an error (no silent saturation or fallback).
     CpuKVPrecision cpu_kv_precision = CpuKVPrecision::BF16;
+    // Prompt cache (prefill_cached): KV rows can be truncated, but GDN, PLE
+    // convolution and QSA ring state cannot be rewound, so a rollback restores
+    // the latest host-memory snapshot taken at the end of a prefill_cached call.
+    // The oldest snapshot is dropped beyond this count; zero keeps only reuse of
+    // a sequence that the new prompt extends.
+    int prompt_cache_checkpoints = 4;
 };
 
 struct Selection {
@@ -163,6 +169,9 @@ struct Statistics {
     uint64_t gpu_attention_calls = 0; // Decode only; prefill has its own counter.
     uint64_t decode_graph_reuses = 0; // GPU KV decode tokens that reused the previous graph.
     uint64_t gpu_kv_bytes = 0; // Persistent, padded K/V allocation; survives reset.
+    uint64_t prompt_cache_reused_tokens = 0; // prefill_cached positions not re-evaluated.
+    uint64_t prompt_cache_restores = 0;      // Rollbacks to a snapshot (or to an empty sequence).
+    uint64_t prompt_cache_checkpoint_bytes = 0; // Host memory held by current snapshots.
 };
 
 struct ModelInfo {
@@ -188,6 +197,15 @@ public:
     // Capture includes every position's logits and attention selections; disabling
     // it keeps vocabulary vectors and diagnostic selection lists off the host.
     std::vector<Step> prefill(const std::vector<int32_t> & tokens, bool capture_logits = true);
+    // Makes `tokens` the whole sequence, reusing the longest consumed prefix the
+    // cache can restore (the current sequence if `tokens` extends it, otherwise
+    // the latest snapshot inside the common prefix) and prefilling the rest.
+    // Returns steps for evaluated positions only; when nothing remains to be
+    // evaluated, the result is empty and sample() uses the restored logits.
+    // A snapshot of the final state is kept for later prompts.
+    std::vector<Step> prefill_cached(const std::vector<int32_t> & tokens, bool capture_logits = true);
+    // Every consumed token of the current sequence, in order.
+    const std::vector<int32_t> & tokens() const;
     // Draw from the last decoded position; consumes RNG but no context token.
     int32_t sample();
     std::string sampling_backend_name() const;

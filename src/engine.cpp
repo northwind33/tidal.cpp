@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <deque>
 #include <map>
 #include <numeric>
 
@@ -299,6 +300,11 @@ struct Engine::Impl {
     std::map<int, ggml_tensor *> gdn_neg_exp_a;
     std::vector<LayerState> states;
     std::vector<int32_t> previous_tokens;
+    // Consumed tokens (prompt-cache prefix matching) and host snapshots of the
+    // state KV truncation cannot rewind, ordered by ascending position.
+    std::vector<int32_t> sequence;
+    struct Checkpoint { int position; std::vector<std::vector<uint8_t>> state; std::vector<float> captured; };
+    std::deque<Checkpoint> checkpoints;
     int position = 0;
     bool failed = false;
     PrefillMemory * prefill_memory = nullptr;
@@ -319,6 +325,7 @@ struct Engine::Impl {
             (options.cpu_kv_precision != CpuKVPrecision::BF16 && options.cpu_kv_precision != CpuKVPrecision::FP16))
             throw std::invalid_argument("Invalid prefill/CPU KV precision or attention tile");
         if (options.context < 0 || options.context > c.context) throw std::invalid_argument("Invalid runtime context capacity");
+        if (options.prompt_cache_checkpoints < 0) throw std::invalid_argument("Negative prompt-cache checkpoint count");
         if (options.context) c.context = options.context;
         auto * ctx = state_context.get();
         hidden = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.hidden, c.branches);
@@ -1444,6 +1451,7 @@ struct Engine::Impl {
                 }
                 sampler->accept(token);
             }
+            sequence.insert(sequence.end(), tokens.begin(), tokens.end());
             position += int(tokens.size()); stats.prefill_tokens += tokens.size();
             return result;
         } catch (...) {
@@ -1752,6 +1760,7 @@ struct Engine::Impl {
                     if (previous_tokens.size() >= size_t(c.ple.ngram_size)) previous_tokens.erase(previous_tokens.begin());
                 }
                 sampler->accept(token);
+                sequence.push_back(token);
                 ++position;
                 return step;
             }
@@ -1764,6 +1773,7 @@ struct Engine::Impl {
                     if (previous_tokens.size() >= size_t(c.ple.ngram_size)) previous_tokens.erase(previous_tokens.begin());
                 }
                 sampler->accept(token);
+                sequence.push_back(token);
                 ++position;
                 return step;
             }
@@ -1802,6 +1812,7 @@ struct Engine::Impl {
                 if (previous_tokens.size() >= size_t(c.ple.ngram_size)) previous_tokens.erase(previous_tokens.begin());
             }
             sampler->accept(token);
+            sequence.push_back(token);
             ++position;
             return step;
         } catch (...) { failed = true; throw; }
@@ -1811,6 +1822,84 @@ struct Engine::Impl {
         if (!position) throw std::logic_error("Decode at least one token before sampling");
         try { return sampler->sample(last_logits, captured_logits.empty() ? nullptr : &captured_logits, position - 1); }
         catch (...) { failed = true; throw; }
+    }
+    // Per-sequence device state that KV truncation cannot rewind. Index-cache
+    // rows need no snapshot: rows of blocks complete before the restored
+    // position belong to the shared prefix, later rows are rewritten when their
+    // block completes and are masked out of scoring until then.
+    std::vector<ggml_tensor *> rollback_tensors() const {
+        std::vector<ggml_tensor *> result{hidden, last_logits};
+        for (const auto & s : states)
+            for (auto * t : {s.conv, s.recurrent, s.ple_conv, s.raw_index}) if (t) result.push_back(t);
+        return result;
+    }
+    void save_checkpoint() {
+        if (!options.prompt_cache_checkpoints || !position) return;
+        if (!checkpoints.empty() && checkpoints.back().position == position) checkpoints.pop_back();
+        ProfileScope scope(&profiler, "host", "prompt_checkpoint_save", "prompt_cache", position, -1, "CPU");
+        ggml_backend_synchronize(backend.get());
+        Checkpoint checkpoint{position, {}, captured_logits};
+        for (auto * t : rollback_tensors()) {
+            auto & bytes = checkpoint.state.emplace_back(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, bytes.data(), 0, bytes.size());
+            stats.device_to_host_bytes += bytes.size();
+        }
+        checkpoints.push_back(std::move(checkpoint));
+        while (checkpoints.size() > size_t(options.prompt_cache_checkpoints)) checkpoints.pop_front();
+        update_checkpoint_bytes();
+    }
+    void update_checkpoint_bytes() {
+        stats.prompt_cache_checkpoint_bytes = 0;
+        for (const auto & checkpoint : checkpoints) {
+            for (const auto & bytes : checkpoint.state) stats.prompt_cache_checkpoint_bytes += bytes.size();
+            stats.prompt_cache_checkpoint_bytes += checkpoint.captured.size() * sizeof(float);
+        }
+    }
+    // Rewinds to `checkpoint` (or to an empty sequence when null).
+    void restore_checkpoint(const Checkpoint * checkpoint) {
+        const int target = checkpoint ? checkpoint->position : 0;
+        ProfileScope scope(&profiler, "host", "prompt_checkpoint_restore", "prompt_cache", target, -1, "CPU");
+        decode_graph.reset();
+        hybrid.clear();
+        ggml_backend_synchronize(backend.get());
+        const auto tensors = rollback_tensors();
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            if (!checkpoint) { ggml_backend_tensor_memset(tensors[i], 0, 0, ggml_nbytes(tensors[i])); continue; }
+            ggml_backend_tensor_set(tensors[i], checkpoint->state[i].data(), 0, checkpoint->state[i].size());
+            stats.host_to_device_bytes += checkpoint->state[i].size();
+        }
+        for (auto & s : states) {
+            if (s.attention) s.attention->truncate(target);
+            if (s.device_keys) s.device_kv_size = target;
+        }
+        sequence.resize(size_t(target));
+        previous_tokens.clear();
+        if (!c.ple.layers.empty())
+            previous_tokens.assign(sequence.end() - std::min<size_t>(sequence.size(), c.ple.ngram_size - 1), sequence.end());
+        sampler->rewind(sequence);
+        captured_logits = checkpoint ? checkpoint->captured : std::vector<float>{};
+        position = target;
+        while (!checkpoints.empty() && checkpoints.back().position > target) checkpoints.pop_back();
+        update_checkpoint_bytes();
+        ++stats.prompt_cache_restores;
+    }
+    std::vector<Step> prefill_cached(const std::vector<int32_t> & tokens, bool capture) {
+        if (failed) throw std::runtime_error("Previous execution failed; call reset() before prefill");
+        if (tokens.empty()) throw std::invalid_argument("Empty prompt");
+        if (tokens.size() > size_t(c.context)) throw std::out_of_range("Prompt exceeds context capacity");
+        for (auto token : tokens) if (token < 0 || token >= c.vocab) throw std::out_of_range("Prompt token outside vocabulary");
+        const size_t common = std::mismatch(sequence.begin(), sequence.end(), tokens.begin(), tokens.end()).first - sequence.begin();
+        if (common < sequence.size()) {
+            const Checkpoint * checkpoint = nullptr;
+            for (const auto & candidate : checkpoints) if (size_t(candidate.position) <= common) checkpoint = &candidate;
+            try { restore_checkpoint(checkpoint); } catch (...) { failed = true; throw; }
+        }
+        stats.prompt_cache_reused_tokens += uint64_t(position);
+        // The state (and logits) of the whole prompt is already resident.
+        if (size_t(position) == tokens.size()) return {};
+        auto result = prefill({tokens.begin() + position, tokens.end()}, capture);
+        try { save_checkpoint(); } catch (...) { failed = true; throw; }
+        return result;
     }
     void reset() {
         decode_graph.reset();
@@ -1829,6 +1918,8 @@ struct Engine::Impl {
         }
         refresh_derived_weights();
         previous_tokens.clear();
+        sequence.clear();
+        checkpoints.clear();
         captured_logits.clear();
         sampler->reset();
         position = 0;
@@ -1847,6 +1938,10 @@ std::string Engine::sampling_backend_name() const { return impl_->sampler->backe
 std::vector<Step> Engine::prefill(const std::vector<int32_t> & tokens, bool capture_logits) {
     return impl_->prefill(tokens, capture_logits);
 }
+std::vector<Step> Engine::prefill_cached(const std::vector<int32_t> & tokens, bool capture_logits) {
+    return impl_->prefill_cached(tokens, capture_logits);
+}
+const std::vector<int32_t> & Engine::tokens() const { return impl_->sequence; }
 void Engine::reset() { impl_->reset(); }
 const Config & Engine::config() const { return impl_->c; }
 const Statistics & Engine::statistics() const { return impl_->stats; }

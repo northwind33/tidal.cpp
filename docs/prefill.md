@@ -154,6 +154,34 @@ After temporary storage and the prefill kernel pool are released, restoring the
 original decode weights uses actual free device memory rather than retaining the
 prefill-only reserve.
 
+## Prompt cache
+
+`Engine::prefill_cached(tokens)` treats `tokens` as the whole sequence and
+reuses what the engine already consumed, in the spirit of llama.cpp prompt
+caching:
+
+- If `tokens` extends the consumed sequence (`Engine::tokens()`), for example
+  prompt + generated reply + next turn, only the new suffix is prefilled.
+- Otherwise the sequence is rolled back. KV rows (CPU or persistent GPU) are
+  truncated, but GDN convolution/recurrent state, PLE convolution history and
+  the QSA raw-index ring cannot be rewound, so the engine restores the latest
+  snapshot whose position lies inside the common prefix, or an empty sequence
+  when none does. QSA index-cache rows need no snapshot: rows of blocks
+  complete before the restored position belong to the shared prefix, and later
+  rows are masked out of scoring until their block completes and rewrites them.
+- Each `prefill_cached` call ends by copying that state, the hidden branches and
+  the last logits to host memory. `Options::prompt_cache_checkpoints` (default 4,
+  CLI `--prompt-cache-checkpoints`) bounds the snapshots; the oldest is dropped
+  first and zero disables rollback reuse. A prompt that ends exactly at a
+  snapshot (regeneration) evaluates nothing and `sample()` uses the restored
+  logits.
+- Penalty history is rebuilt from the kept tokens; the sampler's random state
+  continues. Statistics report reused tokens, restores and snapshot bytes.
+
+A restored sequence is bit-identical to a fresh engine that ran the same
+prefill/decode partition (`tidal-state-test`). Plain `prefill`/`decode` still
+append and track the consumed tokens but take no snapshots.
+
 ## Controls and measurements
 
 The CLI and benchmark accept:

@@ -54,6 +54,16 @@ void Sampler::accept(int32_t token) {
     }
 }
 
+void Sampler::rewind(const std::vector<int32_t> & consumed) {
+    if (!config_.penalties()) return;
+    // Every previously counted token must reach the device counts again.
+    for (int32_t token : history_) pending_.insert(token);
+    for (int32_t token : history_) counts_[token] = 0;
+    history_.clear();
+    const size_t keep = config_.penalty_last_n > 0 ? std::min(consumed.size(), size_t(config_.penalty_last_n)) : consumed.size();
+    for (size_t i = consumed.size() - keep; i < consumed.size(); ++i) accept(consumed[i]);
+}
+
 double Sampler::uniform() {
     // SplitMix64; specified integer operations and 53-bit conversion are identical
     // on CPU/device paths. Only sample(), not prompt ingestion, consumes randomness.
