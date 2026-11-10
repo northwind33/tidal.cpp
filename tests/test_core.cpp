@@ -1,6 +1,8 @@
 #include "internal.hpp"
 #include "prefill_chunks.hpp"
+#include <algorithm>
 #include <cmath>
+#include <numeric>
 #include <iostream>
 
 void require(bool condition, const char * message) {
@@ -64,6 +66,51 @@ int main() {
         require(a.size() == 0, "Reset");
         a.append({0, 0, 0, 0}, {4, 8, 12, 16});
         require(a.attend(std::vector<float>(8), {0})[0] == 4, "Reset must exclude stale KV");
+        {
+            // Grouped, chunked (SIMD when available) attention against a direct
+            // double-precision softmax over the same BF16-rounded K/V.
+            const int heads = 10, kv = 2, dim = 128, tokens = 300;
+            tidal::SparseAttention b(heads, kv, dim, tokens, 4);
+            uint32_t seed = 7;
+            auto next = [&] { seed = seed * 1664525u + 1013904223u; return float(int(seed >> 9) % 2001 - 1000) / 250.0f; };
+            std::vector<std::vector<float>> keys, values;
+            for (int t = 0; t < tokens; ++t) {
+                std::vector<float> k(size_t(kv) * dim), v(size_t(kv) * dim);
+                for (auto & x : k) x = next();
+                for (auto & x : v) x = next();
+                b.append(k, v); keys.push_back(k); values.push_back(v);
+            }
+            std::vector<float> query(size_t(heads) * dim);
+            for (auto & x : query) x = next() / 8;
+            std::vector<int32_t> sparse;
+            for (int t = 0; t < tokens; t += 3) sparse.push_back(t);
+            for (const auto & selection : {std::vector<int32_t>{5}, sparse}) {
+                std::vector<int32_t> all(tokens); std::iota(all.begin(), all.end(), 0);
+                for (const auto & chosen : {selection, all}) {
+                    const auto out = b.attend(query, chosen);
+                    for (int h = 0; h < heads; ++h) {
+                        const int g = h / (heads / kv);
+                        std::vector<double> score;
+                        for (int t : chosen) {
+                            double dot = 0;
+                            for (int d = 0; d < dim; ++d)
+                                dot += double(query[size_t(h) * dim + d]) *
+                                    ggml_bf16_to_fp32(ggml_fp32_to_bf16(keys[t][size_t(g) * dim + d]));
+                            score.push_back(dot / std::sqrt(double(dim)));
+                        }
+                        const double top = *std::max_element(score.begin(), score.end());
+                        double sum = 0; for (auto & x : score) sum += (x = std::exp(x - top));
+                        for (int d = 0; d < dim; ++d) {
+                            double expected = 0;
+                            for (size_t i = 0; i < chosen.size(); ++i)
+                                expected += score[i] / sum * ggml_bf16_to_fp32(ggml_fp32_to_bf16(values[chosen[i]][size_t(g) * dim + d]));
+                            require(std::abs(out[size_t(h) * dim + d] - expected) <= 1e-4 + 1e-4 * std::abs(expected),
+                                    "Grouped chunked attention differs from the reference softmax");
+                        }
+                    }
+                }
+            }
+        }
         {
             // Every task of every run executes exactly once, including runs with
             // fewer tasks than workers and back-to-back runs on the same pool.

@@ -77,8 +77,10 @@ def main():
             assert {"qk", "softmax", "weighted_v", "kv_append_bf16", "worker_dispatch"} <= names
             for event in events:
                 assert math.isfinite(event["dur"]) and event["dur"] >= 0 and event["ts"] >= 0
-            for name in ["qk", "softmax", "weighted_v"]:
-                assert len([e for e in events if e["cat"] == "cpu_head" and e["name"] == name]) == cpu_tokens * 4
+            # One event per attention task (KV head group x token chunk) and phase.
+            counts = [len([e for e in events if e["cat"] == "cpu_head" and e["name"] == name])
+                      for name in ["qk", "softmax", "weighted_v"]]
+            assert counts[0] == counts[1] == counts[2] and counts[0] >= cpu_tokens
             nodes = [e for e in events if e["cat"] == "node"]
             if mode == "nodes":
                 assert len(nodes) == p["statistics"]["graph_nodes"]

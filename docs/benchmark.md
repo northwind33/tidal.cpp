@@ -86,8 +86,9 @@ max absolute/normalized RMS differences; otherwise those error fields are null.
 Phase profiling requires bit-identical captured outputs and sampled decisions. Node profiling deliberately disables cross-node fusion;
 its numerical differences are reported rather than assumed to be zero.
 
-The CPU stages include BF16 KV append, selected-block expansion, worker launch and
-join, and per-query-head QK, stable softmax and weighted-V accumulation. Graph
+The CPU stages include BF16 KV append, selected-block expansion, worker-pool
+dispatch, and per-task QK, stable softmax and weighted-V accumulation. A task is
+one KV head's group of query heads over one chunk of the selected tokens. Graph
 nodes expose matvecs, normalization, convolution, GDN recurrence, RoPE, activations,
 QSA scores/top-k, copies and view/layout operations. Named matrices distinguish
 residual gates, attention projections, FFN and the output head.
@@ -103,10 +104,11 @@ profile to locate expensive operations. Use Nsight for actual kernel/device metr
 
 Totals are inclusive and overlap: token/layer/graph spans contain child events,
 and CPU worker heads execute concurrently. Do not sum all categories to obtain
-inference time. Worker lanes in the exported trace are logical query-head lanes;
-lane 0 is the calling thread. Transfer byte counts are actual API payload sizes;
-node bytes are logical output size; CPU QK/V bytes are logical BF16 cache reads,
-which can be served from caches and repeat across grouped heads.
+inference time. Worker lanes in the exported trace are labelled by the first query
+head of the task's group; tasks from one call run concurrently on the pool.
+Transfer byte counts are actual API payload sizes;
+node bytes are logical output size; CPU QK/V bytes are the BF16 cache rows a task
+reads, once for its whole query-head group.
 
 `--json` stores every event plus aggregates grouped by category, phase, layer,
 name and op, with counts, total/min/max/median/p95 durations and bytes. Raw events

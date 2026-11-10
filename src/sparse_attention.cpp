@@ -6,8 +6,77 @@
 #include <cstring>
 #include <limits>
 #include <thread>
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 namespace tidal {
+namespace {
+// Grouped-query kernels: the R query heads sharing one KV head are processed
+// together, so each K/V row is read once per layer instead of once per query head.
+using Dot = void (*)(const float * q, int rows, int dim, const ggml_bf16_t * k, float * out);
+using Axpy = void (*)(float * acc, const float * p, int rows, int dim, const ggml_bf16_t * v);
+
+void dot_scalar(const float * q, int rows, int dim, const ggml_bf16_t * k, float * out) {
+    for (int r = 0; r < rows; ++r) {
+        float dot = 0;
+        for (int d = 0; d < dim; ++d) dot += q[size_t(r) * dim + d] * ggml_bf16_to_fp32(k[d]);
+        out[r] = dot;
+    }
+}
+void axpy_scalar(float * acc, const float * p, int rows, int dim, const ggml_bf16_t * v) {
+    for (int d = 0; d < dim; ++d) {
+        const float value = ggml_bf16_to_fp32(v[d]);
+        for (int r = 0; r < rows; ++r) acc[size_t(r) * dim + d] += p[r] * value;
+    }
+}
+
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#define TIDAL_X86_KERNELS 1
+__attribute__((target("avx2,fma"))) inline __m256 load_bf16(const ggml_bf16_t * x) {
+    const __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i *>(x));
+    return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw), 16));
+}
+__attribute__((target("avx2,fma"))) inline float hsum(__m256 x) {
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(x), _mm256_extractf128_ps(x, 1));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_movehdup_ps(s));
+    return _mm_cvtss_f32(s);
+}
+__attribute__((target("avx2,fma"))) void dot_avx2(const float * q, int rows, int dim, const ggml_bf16_t * k, float * out) {
+    for (int r0 = 0; r0 < rows; r0 += 8) {
+        const int n = std::min(8, rows - r0);
+        __m256 acc[8];
+        for (int r = 0; r < n; ++r) acc[r] = _mm256_setzero_ps();
+        for (int d = 0; d < dim; d += 8) {
+            const __m256 key = load_bf16(k + d);
+            for (int r = 0; r < n; ++r)
+                acc[r] = _mm256_fmadd_ps(_mm256_loadu_ps(q + size_t(r0 + r) * dim + d), key, acc[r]);
+        }
+        for (int r = 0; r < n; ++r) out[r0 + r] = hsum(acc[r]);
+    }
+}
+__attribute__((target("avx2,fma"))) void axpy_avx2(float * acc, const float * p, int rows, int dim, const ggml_bf16_t * v) {
+    for (int d = 0; d < dim; d += 8) {
+        const __m256 value = load_bf16(v + d);
+        for (int r = 0; r < rows; ++r) {
+            float * out = acc + size_t(r) * dim + d;
+            _mm256_storeu_ps(out, _mm256_fmadd_ps(_mm256_set1_ps(p[r]), value, _mm256_loadu_ps(out)));
+        }
+    }
+}
+#endif
+
+struct Kernels { Dot dot; Axpy axpy; const char * name; };
+Kernels kernels(int dim) {
+#ifdef TIDAL_X86_KERNELS
+    static const bool avx2 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+    if (avx2 && dim % 8 == 0) return {dot_avx2, axpy_avx2, "avx2"};
+#endif
+    return {dot_scalar, axpy_scalar, "scalar"};
+}
+} // namespace
+
 WorkerPool::WorkerPool(int threads) {
     if (threads <= 0) throw std::invalid_argument("Worker pool needs at least one thread");
     for (int i = 1; i < threads; ++i) workers_.emplace_back([this] { work(); });
@@ -100,40 +169,69 @@ std::vector<float> SparseAttention::attend(const std::vector<float> & query,
         if (token <= previous || token >= size_) throw std::invalid_argument("Non-causal, duplicate or unsorted KV index");
         previous = token;
     }
-    std::vector<float> result(query.size());
-    auto worker = [&](int first, int stride) {
-        std::vector<float> scores(selected.size());
-        for (int h = first; h < heads_; h += stride) {
-            ProfileScope qk(profiler, "cpu_head", "qk", phase, position, layer, "CPU", h);
-            qk.event.bytes = selected.size() * dim_ * sizeof(ggml_bf16_t);
-            const int kv = h / (heads_ / kv_heads_); // grouped, not tiled, query heads
-            float maximum = -std::numeric_limits<float>::infinity();
-            for (size_t i = 0; i < selected.size(); ++i) {
-                const size_t offset = (size_t(selected[i]) * kv_heads_ + kv) * dim_;
-                float dot = 0;
-                for (int d = 0; d < dim_; ++d)
-                    dot += query[size_t(h) * dim_ + d] * ggml_bf16_to_fp32(keys_[offset + d]);
-                scores[i] = dot / std::sqrt(float(dim_));
-                maximum = std::max(maximum, scores[i]);
-            }
-            qk.finish();
-            ProfileScope softmax(profiler, "cpu_head", "softmax", phase, position, layer, "CPU", h);
-            float denominator = 0;
-            for (float & score : scores) { score = std::exp(score - maximum); denominator += score; }
-            softmax.finish();
-            ProfileScope weighted(profiler, "cpu_head", "weighted_v", phase, position, layer, "CPU", h);
-            weighted.event.bytes = selected.size() * dim_ * sizeof(ggml_bf16_t);
-            for (size_t i = 0; i < selected.size(); ++i) {
-                const size_t offset = (size_t(selected[i]) * kv_heads_ + kv) * dim_;
-                const float probability = scores[i] / denominator;
-                for (int d = 0; d < dim_; ++d)
-                    result[size_t(h) * dim_ + d] += probability * ggml_bf16_to_fp32(values_[offset + d]);
-            }
+    const int group = heads_ / kv_heads_; // grouped, not tiled, query heads
+    const int64_t n = int64_t(selected.size());
+    const auto kernel = kernels(dim_);
+    const int workers = std::min(threads_, pool_->threads());
+    // Split each KV head's tokens so all workers stream KV; chunks are merged
+    // with the usual max-rescaled softmax combination.
+    const int chunks = int(std::max<int64_t>(1, std::min<int64_t>((n + 31) / 32, (2 * workers + kv_heads_ - 1) / kv_heads_)));
+    const int tasks = kv_heads_ * chunks;
+    const size_t stride = size_t(group) * (dim_ + 2);
+    std::vector<float> partial(size_t(tasks) * stride);
+    const float scale = std::sqrt(float(dim_));
+    auto task = [&](int t) {
+        const int g = t / chunks, c = t % chunks;
+        const int64_t first = n * c / chunks, last = n * (c + 1) / chunks, count = last - first;
+        const float * q = query.data() + size_t(g) * group * dim_;
+        thread_local std::vector<float> scores;
+        scores.resize(size_t(count) * group);
+        ProfileScope qk(profiler, "cpu_head", "qk", phase, position, layer, "CPU", g * group);
+        qk.event.bytes = size_t(count) * dim_ * sizeof(ggml_bf16_t);
+        for (int64_t i = 0; i < count; ++i) {
+            float * out = scores.data() + size_t(i) * group;
+            kernel.dot(q, group, dim_, keys_.data() + (size_t(selected[first + i]) * kv_heads_ + g) * dim_, out);
+            for (int r = 0; r < group; ++r) out[r] /= scale;
         }
+        qk.finish();
+        ProfileScope softmax(profiler, "cpu_head", "softmax", phase, position, layer, "CPU", g * group);
+        float * result = partial.data() + size_t(t) * stride;
+        float * maximum = result, * sum = result + group, * acc = result + 2 * group;
+        for (int r = 0; r < group; ++r) { maximum[r] = -std::numeric_limits<float>::infinity(); sum[r] = 0; }
+        for (int64_t i = 0; i < count; ++i)
+            for (int r = 0; r < group; ++r) maximum[r] = std::max(maximum[r], scores[size_t(i) * group + r]);
+        for (int64_t i = 0; i < count; ++i)
+            for (int r = 0; r < group; ++r) {
+                float & p = scores[size_t(i) * group + r];
+                p = std::exp(p - maximum[r]); sum[r] += p;
+            }
+        softmax.finish();
+        ProfileScope weighted(profiler, "cpu_head", "weighted_v", phase, position, layer, "CPU", g * group);
+        weighted.event.bytes = size_t(count) * dim_ * sizeof(ggml_bf16_t);
+        std::fill(acc, acc + size_t(group) * dim_, 0.0f);
+        for (int64_t i = 0; i < count; ++i)
+            kernel.axpy(acc, scores.data() + size_t(i) * group, group, dim_,
+                        values_.data() + (size_t(selected[first + i]) * kv_heads_ + g) * dim_);
     };
-    const int workers = std::min({threads_, heads_, pool_->threads()});
-    ProfileScope dispatch(profiler, "host", "worker_dispatch", phase, position, layer, "CPU");
-    pool_->run(workers, [&](int w) { worker(w, workers); });
+    {
+        ProfileScope dispatch(profiler, "host", "worker_dispatch", phase, position, layer, "CPU");
+        pool_->run(tasks, task);
+    }
+    std::vector<float> result(query.size());
+    for (int g = 0; g < kv_heads_; ++g)
+        for (int r = 0; r < group; ++r) {
+            float maximum = -std::numeric_limits<float>::infinity(), denominator = 0;
+            for (int c = 0; c < chunks; ++c) maximum = std::max(maximum, partial[size_t(g * chunks + c) * stride + r]);
+            float * out = result.data() + size_t(g * group + r) * dim_;
+            for (int c = 0; c < chunks; ++c) {
+                const float * part = partial.data() + size_t(g * chunks + c) * stride;
+                const float weight = std::exp(part[r] - maximum);
+                denominator += weight * part[group + r];
+                const float * acc = part + 2 * group + size_t(r) * dim_;
+                for (int d = 0; d < dim_; ++d) out[d] += weight * acc[d];
+            }
+            for (int d = 0; d < dim_; ++d) out[d] /= denominator;
+        }
     return result;
 }
 
