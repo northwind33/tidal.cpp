@@ -75,6 +75,23 @@ int main(int argc, char ** argv) {
         require(!s.full_attention_calls && !s.sparse_attention_calls && !s.prefill_kv_to_host_bytes, "GPU KV mode used CPU attention/cache");
         require(s.device_to_host_bytes==8, "GPU KV compact path downloaded more than two finiteness scalars");
         require(s.gpu_kv_bytes==bytes, "Reset lost GPU KV accounting");
+        {
+            // Compact decode runs a different (single-graph) path than the
+            // diagnostic one; both must pick the same tokens, across a 256 boundary.
+            auto compact_options=options;compact_options.profile=tidal::ProfileMode::Off;
+            tidal::Engine diagnostic(argv[1],compact_options), fast(argv[1],compact_options);
+            diagnostic.prefill(tokens);fast.prefill(tokens,false);
+            const int steps=std::min<int>(300,c.context-int(tokens.size()));
+            for(int i=0;i<steps;++i) {
+                const auto expected_token=diagnostic.sample(), actual_token=fast.sample();
+                require(expected_token==actual_token, "Compact GPU KV decode changed greedy sampling");
+                diagnostic.decode(expected_token);
+                require(fast.decode(actual_token,false).logits.empty(), "Compact GPU KV decode downloaded logits");
+            }
+            fast.reset();diagnostic.reset();
+            for(size_t i=0;i<tokens.size();++i) {fast.decode(tokens[i],false);diagnostic.decode(tokens[i]);}
+            require(fast.sample()==diagnostic.sample(), "Compact GPU KV decode after reset changed sampling");
+        }
         if(c.context>=514) {
             options.prefill_chunk_tokens=37;options.prefill_attention_tile=17;options.profile=tidal::ProfileMode::Off;
             tidal::Engine whole(argv[1],options), extended(argv[1],options);
