@@ -12,7 +12,10 @@ set(TIDAL_GGML_SOURCE_DIR "" CACHE PATH "Use an existing checkout of the pinned 
 set(GGML_CUDA ${TIDAL_CUDA} CACHE BOOL "" FORCE)
 if(TIDAL_CUDA)
     set(GGML_CUDA_FA ON CACHE BOOL "Required by GPU layer prefill" FORCE)
-    set(GGML_CUDA_GRAPHS ON CACHE BOOL "Replay reused GPU KV decode graphs" FORCE)
+    # CUDA graph replay measured neutral for GPU KV decode and 0.3-0.4 ms/token
+    # slower for reused CPU KV segments: host submission already stays ahead of
+    # the GPU, so there is no launch gap to remove.
+    set(GGML_CUDA_GRAPHS OFF CACHE BOOL "" FORCE)
 endif()
 set(GGML_METAL OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)

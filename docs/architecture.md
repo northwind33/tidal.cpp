@@ -235,12 +235,17 @@ In the default CPU KV mode, decode runs one GPU graph per span between two CPU
 attention layers: the previous layer's output projection and FFN, the GDN/PLE
 layers in between and the next layer's projections. Q, K and V return as one
 packed download; each span synchronizes once because the next CPU attention needs
-its result. Spans are launched asynchronously, and while one executes the host
-builds and allocates the next from an alternate allocator. Prefill KV exports and
+its result. Without PLE, the span graphs are built once and replayed: the
+position, QSA index rows and block start are a small input per span, every token
+pools its current block into the index cache (masked from scoring until the block
+completes), and scoring covers the complete blocks rounded up to 256. Spans are
+rebuilt when that bucket grows, after prefill and on reset. With PLE, spans are
+rebuilt per token; each is launched asynchronously while the host builds and
+allocates the next from an alternate allocator. Prefill KV exports and
 weight prefetch overlap work. Persistent GPU KV decode instead runs one graph per
 token on a reused compute buffer and, for Qwen3.5, reuses that graph across tokens
 (see [GPU prefill](prefill.md#persistent-gpu-kv-benchmark-mode)).
 CPU attention runs on a persistent worker pool shared by all attention layers, and top-k materializes a score for every compressed block. There
-is no CPU KV graph reuse, server, multi-sequence cache,
+is no server, multi-sequence cache,
 checkpoint converter or long-context benchmark claim. These are explicit next
 optimization/integration boundaries after correctness and GPU runtime validation.

@@ -107,7 +107,7 @@ public:
     }
     bool allocated_inputs() const { return memory || shared; }
     // Per-token data of a reusable decode graph. Their values change between
-    // runs while the graph topology, and thus its captured CUDA graph, does not.
+    // runs while the graph topology does not.
     ggml_tensor * token_input = nullptr, * position_input = nullptr, * kv_row_input = nullptr, * mask_input = nullptr;
     ggml_tensor * finite = nullptr;
     int kv_padded = 0;
@@ -1589,7 +1589,7 @@ struct Engine::Impl {
         return seg;
     }
     // Reused CPU-KV segments: built once per QSA block bucket, then replayed with
-    // new scalar inputs, which lets ggml capture each segment as a CUDA graph.
+    // new scalar inputs, without per-token graph construction or allocation.
     struct HybridCache {
         std::vector<Segment> segments;
         std::vector<std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)>> allocators;
