@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <numeric>
 
 namespace tidal {
@@ -285,6 +286,9 @@ struct Engine::Impl {
     std::unique_ptr<Sampler> sampler;
     // Shared by every CPU attention layer; declared before states so it outlives them.
     std::shared_ptr<WorkerPool> attention_pool;
+    // Decode-only copies of hyper-connection norm gammas scaled by 1/branches
+    // (see mix()); they live in the state buffer, independent of weight eviction.
+    std::map<std::string, ggml_tensor *> hc_norm_scaled;
     std::vector<LayerState> states;
     std::vector<int32_t> previous_tokens;
     int position = 0;
@@ -357,8 +361,19 @@ struct Engine::Impl {
                     std::to_string(bytes) + ", available " + std::to_string(free) +
                     "; reduce --context or choose --kv-placement cpu; no automatic CPU fallback");
         }
+        if (c.architecture == Architecture::Qwen4Exp && c.branches > 1) {
+            std::vector<std::string> names{"head.norm"};
+            for (int l = 0; l < c.layers; ++l)
+                for (const char * part : {"hc_attn", "hc_ffn"}) names.push_back("blk." + std::to_string(l) + "." + part + ".norm");
+            for (const auto & n : names) {
+                auto * w = model.at(n);
+                if (w->type != GGML_TYPE_F32) continue;
+                hc_norm_scaled[n] = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, w->ne);
+            }
+        }
         state_buffer.reset(ggml_backend_alloc_ctx_tensors(ctx, backend.get()));
         if (!state_buffer) throw std::runtime_error("State allocation failed");
+
         sampler = std::make_unique<Sampler>(c.vocab, options.sampling, backend.get(), options.device, stats, profiler);
         reset();
     }
@@ -495,18 +510,43 @@ struct Engine::Impl {
         return ggml_rope_ext(g.c(), x, positions, nullptr, c.rope_dim,
                              GGML_ROPE_TYPE_NEOX, c.context, c.rope_base, 1, 0, 1, 0, 0);
     }
+    // The state buffer is cleared by reset(), so the scaled copies are rebuilt there.
+    void refresh_hc_norms() {
+        if (hc_norm_scaled.empty()) return;
+        Graph g(backend.get(), stats, options.backend == "cuda", profiler, "init.hc_norm", 0, -1, nullptr, nullptr, 4096);
+        for (const auto & [n, t] : hc_norm_scaled) g.add(ggml_cpy(g.c(), ggml_scale(g.c(), weight(n), 1.0f / c.branches), t));
+        g.run();
+    }
     Mixed mix(Graph & g, ggml_tensor * h, const std::string & p, bool inject = true) {
-        auto * x = norm(g, h, p + ".norm");
+        // Every consumer of the normalized branches (down/inject projections and
+        // the branch mean) scales them by 1/branches, so a gamma pre-scaled by
+        // 1/branches replaces three SCALE nodes. For a power-of-two branch count
+        // the scaling is exact, including the backend's activation quantization.
+        const auto scaled = hc_norm_scaled.find(p + ".norm");
+        const bool folded = scaled != hc_norm_scaled.end();
+        ggml_tensor * x;
+        if (folded) {
+            auto * rms = ggml_rms_norm(g.c(), h, c.eps);
+            ggml_set_name(rms, (p + ".norm.rms").c_str());
+            x = ggml_mul(g.c(), rms, scaled->second);
+            ggml_set_name(x, (p + ".norm").c_str());
+        } else {
+            x = norm(g, h, p + ".norm");
+        }
         auto * flat = ggml_reshape_1d(g.c(), x, c.hidden * c.branches);
-        auto * low = ggml_silu(g.c(), ggml_scale(g.c(), mm(g, p + ".down", flat), 1.0f / c.branches));
+        auto * down = mm(g, p + ".down", flat);
+        auto * low = ggml_silu(g.c(), folded ? down : ggml_scale(g.c(), down, 1.0f / c.branches));
         auto * gate = ggml_sigmoid(g.c(), mm(g, p + ".up", low));
         auto * gated = ggml_mul(g.c(), flat, gate);
         auto * mixed = ggml_view_1d(g.c(), gated, c.hidden, 0);
         for (int branch = 1; branch < c.branches; ++branch)
             mixed = ggml_add(g.c(), mixed, ggml_view_1d(g.c(), gated, c.hidden, size_t(branch) * c.hidden * sizeof(float)));
-        mixed = ggml_scale(g.c(), mixed, 1.0f / c.branches);
-        auto * injection = inject ? ggml_scale(g.c(), ggml_sigmoid(g.c(),
-            ggml_scale(g.c(), mm(g, p + ".inject", flat), 1.0f / c.branches)), 2.0f) : nullptr;
+        if (!folded) mixed = ggml_scale(g.c(), mixed, 1.0f / c.branches);
+        ggml_tensor * injection = nullptr;
+        if (inject) {
+            auto * logits = mm(g, p + ".inject", flat);
+            injection = ggml_scale(g.c(), ggml_sigmoid(g.c(), folded ? logits : ggml_scale(g.c(), logits, 1.0f / c.branches)), 2.0f);
+        }
         return {mixed, injection};
     }
     ggml_tensor * combine(Graph & g, ggml_tensor * h, ggml_tensor * output, ggml_tensor * injection) {
@@ -1627,6 +1667,7 @@ struct Engine::Impl {
             std::vector<int32_t> ids(c.context); std::iota(ids.begin(), ids.end(), 0);
             ggml_backend_tensor_set(kv_token_ids, ids.data(), 0, ids.size()*sizeof(int32_t));
         }
+        refresh_hc_norms();
         previous_tokens.clear();
         captured_logits.clear();
         sampler->reset();
