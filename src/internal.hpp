@@ -100,13 +100,17 @@ public:
     void run(int tasks, const std::function<void(int)> & fn);
 private:
     void work();
-    void drain();
+    void drain(uint64_t generation, int tasks, const std::function<void(int)> * job);
     std::vector<std::thread> workers_;
     std::mutex mutex_;
-    std::condition_variable wake_, done_;
+    std::condition_variable wake_;
+    // Upper 32 bits: dispatch generation; lower 32 bits: next task index. A
+    // worker claims a task only while the generation it observed is current, so
+    // a late worker can never run a finished dispatch's job.
+    std::atomic<uint64_t> ticket_{0};
+    std::atomic<int> finished_{0};
     const std::function<void(int)> * job_ = nullptr;
-    std::atomic<int> next_{0}, finished_{0};
-    int tasks_ = 0, busy_ = 0, acknowledged_ = 0;
+    int tasks_ = 0;
     uint64_t generation_ = 0;
     bool stop_ = false;
 };

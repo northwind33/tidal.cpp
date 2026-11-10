@@ -12,6 +12,15 @@
 
 namespace tidal {
 namespace {
+inline void _mm_pause_or_yield() {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#else
+    std::this_thread::yield();
+#endif
+}
+} // namespace
+namespace {
 // Grouped-query kernels: the R query heads sharing one KV head are processed
 // together, so each K/V row is read once per layer instead of once per query head.
 using Dot = void (*)(const float * q, int rows, int dim, const ggml_bf16_t * k, float * out);
@@ -88,48 +97,52 @@ WorkerPool::~WorkerPool() {
     for (auto & worker : workers_) worker.join();
 }
 
-void WorkerPool::drain() {
-    for (int task; (task = next_.fetch_add(1, std::memory_order_relaxed)) < tasks_; ) {
-        (*job_)(task);
-        finished_.fetch_add(1, std::memory_order_release);
+void WorkerPool::drain(uint64_t generation, int tasks, const std::function<void(int)> * job) {
+    uint64_t ticket = ticket_.load(std::memory_order_acquire);
+    while ((ticket >> 32) == generation && int(ticket & 0xffffffffu) < tasks) {
+        if (!ticket_.compare_exchange_weak(ticket, ticket + 1, std::memory_order_acq_rel, std::memory_order_acquire)) continue;
+        (*job)(int(ticket & 0xffffffffu));
+        finished_.fetch_add(1, std::memory_order_acq_rel);
+        ticket = ticket_.load(std::memory_order_acquire);
     }
 }
 
 void WorkerPool::work() {
     uint64_t seen = 0;
     for (;;) {
+        uint64_t generation; int tasks; const std::function<void(int)> * job;
         {
             std::unique_lock lock(mutex_);
             wake_.wait(lock, [&] { return stop_ || generation_ != seen; });
             if (stop_) return;
-            seen = generation_;
-            ++acknowledged_; ++busy_;
+            seen = generation = generation_; tasks = tasks_; job = job_;
         }
-        drain();
-        { std::lock_guard lock(mutex_); --busy_; }
-        done_.notify_one();
+        drain(generation, tasks, job);
     }
 }
 
 void WorkerPool::run(int tasks, const std::function<void(int)> & fn) {
     if (tasks <= 0) return;
     if (workers_.empty() || tasks == 1) { for (int i = 0; i < tasks; ++i) fn(i); return; }
+    uint64_t generation;
     {
         std::lock_guard lock(mutex_);
+        // Generations live in the ticket's upper 32 bits; 0 is the workers' initial view.
+        generation = (generation_ + 1) & 0xffffffffu;
+        if (!generation) generation = 1;
+        generation_ = generation;
         job_ = &fn; tasks_ = tasks;
-        next_.store(0, std::memory_order_relaxed); finished_.store(0, std::memory_order_relaxed);
-        acknowledged_ = 0;
-        ++generation_;
+        finished_.store(0, std::memory_order_relaxed);
+        ticket_.store(generation << 32, std::memory_order_release);
     }
-    wake_.notify_all();
-    drain();
-    // Return only after every worker has observed this generation and left
-    // drain(), so no worker can carry a stale view of job_ into the next run.
-    std::unique_lock lock(mutex_);
-    done_.wait(lock, [&] {
-        return finished_.load(std::memory_order_acquire) == tasks_ && busy_ == 0 && acknowledged_ == int(workers_.size());
-    });
-    job_ = nullptr;
+    // Wake only as many workers as there are tasks beyond the caller's share.
+    const int helpers = std::min<int>(tasks - 1, int(workers_.size()));
+    if (helpers == int(workers_.size())) wake_.notify_all();
+    else for (int i = 0; i < helpers; ++i) wake_.notify_one();
+    drain(generation, tasks, &fn);
+    // A claimed task always finishes before run() returns, so job pointers held
+    // by workers are dereferenced only while fn is alive.
+    while (finished_.load(std::memory_order_acquire) != tasks) _mm_pause_or_yield();
 }
 
 SparseAttention::SparseAttention(int heads, int kv_heads, int dim, int capacity, int threads,
