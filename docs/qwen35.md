@@ -49,6 +49,10 @@ the official tokenizer. `--thinking` allows a thinking section; `--raw` accepts
 literal completion text. It does not run a second inference engine or download
 anything. It removes its temporary full-logit trace after decoding the output.
 
+`tidal-server` needs neither Python nor `tokenizer.json`: it reads the tokenizer
+from the GGUF, applies the chat format itself and keeps the model loaded between
+requests. See [the server guide](server.md).
+
 For applications that already have token IDs, use `tidal-cli --tokens ...` or
 `Engine::prefill` / `Engine::decode`. `--context N` limits allocated sequence
 capacity to N, up to the GGUF maximum. The public model declares a large default;

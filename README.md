@@ -167,6 +167,23 @@ seeding and `--sampler cpu` comparisons.
 See [benchmarking and profiling](docs/benchmark.md) for measurement semantics,
 baseline comparisons, and the distinction between wall timings and CUDA kernel metrics.
 
+## Serve
+
+`tidal-server` keeps one model loaded behind an HTTP API that OpenAI clients
+(`/v1/chat/completions`, `/v1/completions`), Anthropic clients (`/v1/messages`) and
+llama.cpp server clients (`/completion`, `/tokenize`, `/props`, `/slots`, `/metrics`, ...)
+can all use, with streaming, thinking, tool calls and prompt-cache reuse between
+requests. It reads the tokenizer from the GGUF, so real Qwen GGUFs need no Python
+frontend. A test page is served at `/`.
+
+```sh
+build-cuda/bin/tidal-server --model models/qwen35/Qwen3.5-0.8B-Q8_0.gguf --context 8192
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -d '{"messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 64}'
+```
+
+See [the server guide](docs/server.md) for options, endpoints and limits.
+
 ## Verify
 
 ```sh

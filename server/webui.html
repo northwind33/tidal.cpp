@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tidal-server</title>
+<style>
+:root { --bg:#f6f7f9; --panel:#fff; --line:#d5d9e0; --text:#1c2129; --dim:#667085; --accent:#1f6feb; --user:#e7f0ff; --code:#f0f2f5; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#0f1318; --panel:#171c23; --line:#2c343f; --text:#e3e8ef; --dim:#8b96a5; --accent:#58a6ff; --user:#1b2a41; --code:#0d1117; }
+}
+* { box-sizing: border-box; }
+body { margin:0; font:14px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--text); }
+header { display:flex; flex-wrap:wrap; gap:10px; align-items:center; padding:8px 16px; border-bottom:1px solid var(--line); background:var(--panel); }
+header h1 { font-size:15px; margin:0; }
+#status { font-size:12px; color:var(--dim); flex:1; }
+.dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#d29922; margin-right:5px; }
+.dot.ok { background:#2da44e; } .dot.bad { background:#cf222e; }
+nav { display:flex; gap:2px; padding:0 16px; background:var(--panel); border-bottom:1px solid var(--line); overflow-x:auto; }
+nav button { border:0; background:none; color:var(--dim); padding:8px 12px; cursor:pointer; border-bottom:2px solid transparent; font:inherit; }
+nav button.on { color:var(--text); border-color:var(--accent); }
+main { max-width:980px; margin:0 auto; padding:16px; }
+section { display:none; } section.on { display:block; }
+.row { display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; margin:8px 0; }
+label { font-size:12px; color:var(--dim); display:inline-flex; gap:5px; align-items:center; }
+input, select, textarea, button { font:inherit; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:5px 8px; }
+input[type=number] { width:84px; } input[type=checkbox] { width:auto; }
+textarea { width:100%; min-height:70px; resize:vertical; font-family:ui-monospace, monospace; font-size:13px; }
+button { cursor:pointer; } button.go { background:var(--accent); color:#fff; border-color:var(--accent); }
+button:disabled { opacity:.5; cursor:default; }
+pre, .out { background:var(--code); border:1px solid var(--line); border-radius:6px; padding:10px; white-space:pre-wrap; word-break:break-word; font:13px/1.45 ui-monospace, monospace; margin:8px 0; max-height:520px; overflow:auto; }
+#log { min-height:200px; }
+.msg { border:1px solid var(--line); border-radius:8px; padding:8px 12px; margin:8px 0; background:var(--panel); white-space:pre-wrap; word-break:break-word; }
+.msg.user { background:var(--user); } .msg .who { font-size:11px; color:var(--dim); text-transform:uppercase; letter-spacing:.04em; }
+.msg details { color:var(--dim); margin:4px 0; } .msg .call { font:12px ui-monospace, monospace; background:var(--code); border-radius:6px; padding:6px 8px; margin:6px 0; }
+.stats { font-size:12px; color:var(--dim); min-height:18px; }
+details.box { margin:8px 0; } details.box summary { cursor:pointer; color:var(--dim); font-size:12px; }
+.tok { display:inline-block; border:1px solid var(--line); border-radius:4px; padding:0 4px; margin:1px; font:12px ui-monospace, monospace; white-space:pre; }
+</style>
+</head>
+<body>
+<header>
+  <h1>tidal-server</h1>
+  <span id="status"><span class="dot"></span>connecting</span>
+  <label>API key <input id="key" type="password" size="14" placeholder="optional"></label>
+</header>
+<nav id="tabs">
+  <button data-tab="chat" class="on">Chat</button>
+  <button data-tab="completion">Completion</button>
+  <button data-tab="tokens">Tokenize</button>
+  <button data-tab="template">Template</button>
+  <button data-tab="server">Server</button>
+</nav>
+<main>
+<section id="chat" class="on">
+  <div class="row">
+    <label>API <select id="api"><option value="openai">OpenAI /v1/chat/completions</option><option value="anthropic">Anthropic /v1/messages</option></select></label>
+    <label><input id="stream" type="checkbox" checked> stream</label>
+    <label><input id="think" type="checkbox"> thinking</label>
+    <label><input id="tools" type="checkbox"> tools</label>
+    <label>max tokens <input id="max" type="number" value="512" min="0"></label>
+    <label>temperature <input id="temp" type="number" step="0.1" placeholder="default"></label>
+    <label>top_p <input id="topp" type="number" step="0.05" placeholder="default"></label>
+    <label>top_k <input id="topk" type="number" placeholder="default"></label>
+    <label>seed <input id="seed" type="number" placeholder="random"></label>
+    <label>stop <input id="stop" size="10" placeholder="a,b"></label>
+  </div>
+  <details class="box"><summary>System prompt and tool definitions</summary>
+    <textarea id="system" placeholder="System prompt (optional)"></textarea>
+    <textarea id="tooldefs" style="min-height:150px">[
+  {"type": "function", "function": {
+    "name": "get_weather",
+    "description": "Get the current weather for a city",
+    "parameters": {"type": "object", "properties": {
+      "city": {"type": "string", "description": "City name"},
+      "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}},
+      "required": ["city"]}}}
+]</textarea>
+  </details>
+  <div id="log"></div>
+  <div class="stats" id="chatstats"></div>
+  <textarea id="input" placeholder="Message (Ctrl+Enter to send). After a tool call, type the tool result here."></textarea>
+  <div class="row">
+    <button class="go" id="send">Send</button>
+    <button id="abort" disabled>Stop</button>
+    <button id="clear">Clear</button>
+  </div>
+  <details class="box"><summary>Last request / response</summary><pre id="chatraw"></pre></details>
+</section>
+
+<section id="completion">
+  <div class="row">
+    <label>Endpoint <select id="cendpoint"><option>/completion</option><option>/v1/completions</option><option>/infill</option></select></label>
+    <label><input id="cstream" type="checkbox" checked> stream</label>
+    <label>n_predict <input id="cn" type="number" value="128"></label>
+    <label>temperature <input id="ctemp" type="number" step="0.1" placeholder="default"></label>
+    <label>n_probs <input id="cprobs" type="number" value="0" min="0"></label>
+    <label><input id="ccache" type="checkbox" checked> cache_prompt</label>
+  </div>
+  <textarea id="cprompt" style="min-height:120px" placeholder="Raw prompt (for /infill: the text before the gap)"></textarea>
+  <textarea id="csuffix" placeholder="/infill only: the text after the gap"></textarea>
+  <div class="row"><button class="go" id="crun">Generate</button><button id="cabort" disabled>Stop</button></div>
+  <div class="out" id="cout"></div>
+  <details class="box" open><summary>Final response</summary><pre id="craw"></pre></details>
+</section>
+
+<section id="tokens">
+  <textarea id="ttext" placeholder="Text to tokenize"></textarea>
+  <div class="row">
+    <button class="go" id="ttok">POST /tokenize</button>
+    <label><input id="tspecial" type="checkbox" checked> parse_special</label>
+    <button id="tcount">POST /v1/messages/count_tokens</button>
+  </div>
+  <div id="tpieces"></div>
+  <textarea id="tids" placeholder="Token ids, comma separated"></textarea>
+  <div class="row"><button class="go" id="tdetok">POST /detokenize</button></div>
+  <pre id="tout"></pre>
+</section>
+
+<section id="template">
+  <p class="stats">POST /apply-template renders the chat prompt without generating. The body takes the same fields as /v1/chat/completions.</p>
+  <textarea id="pbody" style="min-height:200px">{
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "Hello!"}
+  ],
+  "enable_thinking": false
+}</textarea>
+  <div class="row"><button class="go" id="prun">Render</button></div>
+  <pre id="pout"></pre>
+</section>
+
+<section id="server">
+  <div class="row">
+    <button data-get="/health">GET /health</button>
+    <button data-get="/v1/models">GET /v1/models</button>
+    <button data-get="/props">GET /props</button>
+    <button data-get="/slots">GET /slots</button>
+    <button data-get="/metrics">GET /metrics</button>
+    <button id="erase">POST /slots/0?action=erase</button>
+  </div>
+  <pre id="sout"></pre>
+</section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const pretty = v => typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+$('key').value = localStorage.getItem('tidal-key') || '';
+$('key').onchange = () => localStorage.setItem('tidal-key', $('key').value);
+
+function headers() {
+  const h = {'Content-Type': 'application/json'};
+  if ($('key').value) { h['Authorization'] = 'Bearer ' + $('key').value; h['x-api-key'] = $('key').value; }
+  return h;
+}
+async function call(path, body, signal) {
+  const response = await fetch(path, {method: body === undefined ? 'GET' : 'POST', headers: headers(),
+                                      body: body === undefined ? undefined : JSON.stringify(body), signal});
+  return response;
+}
+async function json(path, body) {
+  const response = await call(path, body);
+  const text = await response.text();
+  try { return JSON.parse(text); } catch { return text; }
+}
+// Reads a server-sent event stream, calling handle(event, data) per event.
+async function events(response, handle) {
+  const reader = response.body.getReader(), decoder = new TextDecoder();
+  let buffer = '';
+  for (;;) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, {stream: true});
+    let end;
+    while ((end = buffer.indexOf('\n\n')) >= 0) {
+      const block = buffer.slice(0, end); buffer = buffer.slice(end + 2);
+      let event = '', data = '';
+      for (const line of block.split('\n')) {
+        if (line.startsWith('event:')) event = line.slice(6).trim();
+        else if (line.startsWith('data:')) data += line.slice(5).trimStart();
+      }
+      if (data && data !== '[DONE]') handle(event, JSON.parse(data));
+    }
+  }
+}
+const number = id => $(id).value === '' ? undefined : Number($(id).value);
+
+document.querySelectorAll('#tabs button').forEach(button => button.onclick = () => {
+  document.querySelectorAll('#tabs button, main section').forEach(e => e.classList.remove('on'));
+  button.classList.add('on'); $(button.dataset.tab).classList.add('on');
+});
+
+async function health() {
+  let label = 'unreachable', kind = 'bad';
+  try {
+    const response = await call('/health');
+    if (response.ok) {
+      kind = 'ok';
+      const props = await json('/props');
+      label = props.model_alias ? `${props.model_alias} · ctx ${props.default_generation_settings.n_ctx} · ${props.backend} · ${props.chat_format}` : 'ready';
+      if (props.thinking_default !== undefined && !health.done) { $('think').checked = props.thinking_default; health.done = true; }
+    } else { label = response.status === 503 ? 'loading model' : 'error ' + response.status; kind = response.status === 503 ? '' : 'bad'; }
+  } catch {}
+  $('status').innerHTML = `<span class="dot ${kind}"></span>`; $('status').append(label);
+  setTimeout(health, kind === 'ok' ? 15000 : 1500);
+}
+health();
+
+// ---- Chat ----
+// Neutral history: {role, content, reasoning?, calls?: [{id, name, arguments}]} and {role:'tool', id, content}.
+let history = [], controller = null;
+function render() {
+  const log = $('log'); log.textContent = '';
+  for (const m of history) {
+    const box = document.createElement('div'); box.className = 'msg ' + m.role;
+    const who = document.createElement('div'); who.className = 'who'; who.textContent = m.role === 'tool' ? `tool result (${m.id})` : m.role;
+    box.append(who);
+    if (m.reasoning) {
+      const details = document.createElement('details'); details.open = !m.content;
+      const summary = document.createElement('summary'); summary.textContent = 'thinking';
+      details.append(summary, m.reasoning); box.append(details);
+    }
+    if (m.content) box.append(m.content);
+    for (const c of m.calls || []) {
+      const call = document.createElement('div'); call.className = 'call';
+      call.textContent = `tool call ${c.name}(${JSON.stringify(c.arguments)})  id=${c.id}`; box.append(call);
+    }
+    log.append(box);
+  }
+  log.scrollTop = log.scrollHeight; window.scrollTo(0, document.body.scrollHeight);
+}
+function pendingCall() {
+  const last = history[history.length - 1];
+  if (!last) return null;
+  const calls = [];
+  for (let i = history.length - 1; i >= 0 && history[i].role !== 'user'; --i)
+    if (history[i].role === 'assistant') { calls.push(...(history[i].calls || [])); break; }
+  const answered = new Set(history.filter(m => m.role === 'tool').map(m => m.id));
+  return calls.find(c => !answered.has(c.id)) || null;
+}
+function sampling(body) {
+  for (const [id, key] of [['temp', 'temperature'], ['topp', 'top_p'], ['topk', 'top_k'], ['seed', 'seed']])
+    if (number(id) !== undefined) body[key] = number(id);
+  return body;
+}
+function openaiBody() {
+  const messages = [];
+  if ($('system').value) messages.push({role: 'system', content: $('system').value});
+  for (const m of history) {
+    if (m.role === 'tool') messages.push({role: 'tool', tool_call_id: m.id, content: m.content});
+    else if (m.role === 'user') messages.push({role: 'user', content: m.content});
+    else {
+      const out = {role: 'assistant', content: m.content || ''};
+      if (m.reasoning) out.reasoning_content = m.reasoning;
+      if (m.calls && m.calls.length) out.tool_calls = m.calls.map(c => ({id: c.id, type: 'function', function: {name: c.name, arguments: JSON.stringify(c.arguments)}}));
+      messages.push(out);
+    }
+  }
+  const body = sampling({messages, stream: $('stream').checked, max_tokens: number('max'), enable_thinking: $('think').checked});
+  if ($('stream').checked) body.stream_options = {include_usage: true};
+  if ($('tools').checked) body.tools = JSON.parse($('tooldefs').value);
+  if ($('stop').value) body.stop = $('stop').value.split(',');
+  return body;
+}
+function anthropicBody() {
+  const messages = [];
+  const push = (role, block) => {
+    const last = messages[messages.length - 1];
+    if (last && last.role === role) last.content.push(block); else messages.push({role, content: [block]});
+  };
+  for (const m of history) {
+    if (m.role === 'tool') push('user', {type: 'tool_result', tool_use_id: m.id, content: m.content});
+    else if (m.role === 'user') push('user', {type: 'text', text: m.content});
+    else {
+      if (m.reasoning) push('assistant', {type: 'thinking', thinking: m.reasoning, signature: ''});
+      if (m.content) push('assistant', {type: 'text', text: m.content});
+      for (const c of m.calls || []) push('assistant', {type: 'tool_use', id: c.id, name: c.name, input: c.arguments});
+    }
+  }
+  const body = sampling({model: 'tidal', messages, stream: $('stream').checked, max_tokens: number('max') ?? 512});
+  delete body.seed;
+  if ($('system').value) body.system = $('system').value;
+  if ($('think').checked) body.thinking = {type: 'enabled', budget_tokens: 1024};
+  if ($('tools').checked) body.tools = JSON.parse($('tooldefs').value).map(t => ({name: t.function.name, description: t.function.description, input_schema: t.function.parameters}));
+  if ($('stop').value) body.stop_sequences = $('stop').value.split(',');
+  return body;
+}
+async function send() {
+  const text = $('input').value;
+  const waiting = pendingCall();
+  if (waiting) history.push({role: 'tool', id: waiting.id, content: text});
+  else { if (!text) return; history.push({role: 'user', content: text}); }
+  $('input').value = '';
+  if (pendingCall()) { render(); $('chatstats').textContent = 'Another tool call is waiting for its result.'; return; }
+  const anthropic = $('api').value === 'anthropic';
+  let body;
+  try { body = anthropic ? anthropicBody() : openaiBody(); }
+  catch (e) { $('chatstats').textContent = 'Invalid tool definitions: ' + e.message; history.pop(); return; }
+  const reply = {role: 'assistant', content: '', reasoning: '', calls: []};
+  history.push(reply); render();
+  controller = new AbortController();
+  $('send').disabled = true; $('abort').disabled = false; $('chatstats').textContent = 'waiting…';
+  const started = performance.now();
+  let raw = [], stats = '';
+  try {
+    const response = await call(anthropic ? '/v1/messages' : '/v1/chat/completions', body, controller.signal);
+    if (!response.ok) throw new Error(await response.text());
+    if (!body.stream) {
+      const data = await response.json(); raw = data;
+      if (anthropic) {
+        for (const block of data.content) {
+          if (block.type === 'thinking') reply.reasoning += block.thinking;
+          else if (block.type === 'text') reply.content += block.text;
+          else if (block.type === 'tool_use') reply.calls.push({id: block.id, name: block.name, arguments: block.input});
+        }
+        stats = `stop_reason=${data.stop_reason} · input ${data.usage.input_tokens} (+${data.usage.cache_read_input_tokens} cached) · output ${data.usage.output_tokens}`;
+      } else {
+        const message = data.choices[0].message;
+        reply.content = message.content || ''; reply.reasoning = message.reasoning_content || '';
+        for (const c of message.tool_calls || []) reply.calls.push({id: c.id, name: c.function.name, arguments: JSON.parse(c.function.arguments)});
+        stats = `finish_reason=${data.choices[0].finish_reason} · prompt ${data.usage.prompt_tokens} (${data.usage.prompt_tokens_details.cached_tokens} cached) · completion ${data.usage.completion_tokens}` + speed(data.timings);
+      }
+    } else {
+      const partial = {};
+      await events(response, (event, data) => {
+        raw.push(data);
+        if (data.error) throw new Error(pretty(data.error));
+        if (anthropic) {
+          if (data.type === 'content_block_start' && data.content_block.type === 'tool_use')
+            partial[data.index] = {id: data.content_block.id, name: data.content_block.name, json: ''};
+          else if (data.type === 'content_block_delta') {
+            const d = data.delta;
+            if (d.type === 'thinking_delta') reply.reasoning += d.thinking;
+            else if (d.type === 'text_delta') reply.content += d.text;
+            else if (d.type === 'input_json_delta') partial[data.index].json += d.partial_json;
+          } else if (data.type === 'content_block_stop' && partial[data.index]) {
+            const p = partial[data.index];
+            reply.calls.push({id: p.id, name: p.name, arguments: JSON.parse(p.json || '{}')});
+          } else if (data.type === 'message_start') stats = `input ${data.message.usage.input_tokens} (+${data.message.usage.cache_read_input_tokens} cached)`;
+          else if (data.type === 'message_delta') stats += ` · output ${data.usage.output_tokens} · stop_reason=${data.delta.stop_reason}`;
+        } else {
+          const choice = data.choices[0];
+          if (choice) {
+            const d = choice.delta;
+            if (d.reasoning_content) reply.reasoning += d.reasoning_content;
+            if (d.content) reply.content += d.content;
+            for (const c of d.tool_calls || []) reply.calls.push({id: c.id, name: c.function.name, arguments: JSON.parse(c.function.arguments)});
+            if (choice.finish_reason) stats = `finish_reason=${choice.finish_reason}` + speed(data.timings);
+          } else if (data.usage) stats += ` · prompt ${data.usage.prompt_tokens} (${data.usage.prompt_tokens_details.cached_tokens} cached) · completion ${data.usage.completion_tokens}`;
+        }
+        render();
+      });
+    }
+  } catch (e) {
+    stats = e.name === 'AbortError' ? 'stopped' : 'error: ' + e.message;
+  }
+  if (!reply.content && !reply.reasoning && !reply.calls.length) history.pop();
+  render();
+  const next = pendingCall();
+  $('chatstats').textContent = stats + ` · ${((performance.now() - started) / 1000).toFixed(2)} s` + (next ? ` — enter the result of ${next.name} and press Send` : '');
+  $('chatraw').textContent = '// request\n' + pretty(body) + '\n\n// response\n' + pretty(raw);
+  $('send').disabled = false; $('abort').disabled = true; controller = null;
+}
+const speed = t => t && t.predicted_per_second ? ` · ${t.predicted_per_second.toFixed(1)} tok/s` : '';
+$('send').onclick = send;
+$('abort').onclick = () => controller && controller.abort();
+$('clear').onclick = () => { history = []; render(); $('chatstats').textContent = ''; };
+$('input').onkeydown = e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) send(); };
+
+// ---- Completion ----
+let ccontroller = null;
+$('crun').onclick = async () => {
+  const endpoint = $('cendpoint').value, stream = $('cstream').checked;
+  const body = {stream, cache_prompt: $('ccache').checked};
+  if (endpoint === '/infill') { body.input_prefix = $('cprompt').value; body.input_suffix = $('csuffix').value; }
+  else body.prompt = $('cprompt').value;
+  if (number('cn') !== undefined) body[endpoint === '/v1/completions' ? 'max_tokens' : 'n_predict'] = number('cn');
+  if (number('ctemp') !== undefined) body.temperature = number('ctemp');
+  if (number('cprobs')) body[endpoint === '/v1/completions' ? 'logprobs' : 'n_probs'] = number('cprobs');
+  $('cout').textContent = ''; $('craw').textContent = '';
+  ccontroller = new AbortController(); $('crun').disabled = true; $('cabort').disabled = false;
+  try {
+    const response = await call(endpoint, body, ccontroller.signal);
+    if (!response.ok) throw new Error(await response.text());
+    const show = data => {
+      $('cout').append(endpoint === '/v1/completions' ? data.choices[0].text : data.content);
+      if (!stream || data.stop || (data.choices && data.choices[0].finish_reason)) $('craw').textContent = pretty(data);
+    };
+    if (stream) await events(response, (event, data) => { if (data.error) throw new Error(pretty(data.error)); show(data); });
+    else show(await response.json());
+  } catch (e) { $('craw').textContent = e.name === 'AbortError' ? 'stopped' : 'error: ' + e.message; }
+  $('crun').disabled = false; $('cabort').disabled = true;
+};
+$('cabort').onclick = () => ccontroller && ccontroller.abort();
+
+// ---- Tokenize ----
+$('ttok').onclick = async () => {
+  const data = await json('/tokenize', {content: $('ttext').value, with_pieces: true, parse_special: $('tspecial').checked});
+  const box = $('tpieces'); box.textContent = '';
+  if (!data.tokens) { $('tout').textContent = pretty(data); return; }
+  for (const t of data.tokens) {
+    const span = document.createElement('span'); span.className = 'tok'; span.title = t.id;
+    span.textContent = typeof t.piece === 'string' ? t.piece : '0x' + t.piece.map(b => b.toString(16).padStart(2, '0')).join('');
+    box.append(span);
+  }
+  $('tids').value = data.tokens.map(t => t.id).join(',');
+  $('tout').textContent = data.tokens.length + ' tokens';
+};
+$('tdetok').onclick = async () => {
+  const tokens = $('tids').value.split(',').map(s => s.trim()).filter(s => s).map(Number);
+  $('tout').textContent = pretty(await json('/detokenize', {tokens}));
+};
+$('tcount').onclick = async () => {
+  $('tout').textContent = pretty(await json('/v1/messages/count_tokens', {model: 'tidal', messages: [{role: 'user', content: $('ttext').value}]}));
+};
+
+// ---- Template / Server ----
+$('prun').onclick = async () => {
+  let body;
+  try { body = JSON.parse($('pbody').value); } catch (e) { $('pout').textContent = 'Invalid JSON: ' + e.message; return; }
+  const data = await json('/apply-template', body);
+  $('pout').textContent = data.prompt !== undefined ? data.prompt : pretty(data);
+};
+document.querySelectorAll('[data-get]').forEach(button => button.onclick = async () => {
+  $('sout').textContent = pretty(await json(button.dataset.get));
+});
+$('erase').onclick = async () => { $('sout').textContent = pretty(await json('/slots/0?action=erase', {})); };
+</script>
+</body>
+</html>

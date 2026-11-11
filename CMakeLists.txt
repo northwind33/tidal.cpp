@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 option(TIDAL_CUDA "Build the strict CUDA execution path" OFF)
+option(TIDAL_SERVER "Build tidal-server, the HTTP API server (POSIX sockets)" ON)
 option(TIDAL_SANITIZE "Enable address and undefined-behavior sanitizers" OFF)
 set(TIDAL_GGML_SOURCE_DIR "" CACHE PATH "Use an existing checkout of the pinned ggml revision")
 
@@ -85,6 +86,25 @@ target_compile_definitions(tidal-bench PRIVATE
     TIDAL_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
     TIDAL_BUILD_TYPE="${CMAKE_BUILD_TYPE}")
 
+if(TIDAL_SERVER AND NOT WIN32)
+    set(TIDAL_WEBUI_HEADER "${CMAKE_BINARY_DIR}/server/webui.hpp")
+    add_custom_command(OUTPUT "${TIDAL_WEBUI_HEADER}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${CMAKE_SOURCE_DIR}/server/webui.html -DOUTPUT=${TIDAL_WEBUI_HEADER}
+            -DNAME=webui_html -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
+        DEPENDS server/webui.html cmake/embed.cmake
+        VERBATIM)
+    find_package(Threads REQUIRED)
+    add_library(tidal-server-core STATIC server/json.cpp server/tokenizer.cpp server/chat.cpp server/http.cpp
+        server/runtime.cpp server/app.cpp "${TIDAL_WEBUI_HEADER}")
+    target_include_directories(tidal-server-core PUBLIC server PRIVATE "${CMAKE_BINARY_DIR}/server")
+    target_link_libraries(tidal-server-core PUBLIC tidal Threads::Threads)
+    target_compile_options(tidal-server-core PRIVATE -Wall -Wextra -Wpedantic)
+    add_executable(tidal-server server/main.cpp)
+    target_include_directories(tidal-server PRIVATE tools)
+    target_link_libraries(tidal-server PRIVATE tidal-server-core)
+    target_compile_options(tidal-server PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 include(CTest)
 if(BUILD_TESTING)
     add_executable(tidal-prefill-test tests/prefill.cpp)
@@ -135,6 +155,11 @@ if(BUILD_TESTING)
     target_link_libraries(tidal-tests PRIVATE tidal)
     target_include_directories(tidal-tests PRIVATE src)
     add_test(NAME core COMMAND tidal-tests)
+    if(TARGET tidal-server)
+        add_executable(tidal-server-test tests/server.cpp)
+        target_link_libraries(tidal-server-test PRIVATE tidal-server-core)
+        add_test(NAME server-text COMMAND tidal-server-test)
+    endif()
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_FOUND)
         add_test(NAME model-plan COMMAND ${Python3_EXECUTABLE}
@@ -143,6 +168,11 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_benchmark.py
             --bin-dir $<TARGET_FILE_DIR:tidal-bench>)
         set_tests_properties(benchmark PROPERTIES TIMEOUT 180)
+        if(TARGET tidal-server)
+            add_test(NAME server COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_server.py --bin-dir $<TARGET_FILE_DIR:tidal-server>)
+            set_tests_properties(server PROPERTIES TIMEOUT 180)
+        endif()
         execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy"
             RESULT_VARIABLE TIDAL_NUMPY_STATUS OUTPUT_QUIET ERROR_QUIET)
         if(TIDAL_NUMPY_STATUS EQUAL 0)

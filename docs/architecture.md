@@ -245,7 +245,7 @@ allocates the next from an alternate allocator. Prefill KV exports and
 weight prefetch overlap work. Persistent GPU KV decode instead runs one graph per
 token on a reused compute buffer and, for Qwen3.5, reuses that graph across tokens
 (see [GPU prefill](prefill.md#persistent-gpu-kv-benchmark-mode)).
-CPU attention runs on a persistent worker pool shared by all attention layers, and top-k materializes a score for every compressed block. There
-is no server, multi-sequence cache,
+CPU attention runs on a persistent worker pool shared by all attention layers, and top-k materializes a score for every compressed block. The
+[HTTP server](server.md) serves one sequence at a time. There is no multi-sequence cache,
 checkpoint converter or long-context benchmark claim. These are explicit next
 optimization/integration boundaries after correctness and GPU runtime validation.
