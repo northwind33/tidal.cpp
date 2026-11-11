@@ -39,7 +39,7 @@ The user's Qwen3-Flash-Next refers here to Qwen3.8-Flash-Next, exposed as
 this fixture follows the earlier Dense-engine plan. It retains the decoder's
 GDN/QSA rhythm, Gated Residual reads/writes, Q/K normalization, partial NeoX RoPE,
 gated attention output and SwiGLU. The FFN can be Dense or MoE. PLE is optional;
-vision and MTP are disabled. These synthetic models have no tokenizer or claim of
+MTP is disabled. The released vision tower can be attached ([vision](vision.md)). These synthetic models have no tokenizer or claim of
 released `qwen4exp` checkpoint compatibility.
 
 Sources inspected on 2026-11-04:

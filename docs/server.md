@@ -179,13 +179,15 @@ reused ones. Thinking blocks have an empty `signature`. Server-side tools
 | `POST /apply-template` | The chat request body; returns `{"prompt": ...}` without generating. |
 | `GET /props` | Context size, default sampling, chat template and format, tokenizer kind. |
 | `GET /slots`, `POST /slots/0?action=erase` | Slot state; erase drops the prompt cache. |
-| `GET /metrics` | Prometheus text with the `llamacpp:` metric names, plus `tidal:prompt_tokens_cached_total`. |
+| `GET /metrics` | Prometheus text with the `llamacpp:` metric names, plus `tidal:prompt_tokens_cached_total` and `tidal:images_encoded_total`. |
+| `GET /placement`, `/v1/placement` | Every weight, KV cache and state tensor with its memory and compute device ([vision guide](vision.md#tensor-placement-api)). |
 | `GET /health`, `/v1/health` | 200 `{"status": "ok"}` once the model is ready, 503 while loading. |
 
 ### Not supported
 
 Embeddings, reranking, LoRA adapters, the OpenAI Responses API, audio and image
-endpoints answer 501. Images and other non-text content parts, grammars and
+generation endpoints answer 501. Image inputs need `--vision-model` (see
+[vision](vision.md)); remote image URLs, video and audio parts, grammars and
 JSON-schema constrained output, `n > 1`, slot save/restore and parallel slots
 are rejected with an error message that names the limitation.
 

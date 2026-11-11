@@ -19,7 +19,7 @@ See [the real-model guide](docs/qwen35.md) for downloads, text generation and
 independent verification. The `tidal-dummy` models still have random weights and
 synthetic token IDs. Their optional PLE implements n-gram embedding, gating and
 dilated convolution; optional MoE implements top-k routing, sparse SwiGLU experts
-and a gated shared expert. Released `qwen4exp` checkpoints, vision and MTP execution
+and a gated shared expert. Released `qwen4exp` checkpoints and their MTP execution
 remain outside this version. CUDA prompt ingestion uses a dedicated layer-major
 batch path; the CPU backend retains sequential reference execution.
 

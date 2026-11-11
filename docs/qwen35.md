@@ -9,8 +9,8 @@ requested CUDA backend. Unsupported CUDA operations fail; there is no scheduler
 that moves neural graph operations to CPU. Tokenization and orchestration are host work; token sampling defaults to the
 model backend.
 
-This supports single-sequence text generation. Image/video inputs and vision
-projectors, MTP execution, scaled RoPE and `qwen35moe` are not
+This supports single-sequence generation with text and, with an mmproj, image input ([vision](vision.md)). Video inputs,
+scaled RoPE and `qwen35moe` are not
 implemented. Other Qwen3.5 sizes are not covered by the public-model validation.
 The existing synthetic `qwen4exp` Dense/MoE/PLE paths remain available.
 
