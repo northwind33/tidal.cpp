@@ -64,6 +64,9 @@ private:
     void slots(const Request &, Response &);
     void slot_action(const Request &, Response &);
     void metrics(const Request &, Response &);
+    void placement(const Request &, Response &);
+    Json vision_json() const;
+    Prompt tokenize_with_images(const std::string & text, const std::vector<std::shared_ptr<const Image>> & images) const;
     void health(const Request &, Response &);
 };
 

@@ -47,6 +47,10 @@ void Runtime::work() {
         backend_ = engine_->backend_name();
         tokenizer_ = std::make_unique<Tokenizer>(config_.model, model_.vocab);
         chat_ = std::make_unique<ChatFormat>(tokenizer_->metadata().chat_template, config_.chat_template);
+        vision_ = engine_->vision_info();
+        image_pad_ = model_.image_token >= 0 ? model_.image_token : tokenizer_->added_token("<|image_pad|>");
+        if (vision_.enabled && image_pad_ < 0) throw std::runtime_error("The tokenizer has no <|image_pad|> token for image input");
+        { std::lock_guard lock(mutex_); placements_ = engine_->tensor_placements(); }
         state_ = State::Ready;
     } catch (const std::exception & e) {
         { std::lock_guard lock(mutex_); error_ = e.what(); }
@@ -87,8 +91,37 @@ void Runtime::erase() {
     submit([this] { engine_->reset(); });
 }
 
-GenerationResult Runtime::generate(const std::vector<int32_t> & prompt, const GenerationParams & params,
+std::vector<TensorPlacement> Runtime::placements() const {
+    if (state_ != State::Ready) throw ApiError(503, "unavailable_error", "Loading model");
+    std::lock_guard lock(mutex_);
+    return placements_;
+}
+
+Prompt Runtime::expand(const std::vector<std::vector<int32_t>> & segments,
+                       const std::vector<std::shared_ptr<const Image>> & images) const {
+    if (state_ != State::Ready) throw ApiError(503, "unavailable_error", "Loading model");
+    if (segments.size() != images.size() + 1)
+        throw invalid_request("The prompt has " + std::to_string(segments.size() - 1) + " image placeholder(s) for " +
+                              std::to_string(images.size()) + " image(s)");
+    if (!images.empty() && !vision_.enabled)
+        throw invalid_request("This server has no vision model; start tidal-server with --vision-model");
+    Prompt prompt;
+    for (size_t i = 0; i < segments.size(); ++i) {
+        prompt.tokens.insert(prompt.tokens.end(), segments[i].begin(), segments[i].end());
+        if (i == images.size()) break;
+        const auto & image = images[i];
+        int count = 0;
+        try { count = engine_->image_tokens(image->width, image->height); }
+        catch (const std::invalid_argument & e) { throw invalid_request(std::string("Invalid image: ") + e.what()); }
+        prompt.images.push_back({int(prompt.tokens.size()), image, nullptr});
+        prompt.tokens.insert(prompt.tokens.end(), size_t(count), image_pad_);
+    }
+    return prompt;
+}
+
+GenerationResult Runtime::generate(const Prompt & request, const GenerationParams & params,
                                    const GenerationCallbacks & callbacks) {
+    const auto & prompt = request.tokens;
     if (state_ != State::Ready) throw ApiError(503, "unavailable_error", "Loading model");
     if (prompt.empty()) throw invalid_request("The prompt is empty");
     if (prompt.size() >= size_t(model_.context))
@@ -97,12 +130,13 @@ GenerationResult Runtime::generate(const std::vector<int32_t> & prompt, const Ge
     try { params.sampling.validate(); }
     catch (const std::invalid_argument &) { throw invalid_request("Invalid sampling parameters"); }
     GenerationResult result;
-    submit([&] { result = execute(prompt, params, callbacks); });
+    submit([&] { result = execute(request, params, callbacks); });
     return result;
 }
 
-GenerationResult Runtime::execute(const std::vector<int32_t> & prompt, const GenerationParams & params,
+GenerationResult Runtime::execute(const Prompt & request, const GenerationParams & params,
                                   const GenerationCallbacks & callbacks) {
+    const auto & prompt = request.tokens;
     GenerationResult result;
     result.prompt_tokens = int(prompt.size());
     const auto is_cancelled = [&] { return stopping_ || (callbacks.cancelled && callbacks.cancelled()); };
@@ -115,9 +149,14 @@ GenerationResult Runtime::execute(const std::vector<int32_t> & prompt, const Gen
     try {
         const auto prompt_start = std::chrono::steady_clock::now();
         if (!params.cache_prompt) engine.reset();
-        const uint64_t reused = engine.statistics().prompt_cache_reused_tokens;
-        engine.prefill_cached(prompt, false);
+        const uint64_t reused = engine.statistics().prompt_cache_reused_tokens, encoded = engine.statistics().images_encoded;
+        try { engine.prefill_cached(prompt, request.images, false); }
+        catch (const std::invalid_argument & e) {
+            // Images are checked and encoded before the sequence changes.
+            throw invalid_request(std::string("Invalid image input: ") + e.what());
+        }
         result.cached_tokens = int(engine.statistics().prompt_cache_reused_tokens - reused);
+        result.images_encoded = int(engine.statistics().images_encoded - encoded);
         engine.set_sampling(params.sampling);
         result.prompt_ms = elapsed_ms(prompt_start);
         if (callbacks.on_prompt) callbacks.on_prompt(result.prompt_tokens, result.cached_tokens);
@@ -220,7 +259,10 @@ GenerationResult Runtime::execute(const std::vector<int32_t> & prompt, const Gen
         throw ApiError(500, "server_error", std::string("Inference failed: ") + e.what());
     }
     decoded_ = 0; remaining_ = 0;
+    auto placements = engine.tensor_placements();
     std::lock_guard lock(mutex_);
+    placements_ = std::move(placements);
+    metrics_.images += uint64_t(result.images_encoded);
     ++metrics_.requests;
     metrics_.prompt_tokens += uint64_t(result.prompt_tokens - result.cached_tokens);
     metrics_.cached_tokens += uint64_t(result.cached_tokens);

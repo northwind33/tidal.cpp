@@ -98,7 +98,7 @@ if(TIDAL_SERVER AND NOT WIN32)
         DEPENDS server/webui.html cmake/embed.cmake
         VERBATIM)
     find_package(Threads REQUIRED)
-    add_library(tidal-server-core STATIC server/json.cpp server/tokenizer.cpp server/chat.cpp server/http.cpp
+    add_library(tidal-server-core STATIC server/json.cpp server/tokenizer.cpp server/chat.cpp server/http.cpp server/media.cpp
         server/runtime.cpp server/app.cpp "${TIDAL_WEBUI_HEADER}")
     target_include_directories(tidal-server-core PUBLIC server PRIVATE "${CMAKE_BINARY_DIR}/server")
     target_link_libraries(tidal-server-core PUBLIC tidal Threads::Threads)

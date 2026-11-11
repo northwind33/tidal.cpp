@@ -5,6 +5,7 @@
 #include "args.hpp"
 #include "prefill_options.hpp"
 #include "sampling_options.hpp"
+#include "vision_options.hpp"
 
 #include <chrono>
 #include <csignal>
@@ -39,10 +40,10 @@ void log_line(const std::string & line) {
 int main(int argc, char ** argv) {
     int exit_code = 0;
     try {
-        Args args(argc, argv, prefill_options({"--help", "--model", "--host", "--port", "--alias", "--api-key", "--backend",
+        Args args(argc, argv, vision_options(prefill_options({"--help", "--model", "--host", "--port", "--alias", "--api-key", "--backend",
             "--device", "--threads", "--context", "--draft-tokens", "--mtp", "--thinking", "--chat-template", "--n-predict",
             "--webui", "--sampler", "--temp", "--top-k", "--top-p", "--min-p", "--repeat-penalty", "--frequency-penalty",
-            "--presence-penalty", "--penalty-last-n", "--seed"}));
+            "--presence-penalty", "--penalty-last-n", "--seed"})));
         if (!args.get("--help").empty()) {
             std::cout <<
                 "tidal-server --model MODEL.gguf [--host 127.0.0.1] [--port 8080] [--alias NAME] [--api-key KEY]\n"
@@ -61,7 +62,10 @@ int main(int argc, char ** argv) {
                 "--seed fixes the default seed; otherwise each request without a seed draws a new one.\n"
                 "--draft-tokens N generates speculatively with MTP drafts (--mtp, as in tidal-cli).\n"
                 "--thinking sets whether chat replies think when a request does not say; auto follows the\n"
-                "model's template. --api-key requires 'Authorization: Bearer KEY' or 'x-api-key: KEY'.\n";
+                "model's template. --api-key requires 'Authorization: Bearer KEY' or 'x-api-key: KEY'.\n"
+                "With --vision-model, chat messages accept images (OpenAI image_url data URIs, Anthropic base64\n"
+                "image blocks, /completion multimodal_data); GET /placement lists where every tensor lives.\n";
+            vision_help(std::cout);
             prefill_help(std::cout);
             return 0;
         }
@@ -77,6 +81,7 @@ int main(int argc, char ** argv) {
         if (sampler == "cpu") options.sampling.backend = tidal::SamplingBackend::CPU;
         else if (sampler != "device") throw std::invalid_argument("--sampler must be device or cpu");
         configure_prefill(args, options);
+        configure_vision(args, options);
         runtime_config.draft_tokens = args.integer("--draft-tokens", 0);
         if (runtime_config.draft_tokens) {
             const auto mtp = args.get("--mtp");
@@ -149,7 +154,8 @@ int main(int argc, char ** argv) {
                 return;
             }
             log_line("tidal-server: model ready (backend " + runtime.backend() + ", context " + std::to_string(runtime.context()) +
-                     ", chat format " + runtime.chat().name() + (runtime.tokenizer().byte_fallback() ? ", byte tokenizer" : "") + ")");
+                     ", chat format " + runtime.chat().name() + (runtime.tokenizer().byte_fallback() ? ", byte tokenizer" : "") +
+                     (runtime.vision().enabled ? ", vision on " + runtime.vision().device : "") + ")");
         }).detach();
         server.run();
         log_line("tidal-server: shutting down");

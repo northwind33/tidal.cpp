@@ -1,11 +1,14 @@
 #include "app.hpp"
+#include "media.hpp"
 #include "webui.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <map>
 #include <random>
+#include <tuple>
 
 namespace tidal::server {
 
@@ -16,7 +19,9 @@ struct App::ChatTask {
     GenerationParams params;
     bool stream = false, include_usage = false, inline_reasoning = false;
     ChatPrompt prompt;
-    std::vector<int32_t> tokens;
+    std::vector<int32_t> tokens;           // After image expansion.
+    std::vector<std::shared_ptr<const Image>> images; // In prompt order.
+    Prompt input;
 };
 struct App::ChatRun {
     std::string reasoning, content;
@@ -112,9 +117,40 @@ std::vector<std::string> stop_words(const Json & body, std::string_view key) {
     return words;
 }
 
-// Message content: a string, null, or an array of text parts. Parts are joined
-// with `separator`. Other modalities are rejected: the engine is text-only.
-std::string content_text(const Json & content, const char * separator = "") {
+using Images = std::vector<std::shared_ptr<const Image>>;
+
+// An image content part: OpenAI image_url / input_image or an Anthropic image
+// block (base64 source). Null when `part` is not an image.
+std::shared_ptr<const Image> image_part(const Json & part) {
+    const auto type = part.at("type").is_string() ? part.at("type").string() : std::string();
+    try {
+        if (type == "image_url" || (type.empty() && part.contains("image_url"))) {
+            const auto & value = part.at("image_url");
+            const auto & url = value.is_string() ? value : value.at("url");
+            if (!url.is_string()) throw invalid_request("image_url needs a url");
+            return image_from_url(url.string());
+        }
+        if (type == "input_image") {
+            if (!part.at("image_url").is_string()) throw invalid_request("input_image needs image_url");
+            return image_from_url(part.at("image_url").string());
+        }
+        if (type == "image") {
+            const auto & source = part.at("source");
+            const auto kind = source.at("type").is_string() ? source.at("type").string() : std::string();
+            if (kind == "base64" && source.at("data").is_string()) return image_from_base64(source.at("data").string());
+            if (kind == "url" && source.at("url").is_string()) return image_from_url(source.at("url").string());
+            throw invalid_request("image blocks need a base64 or data-URI source");
+        }
+    } catch (const std::invalid_argument & e) {
+        throw invalid_request(std::string("Invalid image: ") + e.what());
+    }
+    return nullptr;
+}
+
+// Message content: a string, null, or an array of text and image parts. Text
+// parts are joined with `separator`; each image becomes the chat template's
+// image marker and is appended to `images` (null rejects images).
+std::string content_text(const Json & content, const char * separator = "", Images * images = nullptr) {
     if (content.is_null()) return {};
     if (content.is_string()) return content.string();
     if (!content.is_array()) throw invalid_request("Message content must be a string or an array of content parts");
@@ -126,7 +162,11 @@ std::string content_text(const Json & content, const char * separator = "") {
         if ((type == "text" || type.empty()) && part.at("text").is_string()) {
             if (!first) out += separator;
             out += part.at("text").string(); first = false;
-        } else throw invalid_request("Unsupported content part '" + type + "': this server accepts text only");
+        } else if (auto image = image_part(part)) {
+            if (!images) throw invalid_request("Images are not allowed in this message");
+            images->push_back(std::move(image));
+            out += image_marker;
+        } else throw invalid_request("Unsupported content part '" + type + "': this server accepts text and images");
     }
     return out;
 }
@@ -218,6 +258,7 @@ App::App(AppConfig config, Runtime & runtime, HttpServer & server)
     add("GET", {"/slots"}, Style::OpenAI, &App::slots);
     add("POST", {"/slots/*"}, Style::OpenAI, &App::slot_action);
     add("GET", {"/metrics"}, Style::OpenAI, &App::metrics);
+    add("GET", {"/placement", "/v1/placement"}, Style::OpenAI, &App::placement);
     add("POST", {"/completion", "/completions"}, Style::OpenAI, &App::completion);
     add("POST", {"/infill"}, Style::OpenAI, &App::infill);
     for (const char * path : {"/embedding", "/embeddings", "/v1/embeddings", "/reranking", "/rerank", "/v1/rerank", "/v1/reranking",
@@ -328,7 +369,22 @@ Json App::token_logprob(const GeneratedToken & token) const {
 void App::prepare(ChatTask & task) const {
     if (!runtime_.chat().supports_tools()) task.options.tools = Json();
     task.prompt = runtime_.chat().render(task.messages, task.options);
-    task.tokens = runtime_.tokenizer().encode(task.prompt.text, true);
+    task.input = tokenize_with_images(task.prompt.text, task.images);
+    task.tokens = task.input.tokens;
+}
+
+// The text is tokenized between its <|image_pad|> markers, which then expand
+// to the images' placeholder tokens. The markers sit between special tokens
+// (<|vision_start|>, <|vision_end|>), so segment-wise tokenization equals
+// tokenizing the whole text.
+Prompt App::tokenize_with_images(const std::string & text, const std::vector<std::shared_ptr<const Image>> & images) const {
+    static constexpr std::string_view pad = "<|image_pad|>";
+    std::vector<std::vector<int32_t>> segments;
+    size_t start = 0;
+    for (size_t at; (at = text.find(pad, start)) != std::string::npos; start = at + pad.size())
+        segments.push_back(runtime_.tokenizer().encode(std::string_view(text).substr(start, at - start), true));
+    segments.push_back(runtime_.tokenizer().encode(std::string_view(text).substr(start), true));
+    return runtime_.expand(segments, images);
 }
 
 App::ChatTask App::openai_task(const Json & body) const {
@@ -345,7 +401,7 @@ App::ChatTask App::openai_task(const Json & body) const {
         if (message.role == "function") message.role = "tool";
         if (message.role != "system" && message.role != "user" && message.role != "assistant" && message.role != "tool")
             throw invalid_request("Unexpected message role '" + message.role + "'");
-        message.content = content_text(item.at("content"));
+        message.content = content_text(item.at("content"), "", message.role == "system" ? nullptr : &task.images);
         if (message.role == "assistant") {
             if (item.at("reasoning_content").is_string()) message.reasoning = item.at("reasoning_content").string();
             if (const auto * calls = present(item, "tool_calls")) {
@@ -450,16 +506,21 @@ App::ChatTask App::anthropic_task(const Json & body, bool counting) const {
         message.role = role;
         if (content.is_string()) { message.content = content.string(); task.messages.push_back(std::move(message)); continue; }
         if (!content.is_array()) throw invalid_request("messages: content must be a string or an array of blocks");
-        bool any = false;
+        bool any = false, after_text = false;
         const auto flush = [&] {
             if (any) task.messages.push_back(std::move(message));
-            message = Message(); message.role = role; any = false;
+            message = Message(); message.role = role; any = false; after_text = false;
         };
         for (const auto & block : content.items()) {
             const auto type = block.at("type").is_string() ? block.at("type").string() : std::string();
             if (type == "text" && block.at("text").is_string()) {
-                if (any && !message.content.empty() && role == "user") message.content += "\n";
-                message.content += block.at("text").string(); any = true;
+                // Consecutive user text blocks are separate lines; an image
+                // marker joins the following text directly, as content parts do.
+                if (after_text && role == "user") message.content += "\n";
+                message.content += block.at("text").string(); any = true; after_text = true;
+            } else if (type == "image") {
+                task.images.push_back(image_part(block));
+                message.content += image_marker; any = true; after_text = false;
             } else if (type == "thinking" && role == "assistant") {
                 if (block.at("thinking").is_string()) message.reasoning = message.reasoning.value_or("") + block.at("thinking").string();
                 any = true;
@@ -474,9 +535,9 @@ App::ChatTask App::anthropic_task(const Json & body, bool counting) const {
                 message.tool_calls.push_back(std::move(call)); any = true;
             } else if (type == "tool_result" && role == "user") {
                 flush();
-                std::string result = content_text(block.at("content"), "\n");
+                std::string result = content_text(block.at("content"), "\n", &task.images);
                 task.messages.push_back({"tool", std::move(result), std::nullopt, {}});
-            } else throw invalid_request("messages: unsupported content block '" + type + "' (this server accepts text, thinking and tool blocks)");
+            } else throw invalid_request("messages: unsupported content block '" + type + "' (this server accepts text, image, thinking and tool blocks)");
         }
         flush();
     }
@@ -535,7 +596,7 @@ App::ChatRun App::run_chat(ChatTask & task, const char * id_prefix, Response & r
     callbacks.on_prompt = std::move(on_prompt);
     callbacks.on_text = [&](std::string_view piece, const std::vector<GeneratedToken> & tokens) { return absorb(parser.feed(piece), tokens); };
     callbacks.cancelled = [&] { return !response.alive(); };
-    run.result = runtime_.generate(task.tokens, task.params, callbacks);
+    run.result = runtime_.generate(task.input, task.params, callbacks);
     absorb(parser.finish(), {});
     return run;
 }
@@ -756,6 +817,8 @@ void App::native_completion(const Request & request, Response & response, bool i
     const Json body = parse_body(request);
     const auto & tokenizer = runtime_.tokenizer();
     std::vector<int32_t> tokens;
+    Images images;
+    Prompt input;
     if (infill) {
         const int32_t prefix = tokenizer.added_token("<|fim_prefix|>"), suffix = tokenizer.added_token("<|fim_suffix|>"),
                       middle = tokenizer.added_token("<|fim_middle|>");
@@ -768,8 +831,27 @@ void App::native_completion(const Request & request, Response & response, bool i
     } else {
         const auto * prompt = present(body, "prompt");
         if (!prompt) throw invalid_request("'prompt' is required");
-        tokens = prompt_tokens(*prompt);
+        if (prompt->is_object()) {
+            // llama.cpp multimodal form: {"prompt_string": "... <__media__> ...", "multimodal_data": [base64, ...]}
+            const auto & text = prompt->at("prompt_string");
+            if (!text.is_string()) throw invalid_request("'prompt.prompt_string' must be a string");
+            std::string rendered = text.string();
+            for (size_t at = 0; (at = rendered.find(media_marker, at)) != std::string::npos;) {
+                rendered.replace(at, std::string_view(media_marker).size(), image_marker);
+                at += std::string_view(image_marker).size();
+            }
+            if (const auto & data = prompt->at("multimodal_data"); data.is_array())
+                for (const auto & item : data.items()) {
+                    if (!item.is_string()) throw invalid_request("'multimodal_data' must hold base64 strings");
+                    try { images.push_back(image_from_base64(item.string())); }
+                    catch (const std::invalid_argument & e) { throw invalid_request(std::string("Invalid image: ") + e.what()); }
+                }
+            input = tokenize_with_images(rendered, images);
+            if (input.tokens.empty()) throw invalid_request("The prompt is empty");
+            tokens = input.tokens;
+        } else tokens = prompt_tokens(*prompt);
     }
+    if (input.tokens.empty()) input.tokens = tokens;
     GenerationParams params;
     sampling(body, params);
     params.stop = stop_words(body, "stop");
@@ -810,7 +892,7 @@ void App::native_completion(const Request & request, Response & response, bool i
             return sse(response, event);
         };
     }
-    const auto result = runtime_.generate(tokens, params, callbacks);
+    const auto result = runtime_.generate(input, params, callbacks);
     if (stream && !response.started()) return;
     const char * stop_type = result.stop == StopType::Eos ? "eos" : result.stop == StopType::Limit ? "limit"
                            : result.stop == StopType::Word ? "word" : "none";
@@ -898,13 +980,63 @@ void App::props(const Request &, Response & response) {
     send_json(response, 200, Json::object({
         {"default_generation_settings", Json::object({{"id", 0}, {"n_ctx", runtime_.context()}, {"params", sampling_json(params)}})},
         {"total_slots", 1}, {"model_alias", model_name()}, {"model_path", runtime_.config().model},
-        {"modalities", Json::object({{"vision", false}, {"audio", false}})},
+        {"modalities", Json::object({{"vision", runtime_.vision().enabled}, {"audio", false}})},
+        {"vision", vision_json()},
         {"chat_template", tokenizer.metadata().chat_template}, {"chat_format", runtime_.chat().name()},
         {"bos_token", token_text(tokenizer.bos())}, {"eos_token", token_text(tokenizer.eos())},
         {"build_info", version}, {"backend", runtime_.backend()}, {"n_vocab", runtime_.model().vocab},
         {"tokenizer", tokenizer.byte_fallback() ? "bytes" : "bpe"},
         {"speculative", Json::object({{"draft_tokens", runtime_.config().draft_tokens}})},
         {"thinking_default", config_.thinking.value_or(runtime_.chat().thinking_default())}}));
+}
+
+Json App::vision_json() const {
+    const auto & v = runtime_.vision();
+    if (!v.enabled) return Json();
+    return Json::object({{"model", runtime_.config().options.vision_model}, {"placement", v.placement}, {"device", v.device},
+        {"layers", v.layers}, {"hidden", v.hidden}, {"heads", v.heads}, {"output", v.output}, {"patch_size", v.patch_size},
+        {"spatial_merge", v.merge}, {"min_image_tokens", v.min_tokens}, {"max_image_tokens", v.max_tokens},
+        {"parameters", v.parameters}, {"weight_bytes", v.weight_bytes}});
+}
+
+// Which device holds and computes each tensor. ?component=text|mtp|vision and
+// ?role=weight|state|kv_cache filter the list; ?tensors=0 returns the summary only.
+void App::placement(const Request & request, Response & response) {
+    const auto component = request.parameter("component"), role = request.parameter("role");
+    const bool tensors = request.parameter("tensors") != "0";
+    for (const auto & [name, value, allowed] : {std::tuple{"component", component, "text mtp vision"},
+                                                std::tuple{"role", role, "weight state kv_cache"}})
+        if (!value.empty() && std::string(" ") .append(allowed).append(" ").find(" " + value + " ") == std::string::npos)
+            throw invalid_request(std::string("Unknown ") + name + " '" + value + "'");
+    Json list = Json::array();
+    struct Total { uint64_t tensors = 0, bytes = 0; };
+    std::map<std::tuple<std::string, std::string, std::string, std::string>, Total> totals;
+    std::map<std::string, uint64_t> by_compute, by_memory;
+    for (const auto & t : runtime_.placements()) {
+        if ((!component.empty() && t.component != component) || (!role.empty() && t.role != role)) continue;
+        auto & total = totals[{t.component, t.role, t.memory, t.compute}];
+        ++total.tensors; total.bytes += t.bytes;
+        by_compute[t.compute] += t.bytes;
+        if (t.resident) by_memory[t.memory] += t.bytes;
+        if (!tensors) continue;
+        Json shape = Json::array();
+        for (const auto d : t.shape) shape.push(d);
+        list.push(Json::object({{"name", t.name}, {"component", t.component}, {"role", t.role}, {"group", t.group},
+            {"type", t.type}, {"shape", std::move(shape)}, {"bytes", t.bytes}, {"resident", t.resident},
+            {"memory", t.memory.empty() ? Json() : Json(t.memory)}, {"compute", t.compute}}));
+    }
+    Json summary = Json::array();
+    for (const auto & [key, total] : totals)
+        summary.push(Json::object({{"component", std::get<0>(key)}, {"role", std::get<1>(key)},
+            {"memory", std::get<2>(key).empty() ? Json() : Json(std::get<2>(key))}, {"compute", std::get<3>(key)},
+            {"tensors", total.tensors}, {"bytes", total.bytes}}));
+    Json compute = Json::object(), memory = Json::object();
+    for (const auto & [unit, bytes] : by_compute) compute[unit] = bytes;
+    for (const auto & [unit, bytes] : by_memory) memory[unit] = bytes;
+    Json out = Json::object({{"model", model_name()}, {"backend", runtime_.backend()}, {"vision", vision_json()},
+        {"bytes_by_compute", std::move(compute)}, {"bytes_by_memory", std::move(memory)}, {"summary", std::move(summary)}});
+    if (tensors) out["tensors"] = std::move(list);
+    send_json(response, 200, out);
 }
 
 void App::slots(const Request &, Response & response) {
@@ -945,6 +1077,7 @@ void App::metrics(const Request &, Response & response) {
     metric("llamacpp:requests_deferred", "gauge", "Number of requests deferred.", runtime_.queued());
     metric("tidal:requests_total", "counter", "Number of completed generation requests.", double(m.requests));
     metric("tidal:prompt_tokens_cached_total", "counter", "Number of prompt tokens reused from the prompt cache.", double(m.cached_tokens));
+    metric("tidal:images_encoded_total", "counter", "Number of images run through the vision tower.", double(m.images));
     response.send(200, "text/plain; version=0.0.4; charset=utf-8", out);
 }
 

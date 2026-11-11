@@ -30,6 +30,7 @@ button { cursor:pointer; } button.go { background:var(--accent); color:#fff; bor
 button:disabled { opacity:.5; cursor:default; }
 pre, .out { background:var(--code); border:1px solid var(--line); border-radius:6px; padding:10px; white-space:pre-wrap; word-break:break-word; font:13px/1.45 ui-monospace, monospace; margin:8px 0; max-height:520px; overflow:auto; }
 #log { min-height:200px; }
+.msg img, #attached img { max-height:120px; max-width:200px; border-radius:6px; border:1px solid var(--line); margin:4px 6px 4px 0; display:inline-block; vertical-align:top; }
 .msg { border:1px solid var(--line); border-radius:8px; padding:8px 12px; margin:8px 0; background:var(--panel); white-space:pre-wrap; word-break:break-word; }
 .msg.user { background:var(--user); } .msg .who { font-size:11px; color:var(--dim); text-transform:uppercase; letter-spacing:.04em; }
 .msg details { color:var(--dim); margin:4px 0; } .msg .call { font:12px ui-monospace, monospace; background:var(--code); border-radius:6px; padding:6px 8px; margin:6px 0; }
@@ -80,10 +81,12 @@ details.box { margin:8px 0; } details.box summary { cursor:pointer; color:var(--
   <div id="log"></div>
   <div class="stats" id="chatstats"></div>
   <textarea id="input" placeholder="Message (Ctrl+Enter to send). After a tool call, type the tool result here."></textarea>
+  <div id="attached"></div>
   <div class="row">
     <button class="go" id="send">Send</button>
     <button id="abort" disabled>Stop</button>
     <button id="clear">Clear</button>
+    <label id="imagebox" title="Needs a server started with --vision-model">images <input id="images" type="file" accept="image/png,image/jpeg,image/bmp,.ppm,.pgm" multiple></label>
   </div>
   <details class="box"><summary>Last request / response</summary><pre id="chatraw"></pre></details>
 </section>
@@ -137,6 +140,8 @@ details.box { margin:8px 0; } details.box summary { cursor:pointer; color:var(--
     <button data-get="/props">GET /props</button>
     <button data-get="/slots">GET /slots</button>
     <button data-get="/metrics">GET /metrics</button>
+    <button data-get="/placement?tensors=0">GET /placement (summary)</button>
+    <button data-get="/placement">GET /placement</button>
     <button id="erase">POST /slots/0?action=erase</button>
   </div>
   <pre id="sout"></pre>
@@ -198,6 +203,7 @@ async function health() {
       kind = 'ok';
       const props = await json('/props');
       label = props.model_alias ? `${props.model_alias} · ctx ${props.default_generation_settings.n_ctx} · ${props.backend} · ${props.chat_format}` : 'ready';
+      if (props.vision) label += ` · vision on ${props.vision.device}`;
       if (props.thinking_default !== undefined && !health.done) { $('think').checked = props.thinking_default; health.done = true; }
     } else { label = response.status === 503 ? 'loading model' : 'error ' + response.status; kind = response.status === 503 ? '' : 'bad'; }
   } catch {}
@@ -220,6 +226,7 @@ function render() {
       const summary = document.createElement('summary'); summary.textContent = 'thinking';
       details.append(summary, m.reasoning); box.append(details);
     }
+    for (const url of m.images || []) { const img = document.createElement('img'); img.src = url; box.append(img); }
     if (m.content) box.append(m.content);
     for (const c of m.calls || []) {
       const call = document.createElement('div'); call.className = 'call';
@@ -248,7 +255,8 @@ function openaiBody() {
   if ($('system').value) messages.push({role: 'system', content: $('system').value});
   for (const m of history) {
     if (m.role === 'tool') messages.push({role: 'tool', tool_call_id: m.id, content: m.content});
-    else if (m.role === 'user') messages.push({role: 'user', content: m.content});
+    else if (m.role === 'user') messages.push({role: 'user', content: m.images && m.images.length
+      ? [...m.images.map(url => ({type: 'image_url', image_url: {url}})), {type: 'text', text: m.content}] : m.content});
     else {
       const out = {role: 'assistant', content: m.content || ''};
       if (m.reasoning) out.reasoning_content = m.reasoning;
@@ -270,7 +278,13 @@ function anthropicBody() {
   };
   for (const m of history) {
     if (m.role === 'tool') push('user', {type: 'tool_result', tool_use_id: m.id, content: m.content});
-    else if (m.role === 'user') push('user', {type: 'text', text: m.content});
+    else if (m.role === 'user') {
+      for (const url of m.images || []) {
+        const [head, data] = url.split(',');
+        push('user', {type: 'image', source: {type: 'base64', media_type: head.slice(5, head.indexOf(';')), data}});
+      }
+      push('user', {type: 'text', text: m.content});
+    }
     else {
       if (m.reasoning) push('assistant', {type: 'thinking', thinking: m.reasoning, signature: ''});
       if (m.content) push('assistant', {type: 'text', text: m.content});
@@ -289,8 +303,8 @@ async function send() {
   const text = $('input').value;
   const waiting = pendingCall();
   if (waiting) history.push({role: 'tool', id: waiting.id, content: text});
-  else { if (!text) return; history.push({role: 'user', content: text}); }
-  $('input').value = '';
+  else { if (!text && !attached.length) return; history.push({role: 'user', content: text, images: attached}); }
+  $('input').value = ''; attached = []; $('attached').textContent = ''; $('images').value = '';
   if (pendingCall()) { render(); $('chatstats').textContent = 'Another tool call is waiting for its result.'; return; }
   const anthropic = $('api').value === 'anthropic';
   let body;
@@ -358,11 +372,27 @@ async function send() {
   render();
   const next = pendingCall();
   $('chatstats').textContent = stats + ` · ${((performance.now() - started) / 1000).toFixed(2)} s` + (next ? ` — enter the result of ${next.name} and press Send` : '');
-  $('chatraw').textContent = '// request\n' + pretty(body) + '\n\n// response\n' + pretty(raw);
+  // Image payloads are elided from the displayed request.
+  const shown = JSON.parse(JSON.stringify(body, (key, value) => typeof value === 'string' && value.length > 256 &&
+    (key === 'url' || key === 'data') ? `<${value.length} characters of image data>` : value));
+  $('chatraw').textContent = '// request\n' + pretty(shown) + '\n\n// response\n' + pretty(raw);
   $('send').disabled = false; $('abort').disabled = true; controller = null;
 }
 const speed = t => t && t.predicted_per_second ? ` · ${t.predicted_per_second.toFixed(1)} tok/s` : '';
 $('send').onclick = send;
+let attached = [];
+$('images').onchange = () => {
+  for (const file of $('images').files) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      // Files without an image MIME type (PPM) still decode on the server.
+      const url = String(reader.result).replace(/^data:[^;,]*;/, m => m === 'data:;' ? 'data:image/x-portable-pixmap;' : m);
+      attached.push(url);
+      const img = document.createElement('img'); img.src = url; img.title = file.name; $('attached').append(img);
+    };
+    reader.readAsDataURL(file);
+  }
+};
 $('abort').onclick = () => controller && controller.abort();
 $('clear').onclick = () => { history = []; render(); $('chatstats').textContent = ''; };
 $('input').onkeydown = e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) send(); };

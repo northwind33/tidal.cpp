@@ -48,7 +48,7 @@ struct GenerationResult {
     std::vector<GeneratedToken> tokens;
     StopType stop = StopType::None;
     std::string stopping_word;
-    int prompt_tokens = 0, cached_tokens = 0;
+    int prompt_tokens = 0, cached_tokens = 0, images_encoded = 0;
     double prompt_ms = 0, generation_ms = 0;
 };
 
@@ -64,6 +64,12 @@ struct GenerationCallbacks {
     std::function<bool()> cancelled;
 };
 
+// A tokenized prompt; each image's placeholder tokens are already expanded.
+struct Prompt {
+    std::vector<int32_t> tokens;
+    std::vector<ImageSpan> images;
+};
+
 struct RuntimeConfig {
     std::string model;
     Options options;
@@ -72,7 +78,7 @@ struct RuntimeConfig {
 };
 
 struct Metrics {
-    uint64_t requests = 0, prompt_tokens = 0, cached_tokens = 0, generated_tokens = 0;
+    uint64_t requests = 0, prompt_tokens = 0, cached_tokens = 0, generated_tokens = 0, images = 0;
     double prompt_seconds = 0, generation_seconds = 0;
 };
 
@@ -93,11 +99,21 @@ public:
     int context() const { return model_.context; }
     const std::string & backend() const { return backend_; }
     const RuntimeConfig & config() const { return config_; }
+    const VisionInfo & vision() const { return vision_; }
+    // Joins tokenized text segments with the placeholder tokens of the images
+    // between them (segments.size() == images.size() + 1). Throws ApiError for
+    // a count mismatch, an invalid image or when no vision model is loaded.
+    Prompt expand(const std::vector<std::vector<int32_t>> & segments, const std::vector<std::shared_ptr<const Image>> & images) const;
+    // Tensor placement as of the last completed request (or the load).
+    std::vector<TensorPlacement> placements() const;
 
     // Queues the request and blocks until it has finished. Callbacks run on the
     // worker thread. Throws ApiError for requests the engine cannot serve.
+    GenerationResult generate(const Prompt & prompt, const GenerationParams & params, const GenerationCallbacks & callbacks);
     GenerationResult generate(const std::vector<int32_t> & prompt, const GenerationParams & params,
-                              const GenerationCallbacks & callbacks);
+                              const GenerationCallbacks & callbacks) {
+        return generate(Prompt{prompt, {}}, params, callbacks);
+    }
     // Drops the cached sequence and its snapshots.
     void erase();
     // Asks a running generation to stop; later requests are rejected.
@@ -119,6 +135,9 @@ private:
     Config model_;
     ModelInfo model_info_;
     std::string backend_, error_;
+    VisionInfo vision_;
+    int32_t image_pad_ = -1;
+    std::vector<TensorPlacement> placements_;
     std::atomic<State> state_{State::Loading};
     std::atomic<bool> busy_{false}, stopping_{false};
     std::atomic<int> queued_{0}, decoded_{0}, remaining_{0};
@@ -130,8 +149,7 @@ private:
 
     void work();
     void submit(std::function<void()> job);
-    GenerationResult execute(const std::vector<int32_t> & prompt, const GenerationParams & params,
-                             const GenerationCallbacks & callbacks);
+    GenerationResult execute(const Prompt & prompt, const GenerationParams & params, const GenerationCallbacks & callbacks);
 };
 
 } // namespace tidal::server
