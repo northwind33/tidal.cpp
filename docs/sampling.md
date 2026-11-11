@@ -42,6 +42,15 @@ remain on the GPU. Reset replays the same sequence on the same backend. Floating
 point reductions and exponentials can differ across devices, so identical seeds
 do not promise identical tokens for distributions at a rounding boundary.
 
+`Engine::set_sampling(config)` replaces the parameters of a live engine, between
+prompts or mid-sequence: it restarts the random sequence from the new seed and
+rebuilds the penalty history from the consumed tokens, so the next draw is the
+one a fresh engine with that configuration would make after the same sequence.
+The sampler backend stays the one chosen at construction. `Engine::logits()`
+returns the last position's unpenalized logits (one vocabulary-sized
+device-to-host copy on CUDA). `tidal-server` uses both: per-request sampling
+parameters and token probabilities.
+
 ## API and logit capture
 
 Set `Options::sampling` before constructing an engine. Call

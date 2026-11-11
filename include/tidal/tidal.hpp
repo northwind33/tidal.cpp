@@ -233,6 +233,13 @@ public:
     std::vector<int32_t> draft(int32_t token, int count);
     // Draw from the last decoded position; consumes RNG but no context token.
     int32_t sample();
+    // Replaces the sampling parameters and reseeds the generator, keeping the
+    // sampler backend chosen at construction. Penalty history is rebuilt from
+    // the consumed sequence, so it may be called between prompts or mid-sequence.
+    void set_sampling(const SamplingConfig & sampling);
+    // Vocabulary logits of the last consumed position (the distribution that
+    // sample() draws from, before penalties); a device-to-host copy on CUDA.
+    std::vector<float> logits();
     std::string sampling_backend_name() const;
     void reset();
     const Config & config() const;

@@ -64,6 +64,15 @@ void Sampler::rewind(const std::vector<int32_t> & consumed) {
     for (size_t i = consumed.size() - keep; i < consumed.size(); ++i) accept(consumed[i]);
 }
 
+void Sampler::configure(SamplingConfig config, const std::vector<int32_t> & consumed) {
+    config.backend = config_.backend;
+    config.validate();
+    for (int32_t token : history_) { pending_.insert(token); counts_[token] = 0; }
+    history_.clear();
+    config_ = config; random_state_ = config.seed;
+    rewind(consumed);
+}
+
 double Sampler::uniform() {
     // SplitMix64; specified integer operations and 53-bit conversion are identical
     // on CPU/device paths. Only sample(), not prompt ingestion, consumes randomness.

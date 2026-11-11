@@ -2399,6 +2399,16 @@ struct Engine::Impl {
         try { return sampler->sample(last_logits, captured_logits.empty() ? nullptr : &captured_logits, position - 1); }
         catch (...) { failed = true; throw; }
     }
+    std::vector<float> logits() {
+        if (failed) throw std::runtime_error("Previous execution failed; call reset() before reading logits");
+        if (!position) throw std::logic_error("Decode at least one token before reading logits");
+        if (!captured_logits.empty()) return captured_logits;
+        std::vector<float> values(size_t(c.vocab));
+        ggml_backend_synchronize(backend.get());
+        ggml_backend_tensor_get(last_logits, values.data(), 0, values.size() * sizeof(float));
+        if (!ggml_backend_is_cpu(backend.get())) stats.device_to_host_bytes += values.size() * sizeof(float);
+        return values;
+    }
     // Per-sequence device state that KV truncation cannot rewind. Index-cache
     // rows need no snapshot: rows of blocks complete before the restored
     // position belong to the shared prefix, later rows are rewritten when their
@@ -2516,6 +2526,8 @@ Engine::Engine(const std::string & path, Options options) : impl_(std::make_uniq
 Engine::~Engine() = default;
 Step Engine::decode(int32_t token, bool capture_logits) { return impl_->decode(token, capture_logits); }
 int32_t Engine::sample() { return impl_->sample(); }
+void Engine::set_sampling(const SamplingConfig & sampling) { impl_->sampler->configure(sampling, impl_->sequence); }
+std::vector<float> Engine::logits() { return impl_->logits(); }
 std::string Engine::sampling_backend_name() const { return impl_->sampler->backend_name(); }
 std::vector<Step> Engine::prefill(const std::vector<int32_t> & tokens, bool capture_logits) {
     return impl_->prefill(tokens, capture_logits);

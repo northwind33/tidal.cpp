@@ -28,6 +28,9 @@ public:
     // Replaces the penalty history with `consumed` (prompt-cache rollback);
     // the random state continues, as after any other prompt change.
     void rewind(const std::vector<int32_t> & consumed);
+    // Replaces the parameters (the backend is fixed at construction), restarts
+    // the random sequence from the new seed and rebuilds the penalty history.
+    void configure(SamplingConfig config, const std::vector<int32_t> & consumed);
     int32_t sample(ggml_tensor * logits, const std::vector<float> * captured, int position,
                    SamplingDiagnostics * diagnostics = nullptr);
     std::string backend_name() const { return backend_name_; }
