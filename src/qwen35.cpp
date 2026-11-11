@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <climits>
+#include <cstring>
 #include <set>
 
 namespace tidal {
@@ -36,6 +37,7 @@ void validate_qwen35(const Config & c) {
         throw std::invalid_argument("Unsupported Qwen3.5 dimensions or layer configuration");
     if (!std::isfinite(c.eps) || c.eps <= 0 || !std::isfinite(c.rope_base) || c.rope_base <= 1)
         throw std::invalid_argument("Invalid Qwen3.5 normalization or RoPE parameters");
+    validate_rope_sections(c);
 }
 
 Config read_qwen35_config(const gguf_context * f) {
@@ -75,6 +77,7 @@ Config read_qwen35_config(const gguf_context * f) {
     }
     if (sum != c.rope_dim / 2 || values[3] != 0)
         throw std::runtime_error("Unsupported Qwen3.5 MRoPE layout");
+    for (int i = 0; i < 3; ++i) c.rope_sections[i] = values[i];
     // Text positions are equal on all three MRoPE axes, reducing to partial NeoX RoPE.
     const auto scaling = gguf_find_key(f, "qwen35.rope.scaling.type");
     if (scaling >= 0 && (gguf_get_kv_type(f, scaling) != GGUF_TYPE_STRING ||
@@ -112,6 +115,13 @@ Config read_qwen35_config(const gguf_context * f) {
         c.eos_token = int(id);
     }
     c.tied_embeddings = gguf_find_tensor(f, "output.weight") < 0;
+    // The image placeholder of the Qwen3.5/Qwen3.8 vocabulary.
+    const auto tokens = gguf_find_key(f, "tokenizer.ggml.tokens");
+    if (tokens >= 0 && gguf_get_kv_type(f, tokens) == GGUF_TYPE_ARRAY && gguf_get_arr_type(f, tokens) == GGUF_TYPE_STRING) {
+        const size_t count = std::min<size_t>(gguf_get_arr_n(f, tokens), size_t(c.vocab));
+        for (size_t i = count; i-- > 0;)
+            if (std::strcmp(gguf_get_arr_str(f, tokens, i), "<|image_pad|>") == 0) { c.image_token = int(i); break; }
+    }
     c.validate();
     return c;
 }

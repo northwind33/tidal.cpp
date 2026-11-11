@@ -51,6 +51,9 @@ bool qwen35_mtp_tensor(const Config & config, const std::string & name);
 // blk.<layers>.{attn_norm, attn.*, ffn_norm, ffn.*} and mtp.{eh_proj, enorm, hnorm, head_norm}.
 std::vector<TensorSpec> qwen35_mtp_specs(const Config & config, int file);
 void validate_ple(const Config & config);
+void validate_rope_sections(const Config & config);
+// Fills unset MRoPE sections of the synthetic schema.
+void default_rope_sections(Config & config);
 void write_ple(gguf_context * file, const PLEConfig & config);
 void read_ple(const gguf_context * file, Config & config);
 // Previous tokens are oldest-first. Only the ngram_size-1 most recent are needed.
@@ -150,6 +153,7 @@ public:
         size_ = tokens;
     }
     int size() const { return size_; }
+    size_t bytes() const { return (keys_.size() + values_.size()) * sizeof(uint16_t); }
 private:
     void store(const uint16_t * key, const uint16_t * value, int tokens);
     size_t row_offset(int head, int token) const { return (size_t(head) * capacity_ + token) * dim_; }

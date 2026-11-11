@@ -10,6 +10,8 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <climits>
+#include <cstring>
 
 namespace tidal {
 namespace {
@@ -59,6 +61,15 @@ void Config::validate() const {
                      expert_ffn > 65536 || shared_ffn > 65536 || expert_ffn % 32 || shared_ffn % 32)))
         throw std::invalid_argument("Invalid MoE expert count, top-k or FFN dimensions");
     validate_ple(*this);
+    validate_rope_sections(*this);
+}
+
+void validate_rope_sections(const Config & c) {
+    const int * s = c.rope_sections;
+    if (!s[0] && !s[1] && !s[2]) return; // Text-only configuration built in code.
+    if (s[0] < 0 || s[1] < 0 || s[2] < 0 || s[0] + s[1] + s[2] != c.rope_dim / 2)
+        throw std::invalid_argument("MRoPE sections must be non-negative and sum to rope_dim / 2");
+    if (c.image_token >= c.vocab) throw std::invalid_argument("Image token outside the vocabulary");
 }
 
 std::vector<TensorSpec> tensor_specs(const Config & c) {
@@ -153,6 +164,17 @@ void write_config(gguf_context * f, const Config & c) {
         gguf_set_val_bool(f, "tidal.norm_topk", c.norm_topk);
     }
     write_ple(f, c.ple);
+    if (c.image_token >= 0) gguf_set_val_u32(f, "tidal.image_token", uint32_t(c.image_token));
+    if (c.rope_sections[0] || c.rope_sections[1] || c.rope_sections[2])
+        gguf_set_arr_data(f, "tidal.rope_sections", GGUF_TYPE_INT32, c.rope_sections, 3);
+}
+
+void default_rope_sections(Config & c) {
+    if (c.rope_sections[0] || c.rope_sections[1] || c.rope_sections[2]) return;
+    // The released [11, 11, 10] split of 32 pairs, generalized: the temporal
+    // and height axes take the remainder first.
+    const int pairs = c.rope_dim / 2;
+    c.rope_sections[0] = (pairs + 2) / 3; c.rope_sections[1] = (pairs + 1) / 3; c.rope_sections[2] = pairs / 3;
 }
 
 Config read_config(const gguf_context * f) {
@@ -185,6 +207,16 @@ Config read_config(const gguf_context * f) {
         if (!c.experts) throw std::runtime_error("MoE model must have experts");
     } else if (gguf_find_key(f, "tidal.norm_topk") >= 0) throw std::runtime_error("MoE metadata in Dense architecture");
     read_ple(f, c);
+    if (const auto id = gguf_find_key(f, "tidal.image_token"); id >= 0) {
+        if (gguf_get_kv_type(f, id) != GGUF_TYPE_UINT32) throw std::runtime_error("Wrongly typed tidal.image_token");
+        c.image_token = int(std::min<uint32_t>(gguf_get_val_u32(f, id), uint32_t(INT32_MAX)));
+    }
+    if (const auto id = gguf_find_key(f, "tidal.rope_sections"); id >= 0) {
+        if (gguf_get_kv_type(f, id) != GGUF_TYPE_ARRAY || gguf_get_arr_type(f, id) != GGUF_TYPE_INT32 || gguf_get_arr_n(f, id) != 3)
+            throw std::runtime_error("tidal.rope_sections must hold three int32 values");
+        std::memcpy(c.rope_sections, gguf_get_arr_data(f, id), sizeof(c.rope_sections));
+    }
+    default_rope_sections(c);
     c.validate();
     return c;
 }

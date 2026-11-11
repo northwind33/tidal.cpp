@@ -34,7 +34,8 @@ else()
     set(TIDAL_GGML_BUILD_SOURCE "${ggml_SOURCE_DIR}")
 endif()
 
-add_library(tidal src/model.cpp src/qwen35.cpp src/quant.cpp src/ple.cpp src/engine.cpp src/sparse_attention.cpp src/sampling.cpp src/prefill_memory.cpp src/kv_export.cpp)
+add_library(tidal src/model.cpp src/qwen35.cpp src/quant.cpp src/ple.cpp src/engine.cpp src/sparse_attention.cpp src/sampling.cpp src/prefill_memory.cpp src/kv_export.cpp
+    src/vision.cpp src/image.cpp)
 target_include_directories(tidal PUBLIC include PRIVATE src)
 target_link_libraries(tidal PUBLIC ggml ggml-cpu)
 if(TIDAL_CUDA)
@@ -67,6 +68,9 @@ target_link_libraries(tidal-cli PRIVATE tidal)
 add_executable(tidal-dummy tools/dummy.cpp)
 target_link_libraries(tidal-dummy PRIVATE tidal)
 target_include_directories(tidal-dummy PRIVATE src)
+
+add_executable(tidal-vision tools/vision.cpp)
+target_link_libraries(tidal-vision PRIVATE tidal)
 
 add_executable(tidal-bench tools/bench.cpp)
 target_link_libraries(tidal-bench PRIVATE tidal)
@@ -193,6 +197,7 @@ if(BUILD_TESTING)
             add_test(NAME sampling COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_sampling.py --bin-dir $<TARGET_FILE_DIR:tidal-cli>)
             set_tests_properties(sampling PROPERTIES TIMEOUT 180)
+            endif()
             add_test(NAME qwen35-reference COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_qwen35.py --bin-dir $<TARGET_FILE_DIR:tidal-cli>)
             set_tests_properties(qwen35-reference PROPERTIES TIMEOUT 180)

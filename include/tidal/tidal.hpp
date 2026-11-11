@@ -59,6 +59,13 @@ struct Config {
     bool tied_embeddings = false;
     int mtp_layers = 0;
     int eos_token = -1;
+    // Interleaved MRoPE pairs per (temporal, height, width) axis; they sum to
+    // rope_dim / 2. Text positions are equal on every axis (plain NeoX RoPE);
+    // image tokens rotate by their grid row and column.
+    int rope_sections[3] = {0, 0, 0};
+    // Placeholder token of image positions (<|image_pad|>), -1 when unknown.
+    // PLE hashes it at those positions, as the released checkpoints do.
+    int image_token = -1;
     bool is_recurrent(int layer) const {
         return recurrent_layers.empty() ? (layer + 1) % 4 != 0 : recurrent_layers.at(layer);
     }
@@ -72,6 +79,9 @@ enum class PrefillPrecision { FP16, BF16 };
 // 16-bit type of the CPU-resident KV cache (default CPU KV placement).
 enum class CpuKVPrecision { BF16, FP16 };
 enum class KVPlacement { CPU, GPU };
+// Where the vision tower's weights live; the encoder runs on that device.
+// Auto follows Options::backend.
+enum class VisionPlacement { Auto, GPU, CPU };
 
 struct SamplingConfig {
     SamplingBackend backend = SamplingBackend::Device;
@@ -144,6 +154,68 @@ struct Options {
     // model file without one needs mtp_model, a sidecar GGUF of the MTP tensors.
     bool mtp = false;
     std::string mtp_model;
+    // Vision tower: an mmproj GGUF of the Qwen3-VL ViT and merger
+    // (clip.projector_type qwen3vl_merger), as published for Qwen3.5, Qwen3.8
+    // and Qwen3.8-Flash-Next (qwen4exp). Empty disables image input.
+    std::string vision_model;
+    VisionPlacement vision_placement = VisionPlacement::Auto;
+    // Image token budget after resizing (one token per 2x2 merged patches);
+    // zero keeps the defaults of 8 and 4096 tokens.
+    int image_min_tokens = 0, image_max_tokens = 0;
+};
+
+// Decoded 8-bit RGB pixels, row-major, width * height * 3 bytes.
+struct Image {
+    int width = 0, height = 0;
+    std::vector<uint8_t> rgb;
+    // Content hash of the size and pixels; keys prompt-cache reuse.
+    uint64_t hash() const;
+};
+// PNG (any bit depth, palette, alpha, interlace), baseline/progressive JPEG,
+// BMP and binary PPM/PGM. Alpha is composited over white. Throws
+// std::invalid_argument for unsupported or malformed data.
+Image decode_image(const std::string & bytes);
+
+// Output of the vision tower for one image: grid_height * grid_width merged
+// tokens in row-major order, each of Config::hidden values.
+struct ImageEmbedding {
+    int grid_width = 0, grid_height = 0;
+    int pixel_width = 0, pixel_height = 0; // After resizing.
+    std::vector<float> values;
+    uint64_t hash = 0;
+    int tokens() const { return grid_width * grid_height; }
+};
+// One image of a prompt: its placeholder tokens are [offset, offset + count)
+// of the token vector passed alongside, count = Engine::image_tokens(image).
+// `embedding`, when set, is used instead of encoding `image` (which may then
+// be null); a span reused by the prompt cache needs neither to be evaluated.
+struct ImageSpan {
+    int offset = 0;
+    std::shared_ptr<const Image> image;
+    std::shared_ptr<const ImageEmbedding> embedding;
+};
+
+struct VisionInfo {
+    bool enabled = false;
+    std::string placement;  // "gpu" or "cpu"
+    std::string device;     // ggml backend executing the encoder
+    int layers = 0, hidden = 0, heads = 0, ffn = 0, patch_size = 0, merge = 0, output = 0;
+    int min_tokens = 0, max_tokens = 0;
+    uint64_t parameters = 0, weight_bytes = 0;
+};
+
+// One tensor of the loaded model and the unit that computes with it.
+struct TensorPlacement {
+    std::string name;
+    std::string component;  // text | mtp | vision
+    std::string role;       // weight | state | kv_cache
+    std::string group;      // Weight group or layer the tensor belongs to.
+    std::string type;       // ggml type as stored in memory.
+    std::vector<int64_t> shape;
+    uint64_t bytes = 0;
+    bool resident = false;  // Allocated now (prefill may evict weight groups).
+    std::string memory;     // Buffer holding it: e.g. CUDA0, CUDA_Host, CPU.
+    std::string compute;    // Device whose kernels read it: e.g. CUDA0 or CPU.
 };
 
 struct Selection {
@@ -186,6 +258,8 @@ struct Statistics {
     uint64_t prompt_cache_checkpoint_bytes = 0; // Host memory held by current snapshots.
     uint64_t speculative_verifications = 0, speculative_drafted = 0, speculative_accepted = 0;
     uint64_t mtp_drafts = 0; // Engine::draft calls.
+    uint64_t images_encoded = 0, image_tokens = 0; // Vision tower runs and their output tokens.
+    double vision_ms = 0;                          // Preprocessing and encoding.
 };
 
 struct ModelInfo {
@@ -218,6 +292,25 @@ public:
     // evaluated, the result is empty and sample() uses the restored logits.
     // A snapshot of the final state is kept for later prompts.
     std::vector<Step> prefill_cached(const std::vector<int32_t> & tokens, bool capture_logits = true);
+    // Prompts with images: each span's positions take the vision tower output
+    // instead of token embeddings and rotate by MRoPE grid positions; text
+    // after an image continues from the image's start plus max(rows, columns).
+    // Placeholder tokens must equal Config::image_token when it is known.
+    std::vector<Step> prefill(const std::vector<int32_t> & tokens, const std::vector<ImageSpan> & images,
+                              bool capture_logits = true);
+    // The cache matches images by content hash, and encodes only images that
+    // reach past the reused prefix.
+    std::vector<Step> prefill_cached(const std::vector<int32_t> & tokens, const std::vector<ImageSpan> & images,
+                                     bool capture_logits = true);
+    // Vision (Options::vision_model).
+    bool has_vision() const;
+    VisionInfo vision_info() const;
+    // Placeholder tokens of an image after resizing; a pure function of its size.
+    int image_tokens(int width, int height) const;
+    ImageEmbedding encode_image(const Image & image);
+    // Every weight (text, MTP, vision), KV cache and recurrent state tensor
+    // with its memory and compute device.
+    std::vector<TensorPlacement> tensor_placements() const;
     // Every consumed token of the current sequence, in order.
     const std::vector<int32_t> & tokens() const;
     // Speculative decoding (Options::max_draft_tokens > 0). Consumes `token`

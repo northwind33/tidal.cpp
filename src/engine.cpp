@@ -4,12 +4,14 @@
 #include "prefill_chunks.hpp"
 #include "kv_export.hpp"
 #include "profiler.hpp"
+#include "vision.hpp"
 #include "ggml-cpu.h"
 #ifdef TIDAL_CUDA
 #include "ggml-cuda.h"
 #endif
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -318,6 +320,19 @@ struct Engine::Impl {
     int mtp_next = 0;
     int32_t mtp_drafted_for = -1; // token the current MTP row of position - 1 was drafted with
     std::vector<int32_t> previous_tokens;
+    // Vision tower (Options::vision_model) and recently encoded images by hash.
+    std::unique_ptr<VisionEncoder> vision;
+    std::deque<std::shared_ptr<const ImageEmbedding>> recent_images;
+    // MRoPE position {t, h, w, next} of every consumed (or in-flight) sequence
+    // index; `next` is where the following text token's t continues. Text has
+    // t == h == w, so text-only RoPE is plain NeoX RoPE at position t.
+    std::vector<std::array<int32_t, 4>> rope_table;
+    // Image rows of the batch in flight (batch-relative; empty without images)
+    // and the single-token override of the sequential reference path.
+    std::vector<const float *> injected;
+    const float * injected_row = nullptr;
+    // Per consumed position: 0 for text, the image hash for image positions.
+    std::vector<uint64_t> sequence_hash, pending_hash;
     // Consumed tokens (prompt-cache prefix matching) and host snapshots of the
     // state KV truncation cannot rewind, ordered by ascending position.
     std::vector<int32_t> sequence;
@@ -452,6 +467,12 @@ struct Engine::Impl {
         if (!state_buffer) throw std::runtime_error("State allocation failed");
 
         sampler = std::make_unique<Sampler>(c.vocab, options.sampling, backend.get(), options.device, stats, profiler);
+        if (!options.vision_model.empty()) {
+            if (!c.rope_sections[0] && !c.rope_sections[1] && !c.rope_sections[2])
+                throw std::runtime_error("The text model declares no MRoPE sections for image positions");
+            vision = std::make_unique<VisionEncoder>(options.vision_model, options, c.hidden);
+        } else if (options.vision_placement != VisionPlacement::Auto || options.image_min_tokens || options.image_max_tokens)
+            throw std::invalid_argument("Vision options require a vision model");
         reset();
     }
     ggml_type cpu_kv_type() const { return options.cpu_kv_precision == CpuKVPrecision::FP16 ? GGML_TYPE_F16 : GGML_TYPE_BF16; }
@@ -581,16 +602,47 @@ struct Engine::Impl {
         ggml_set_name(result, n.c_str());
         return result;
     }
-    ggml_tensor * rope_at(Graph & g, ggml_tensor * x, int dim, int heads, ggml_tensor * positions) {
-        x = ggml_reshape_3d(g.c(), ggml_is_contiguous(x) ? x : ggml_cont(g.c(), x), dim, heads, 1);
-        return ggml_rope_ext(g.c(), x, positions, nullptr, c.rope_dim,
-                             GGML_ROPE_TYPE_NEOX, c.context, c.rope_base, 1, 0, 1, 0, 0);
+    // MRoPE position of a sequence index: consumed or in-flight entries from
+    // the table, later indices continue as text.
+    std::array<int32_t, 4> rope_entry(int index) const {
+        if (index < int(rope_table.size())) return rope_table[size_t(index)];
+        const int base = rope_table.empty() ? 0 : rope_table.back()[3];
+        const int t = base + index - int(rope_table.size());
+        return {t, t, t, t + 1};
     }
-    ggml_tensor * rope(Graph & g, ggml_tensor * x, int dim, int heads, int pos) {
+    void push_text_positions(int count) {
+        for (int i = 0; i < count; ++i) rope_table.push_back(rope_entry(int(rope_table.size())));
+    }
+    ggml_tensor * rope_multi(Graph & g, ggml_tensor * x, ggml_tensor * positions) {
+        int sections[GGML_MROPE_SECTIONS] = {c.rope_sections[0], c.rope_sections[1], c.rope_sections[2], 0};
+        return ggml_rope_multi(g.c(), x, positions, nullptr, c.rope_dim, sections, GGML_ROPE_TYPE_IMROPE,
+                               c.context, c.rope_base, 1, 0, 1, 0, 0);
+    }
+    // x is [dim, heads, n]: row i rotates at the position of sequence index
+    // indices[i]. Interleaved MRoPE with equal axes computes exactly NeoX
+    // RoPE (CPU and CUDA kernels share the angle expression), so text-only
+    // batches keep the NeoX op.
+    ggml_tensor * rope_indices(Graph & g, ggml_tensor * x, const std::vector<int> & indices) {
+        const size_t n = indices.size();
+        std::vector<int32_t> t(n), all(4 * n);
+        bool uniform = true;
+        for (size_t i = 0; i < n; ++i) {
+            const auto e = rope_entry(indices[i]);
+            t[i] = e[0]; all[i] = e[0]; all[n + i] = e[1]; all[2 * n + i] = e[2]; all[3 * n + i] = e[0];
+            uniform = uniform && e[1] == e[0] && e[2] == e[0];
+        }
+        if (uniform) return ggml_rope_ext(g.c(), x, g.integers(t), nullptr, c.rope_dim,
+                                          GGML_ROPE_TYPE_NEOX, c.context, c.rope_base, 1, 0, 1, 0, 0);
+        return rope_multi(g, x, g.integers(all));
+    }
+    // One row at sequence index `index`; reusable decode graphs take the text
+    // position of the current token from their position input.
+    ggml_tensor * rope(Graph & g, ggml_tensor * x, int dim, int heads, int index) {
         x = ggml_reshape_3d(g.c(), ggml_is_contiguous(x) ? x : ggml_cont(g.c(), x), dim, heads, 1);
-        auto * positions = g.position_input && pos == position ? g.position_input : g.integer(pos);
-        return ggml_rope_ext(g.c(), x, positions, nullptr, c.rope_dim,
-                             GGML_ROPE_TYPE_NEOX, c.context, c.rope_base, 1, 0, 1, 0, 0);
+        if (g.position_input && index == position)
+            return ggml_rope_ext(g.c(), x, g.position_input, nullptr, c.rope_dim,
+                                 GGML_ROPE_TYPE_NEOX, c.context, c.rope_base, 1, 0, 1, 0, 0);
+        return rope_indices(g, x, {index});
     }
     // The state buffer is cleared by reset(), so derived constants are rebuilt there.
     void refresh_derived_weights() {
@@ -836,7 +888,10 @@ struct Engine::Impl {
                 pooled = ggml_add(g.c(), pooled, ggml_view_1d(g.c(), s.raw_index, c.index_dim,
                                                            size_t(i) * c.index_dim * sizeof(float)));
             pooled = ggml_scale(g.c(), pooled, 1.0f / c.block_size);
-            pooled = rope_at(g, norm(g, pooled, p + "index.k_norm"), c.index_dim, 1, scalar(3));
+            // Block keys rotate at the MRoPE position of the block's first token,
+            // which may be an image position (scalars 3-6: t, h, w, t).
+            pooled = rope_multi(g, ggml_reshape_3d(g.c(), norm(g, pooled, p + "index.k_norm"), c.index_dim, 1, 1),
+                                ggml_view_1d(g.c(), g.scalars, 4, 3 * sizeof(int32_t)));
             g.add(ggml_set_rows(g.c(), s.index_cache, ggml_reshape_2d(g.c(), pooled, c.index_dim, 1), scalar(1)));
             g.add(ggml_set_rows(g.c(), s.raw_index, ggml_reshape_2d(g.c(), raw, c.index_dim, 1), scalar(2)));
             ggml_tensor * top = nullptr, * scores = nullptr;
@@ -1078,11 +1133,28 @@ struct Engine::Impl {
             g.run();
         });
     }
+    // Token embeddings [hidden, n] of batch tokens [first, first + n), with the
+    // vision tower's rows at image positions.
+    ggml_tensor * embed(Graph & g, const std::vector<int32_t> & tokens, int first, int n) {
+        auto * rows = ggml_get_rows(g.c(), weight("token_embd.weight"),
+                                    g.integers({tokens.begin() + first, tokens.begin() + first + n}));
+        if (injected.empty()) return rows;
+        std::vector<int32_t> ids;
+        std::vector<float> values;
+        for (int i = 0; i < n; ++i) {
+            const float * row = injected[size_t(first + i)];
+            if (!row) continue;
+            ids.push_back(i);
+            values.insert(values.end(), row, row + c.hidden);
+        }
+        if (ids.empty()) return rows;
+        auto * images = ggml_reshape_2d(g.c(), g.floats(values), c.hidden, int64_t(ids.size()));
+        return ggml_set_rows(g.c(), ggml_reshape_2d(g.c(), rows, c.hidden, n), images, g.integers(ids));
+    }
     ggml_tensor * batch_rope(Graph & g, ggml_tensor * x, int dim, int heads, int count, int first) {
-        std::vector<int32_t> positions(count); std::iota(positions.begin(), positions.end(), first);
+        std::vector<int> indices(count); std::iota(indices.begin(), indices.end(), first);
         x = ggml_reshape_3d(g.c(), ggml_cont(g.c(), x), dim, heads, count);
-        return ggml_rope_ext(g.c(), x, g.integers(positions), nullptr, c.rope_dim,
-                             GGML_ROPE_TYPE_NEOX, c.context, c.rope_base, 1, 0, 1, 0, 0);
+        return rope_indices(g, x, indices);
     }
     ggml_tensor * batch_gdn_heads(Graph & g, ggml_tensor * x, int count) {
         if (c.architecture == Architecture::Qwen35)
@@ -1334,10 +1406,9 @@ struct Engine::Impl {
                     auto * pooled = ggml_reshape_3d(g.c(), ggml_mean(g.c(), ggml_cont(g.c(),
                         ggml_permute(g.c(), complete, 1, 0, 2, 3))), c.index_dim, 1, new_blocks);
                     pooled = norm(g, pooled, p+"index.k_norm");
-                    std::vector<int32_t> starts(new_blocks);
+                    std::vector<int> starts(new_blocks);
                     for (int j=0; j<new_blocks; ++j) starts[j] = (start/c.block_size+j)*c.block_size;
-                    pooled = ggml_rope_ext(g.c(), pooled, g.integers(starts), nullptr, c.rope_dim,
-                        GGML_ROPE_TYPE_NEOX, c.context, c.rope_base, 1, 0, 1, 0, 0);
+                    pooled = rope_indices(g, pooled, starts);
                     auto * destination = ggml_view_2d(g.c(), state.index_cache, c.index_dim, new_blocks,
                         state.index_cache->nb[1], size_t(start/c.block_size)*state.index_cache->nb[1]);
                     g.add(ggml_cpy(g.c(), pooled, destination));
@@ -1546,6 +1617,7 @@ struct Engine::Impl {
             ProfileScope scope(&profiler, "token", "verify", "decode", position, -1, "CPU");
             mtp_sync(token);
             const int n = int(tokens.size()), start = position;
+            if (int(rope_table.size()) == position) push_text_positions(n);
             std::vector<Step> steps(n);
             int which = 0;
             auto seg = build_batch_segment(-1, decode_allocator_get(which), tokens, false, true);
@@ -1615,6 +1687,8 @@ struct Engine::Impl {
             }
             captured_logits.clear();
             sequence.insert(sequence.end(), tokens.begin(), tokens.begin() + consumed);
+            sequence_hash.resize(sequence.size());
+            rope_table.resize(sequence.size());
             position += consumed;
             ++stats.speculative_verifications;
             stats.speculative_drafted += drafts.size();
@@ -1648,7 +1722,7 @@ struct Engine::Impl {
         auto shaped = [&](ggml_tensor * t) { return ggml_reshape_3d(g.c(), t, c.hidden, c.branches, n); };
         ggml_tensor * h;
         if (finished < 0) {
-            auto * embedded = ggml_reshape_3d(g.c(), ggml_get_rows(g.c(), weight("token_embd.weight"), g.integers(tokens)), c.hidden, 1, n);
+            auto * embedded = ggml_reshape_3d(g.c(), embed(g, tokens, 0, n), c.hidden, 1, n);
             h = ggml_repeat_4d(g.c(), embedded, c.hidden, c.branches, n, 1);
             g.mark(h, "embedding", -1);
         } else {
@@ -1707,10 +1781,9 @@ struct Engine::Impl {
                     auto * pooled = ggml_reshape_3d(g.c(), ggml_mean(g.c(), ggml_cont(g.c(),
                         ggml_permute(g.c(), complete, 1, 0, 2, 3))), c.index_dim, 1, new_blocks);
                     pooled = norm(g, pooled, p + "index.k_norm");
-                    std::vector<int32_t> starts(new_blocks);
+                    std::vector<int> starts(new_blocks);
                     for (int j = 0; j < new_blocks; ++j) starts[j] = (start / c.block_size + j) * c.block_size;
-                    pooled = ggml_rope_ext(g.c(), pooled, g.integers(starts), nullptr, c.rope_dim,
-                        GGML_ROPE_TYPE_NEOX, c.context, c.rope_base, 1, 0, 1, 0, 0);
+                    pooled = rope_indices(g, pooled, starts);
                     auto * destination = ggml_view_2d(g.c(), state.index_cache, c.index_dim, new_blocks,
                         state.index_cache->nb[1], size_t(start / c.block_size) * state.index_cache->nb[1]);
                     // Ordered before the scoring below reads the cache (graph order).
@@ -1879,6 +1952,7 @@ struct Engine::Impl {
             sampler->accept(token);
         }
         sequence.insert(sequence.end(), tokens.begin(), tokens.end());
+        commit_hashes(n);
         position += n; stats.prefill_tokens += uint64_t(n);
         if (mtp_backlog) { mtp_next = position - 1; mtp_state.device_kv_size = mtp_next; mtp_drafted_for = -1; }
         return result;
@@ -1919,6 +1993,8 @@ struct Engine::Impl {
         if (tokens.size() > size_t(c.context-position)) throw std::out_of_range("Prompt exceeds context capacity");
         for (auto token : tokens) if (token < 0 || token >= c.vocab) throw std::out_of_range("Prompt token outside vocabulary");
         if (tokens.empty()) return {};
+        if (int(rope_table.size()) < position + int(tokens.size()))
+            push_text_positions(position + int(tokens.size()) - int(rope_table.size()));
         mtp_sync(tokens[0]);
         if (batch_hidden && tokens.size() <= size_t(options.hybrid_batch_tokens)) {
             // Weights stay in the decode layout, so reusable decode segments survive.
@@ -1928,7 +2004,13 @@ struct Engine::Impl {
         hybrid.clear();
         std::vector<Step> result; result.reserve(tokens.size());
         if (options.backend == "cpu") {
-            for (auto token : tokens) result.push_back(decode(token, capture));
+            const auto hashes = pending_hash;
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                injected_row = injected.empty() ? nullptr : injected[i];
+                try { result.push_back(decode(tokens[i], capture)); } catch (...) { injected_row = nullptr; throw; }
+            }
+            injected_row = nullptr;
+            if (!hashes.empty()) std::copy(hashes.begin(), hashes.end(), sequence_hash.end() - long(hashes.size()));
             return result;
         }
         PrefillMemory memory(model, backend.get(), stats, profiler, options);
@@ -1955,9 +2037,7 @@ struct Engine::Impl {
                        options.prefill_chunk_tokens, [&](int first, int n) {
                     auto g = graph("prefill.embedding", -1, first);
                     auto * target = token_range(g.c(), batch, first, n);
-                    auto * embedded = ggml_get_rows(g.c(), weight("token_embd.weight"),
-                                                   g.integers({tokens.begin()+first, tokens.begin()+first+n}));
-                    embedded = ggml_reshape_3d(g.c(), embedded, c.hidden, 1, n);
+                    auto * embedded = ggml_reshape_3d(g.c(), embed(g, tokens, first, n), c.hidden, 1, n);
                     g.add(ggml_cpy(g.c(), ggml_repeat(g.c(), embedded, target), target)); g.run();
                 });
                 for (int layer=0; layer<c.layers; ++layer) {
@@ -2020,6 +2100,7 @@ struct Engine::Impl {
                 sampler->accept(token);
             }
             sequence.insert(sequence.end(), tokens.begin(), tokens.end());
+            commit_hashes(int(tokens.size()));
             position += int(tokens.size()); stats.prefill_tokens += tokens.size();
             return result;
         } catch (...) {
@@ -2083,7 +2164,8 @@ struct Engine::Impl {
         auto & g = *decode_graph;
         const int64_t row = position;
         g.put(g.token_input, &token, sizeof(token));
-        g.put(g.position_input, &position, sizeof(position));
+        const int32_t rope_position = rope_entry(position)[0];
+        g.put(g.position_input, &rope_position, sizeof(rope_position));
         g.put(g.kv_row_input, &row, sizeof(row));
         g.run();
         if (!rebuild) ++stats.decode_graph_reuses;
@@ -2114,7 +2196,8 @@ struct Engine::Impl {
         auto & g = *seg.g;
         const bool reusable = padded >= 0;
         if (reusable) {
-            g.scalars = g.input(GGML_TYPE_I32, 4);
+            // {rope position, index-cache row, raw-index ring row, block start t, h, w, t, pad}
+            g.scalars = g.input(GGML_TYPE_I32, 8);
             g.position_input = ggml_view_1d(g.c(), g.scalars, 1, 0);
             g.qsa_padded = padded;
             if (padded > 0) { g.block_mask = g.input(GGML_TYPE_F32, padded); ggml_set_output(g.block_mask); }
@@ -2122,7 +2205,8 @@ struct Engine::Impl {
         }
         ggml_tensor * h;
         if (finished < 0) {
-            h = ggml_get_rows(g.c(), weight("token_embd.weight"), reusable ? g.token_input : g.integer(token));
+            h = injected_row ? g.floats({injected_row, injected_row + c.hidden})
+                             : ggml_get_rows(g.c(), weight("token_embd.weight"), reusable ? g.token_input : g.integer(token));
             h = c.branches == 1 ? ggml_reshape_2d(g.c(), h, c.hidden, 1) : ggml_repeat(g.c(), h, hidden);
             g.mark(h, "embedding", -1);
         } else {
@@ -2199,8 +2283,9 @@ struct Engine::Impl {
             for (auto & seg : hybrid.segments) if (seg.g->block_mask) seg.g->put(seg.g->block_mask, mask.data(), mask.size() * sizeof(float));
             hybrid.complete = complete;
         }
-        const int32_t scalars[4] = {position, sparse ? position / c.block_size : 0, sparse ? position % c.block_size : 0,
-                                    sparse ? position / c.block_size * c.block_size : 0};
+        const auto block = rope_entry(sparse ? position / c.block_size * c.block_size : 0);
+        const int32_t scalars[8] = {rope_entry(position)[0], sparse ? position / c.block_size : 0, sparse ? position % c.block_size : 0,
+                                    block[0], block[1], block[2], block[0], 0};
         std::vector<float> output;
         for (size_t i = 0; i < hybrid.segments.size(); ++i) {
             auto & seg = hybrid.segments[i];
@@ -2258,7 +2343,10 @@ struct Engine::Impl {
         return output;
     }
     void decode_hybrid(int32_t token, bool capture, Step & step) {
-        if (c.ple.layers.empty()) { decode_hybrid_reused(token, capture, step); return; }
+        const auto e = rope_entry(position);
+        // Reusable segments carry a token id and a text position; an image row
+        // of the sequential reference prefill builds its own graphs.
+        if (c.ple.layers.empty() && !injected_row && e[1] == e[0] && e[2] == e[0]) { decode_hybrid_reused(token, capture, step); return; }
         const int visible = position + 1;
         int which = 0;
         auto seg = build_segment(-1, decode_allocator_get(which), token, capture);
@@ -2328,6 +2416,7 @@ struct Engine::Impl {
         if (position >= c.context) throw std::out_of_range("Context capacity exceeded; reset before decoding a new sequence");
         try {
             ProfileScope token_scope(&profiler, "token", "decode", "decode", position, -1, "CPU");
+            if (int(rope_table.size()) == position) push_text_positions(1);
             if (options.kv_placement == KVPlacement::CPU) {
                 Step step{position, {}, {}};
                 decode_hybrid(token, capture_logits, step);
@@ -2336,7 +2425,7 @@ struct Engine::Impl {
                     if (previous_tokens.size() >= size_t(c.ple.ngram_size)) previous_tokens.erase(previous_tokens.begin());
                 }
                 sampler->accept(token);
-                sequence.push_back(token);
+                sequence.push_back(token); sequence_hash.push_back(0);
                 ++position;
                 return step;
             }
@@ -2349,12 +2438,13 @@ struct Engine::Impl {
                     if (previous_tokens.size() >= size_t(c.ple.ngram_size)) previous_tokens.erase(previous_tokens.begin());
                 }
                 sampler->accept(token);
-                sequence.push_back(token);
+                sequence.push_back(token); sequence_hash.push_back(0);
                 ++position;
                 return step;
             }
             auto emb = graph("embedding");
-            auto * token_embedding = ggml_get_rows(emb.c(), weight("token_embd.weight"), emb.integer(token));
+            auto * token_embedding = injected_row ? emb.floats({injected_row, injected_row + c.hidden})
+                                                  : ggml_get_rows(emb.c(), weight("token_embd.weight"), emb.integer(token));
             emb.add(ggml_cpy(emb.c(), ggml_repeat(emb.c(), token_embedding, hidden), hidden));
             emb.run();
             Step step{position, {}, {}};
@@ -2388,7 +2478,7 @@ struct Engine::Impl {
                 if (previous_tokens.size() >= size_t(c.ple.ngram_size)) previous_tokens.erase(previous_tokens.begin());
             }
             sampler->accept(token);
-            sequence.push_back(token);
+            sequence.push_back(token); sequence_hash.push_back(0);
             ++position;
             return step;
         } catch (...) { failed = true; throw; }
@@ -2460,6 +2550,8 @@ struct Engine::Impl {
             if (s.device_keys) s.device_kv_size = target;
         }
         sequence.resize(size_t(target));
+        sequence_hash.resize(size_t(target));
+        rope_table.resize(size_t(target));
         previous_tokens.clear();
         if (!c.ple.layers.empty())
             previous_tokens.assign(sequence.end() - std::min<size_t>(sequence.size(), c.ple.ngram_size - 1), sequence.end());
@@ -2474,12 +2566,131 @@ struct Engine::Impl {
         update_checkpoint_bytes();
         ++stats.prompt_cache_restores;
     }
-    std::vector<Step> prefill_cached(const std::vector<int32_t> & tokens, bool capture) {
+    void commit_hashes(int n) {
+        if (pending_hash.size() == size_t(n)) sequence_hash.insert(sequence_hash.end(), pending_hash.begin(), pending_hash.end());
+        else sequence_hash.insert(sequence_hash.end(), size_t(n), 0);
+        pending_hash.clear();
+    }
+    // An image of a prompt: absolute placeholder range, merged grid and hash.
+    struct SpanInfo { int offset = 0, count = 0, grid_w = 0, grid_h = 0; uint64_t hash = 0; const ImageSpan * span = nullptr; };
+    static uint64_t embedding_hash(const ImageEmbedding & e) {
+        Image bytes;
+        bytes.width = e.grid_width; bytes.height = e.grid_height;
+        bytes.rgb.resize(e.values.size() * sizeof(float));
+        std::memcpy(bytes.rgb.data(), e.values.data(), bytes.rgb.size());
+        return bytes.hash();
+    }
+    // `tokens` occupy sequence indices [base, base + size); offsets are relative to it.
+    std::vector<SpanInfo> describe(const std::vector<int32_t> & tokens, const std::vector<ImageSpan> & images, int base) const {
+        std::vector<SpanInfo> spans;
+        for (const auto & s : images) {
+            SpanInfo info;
+            info.span = &s;
+            if (s.embedding) {
+                info.grid_w = s.embedding->grid_width; info.grid_h = s.embedding->grid_height;
+                if (info.grid_w < 1 || info.grid_h < 1 || s.embedding->values.size() != size_t(info.grid_w) * info.grid_h * c.hidden)
+                    throw std::invalid_argument("Image embedding must hold grid_width * grid_height rows of the model's hidden size");
+                info.hash = s.embedding->hash ? s.embedding->hash : embedding_hash(*s.embedding);
+            } else if (s.image) {
+                if (!vision) throw std::logic_error("Image input requires Options::vision_model");
+                const auto size = vision->resized(s.image->width, s.image->height);
+                info.grid_w = size[0] / vision->config().factor(); info.grid_h = size[1] / vision->config().factor();
+                info.hash = s.image->hash();
+            } else throw std::invalid_argument("An image span needs an image or an embedding");
+            info.count = info.grid_w * info.grid_h;
+            if (s.offset < 0 || size_t(s.offset) + size_t(info.count) > tokens.size())
+                throw std::out_of_range("Image placeholders extend past the prompt (" + std::to_string(info.count) + " tokens at offset " +
+                                        std::to_string(s.offset) + ")");
+            if (c.image_token >= 0)
+                for (int j = 0; j < info.count; ++j)
+                    if (tokens[size_t(s.offset + j)] != c.image_token)
+                        throw std::invalid_argument("Image positions must hold the image placeholder token " + std::to_string(c.image_token));
+            info.offset = base + s.offset;
+            spans.push_back(info);
+        }
+        std::sort(spans.begin(), spans.end(), [](const SpanInfo & a, const SpanInfo & b) { return a.offset < b.offset; });
+        for (size_t i = 1; i < spans.size(); ++i)
+            if (spans[i].offset < spans[i - 1].offset + spans[i - 1].count) throw std::invalid_argument("Image spans overlap");
+        return spans;
+    }
+    std::shared_ptr<const ImageEmbedding> embedding_for(const SpanInfo & s) {
+        if (s.span->embedding) return s.span->embedding;
+        for (const auto & e : recent_images)
+            if (e->hash == s.hash && e->grid_width == s.grid_w && e->grid_height == s.grid_h) return e;
+        auto e = std::make_shared<const ImageEmbedding>(vision->encode(*s.span->image, stats, profiler));
+        recent_images.push_back(e);
+        while (recent_images.size() > 8) recent_images.pop_front();
+        return e;
+    }
+    // Prefills `tokens` at the current position. Image rows replace token
+    // embeddings and take grid positions; images starting before the current
+    // position (a prompt-cache restore inside an image) continue from the
+    // rotary base recorded for their first token.
+    std::vector<Step> prefill_spans(const std::vector<int32_t> & tokens, const std::vector<SpanInfo> & spans, bool capture) {
+        if (failed) throw std::runtime_error("Previous execution failed; call reset() before prefill");
+        if (tokens.size() > size_t(c.context - position)) throw std::out_of_range("Prompt exceeds context capacity");
+        for (auto token : tokens) if (token < 0 || token >= c.vocab) throw std::out_of_range("Prompt token outside vocabulary");
+        const int start = position, n = int(tokens.size());
+        const bool any = std::any_of(spans.begin(), spans.end(), [&](const SpanInfo & s) { return s.offset + s.count > start && s.offset < start + n; });
+        if (!any) return prefill(tokens, capture);
+        if (int(rope_table.size()) != position) throw std::logic_error("MRoPE positions are inconsistent with the sequence");
+        std::vector<std::array<int32_t, 4>> entries(static_cast<size_t>(n));
+        std::vector<uint64_t> hashes(size_t(n), 0);
+        std::vector<const float *> rows(size_t(n), nullptr);
+        std::vector<std::shared_ptr<const ImageEmbedding>> embeddings(spans.size());
+        std::vector<int> bases(spans.size(), 0);
+        int next = rope_entry(start)[0];
+        size_t si = 0;
+        for (int i = 0; i < n; ++i) {
+            const int index = start + i;
+            while (si < spans.size() && spans[si].offset + spans[si].count <= index) ++si;
+            if (si < spans.size() && spans[si].offset <= index) {
+                const auto & s = spans[si];
+                if (!embeddings[si]) {
+                    embeddings[si] = embedding_for(s);
+                    if (embeddings[si]->tokens() != s.count || embeddings[si]->values.size() != size_t(s.count) * c.hidden)
+                        throw std::logic_error("Vision tower output does not match the image's placeholder count");
+                    bases[si] = s.offset < start ? rope_table[size_t(s.offset)][0] : next;
+                }
+                const int j = index - s.offset, base = bases[si];
+                entries[size_t(i)] = {base, base + j / s.grid_w, base + j % s.grid_w, base + std::max(s.grid_w, s.grid_h)};
+                rows[size_t(i)] = embeddings[si]->values.data() + size_t(j) * c.hidden;
+                hashes[size_t(i)] = s.hash;
+                next = entries[size_t(i)][3];
+            } else {
+                entries[size_t(i)] = {next, next, next, next + 1};
+                ++next;
+            }
+        }
+        rope_table.insert(rope_table.end(), entries.begin(), entries.end());
+        injected = std::move(rows);
+        pending_hash = std::move(hashes);
+        try {
+            auto result = prefill(tokens, capture);
+            injected.clear(); pending_hash.clear();
+            return result;
+        } catch (...) {
+            injected.clear(); pending_hash.clear();
+            if (!failed) rope_table.resize(size_t(position));
+            throw;
+        }
+    }
+    std::vector<Step> prefill_images(const std::vector<int32_t> & tokens, const std::vector<ImageSpan> & images, bool capture) {
+        if (failed) throw std::runtime_error("Previous execution failed; call reset() before prefill");
+        return prefill_spans(tokens, describe(tokens, images, position), capture);
+    }
+    std::vector<Step> prefill_cached(const std::vector<int32_t> & tokens, const std::vector<ImageSpan> & images, bool capture) {
         if (failed) throw std::runtime_error("Previous execution failed; call reset() before prefill");
         if (tokens.empty()) throw std::invalid_argument("Empty prompt");
         if (tokens.size() > size_t(c.context)) throw std::out_of_range("Prompt exceeds context capacity");
         for (auto token : tokens) if (token < 0 || token >= c.vocab) throw std::out_of_range("Prompt token outside vocabulary");
-        const size_t common = std::mismatch(sequence.begin(), sequence.end(), tokens.begin(), tokens.end()).first - sequence.begin();
+        const auto spans = describe(tokens, images, 0);
+        std::vector<uint64_t> hashes(tokens.size(), 0);
+        for (const auto & s : spans) std::fill(hashes.begin() + s.offset, hashes.begin() + s.offset + s.count, s.hash);
+        // A position matches when its token and its image content both match.
+        size_t common = 0;
+        while (common < sequence.size() && common < tokens.size() && sequence[common] == tokens[common] &&
+               sequence_hash[common] == hashes[common]) ++common;
         if (common < sequence.size()) {
             const Checkpoint * checkpoint = nullptr;
             for (const auto & candidate : checkpoints) if (size_t(candidate.position) <= common) checkpoint = &candidate;
@@ -2488,9 +2699,67 @@ struct Engine::Impl {
         stats.prompt_cache_reused_tokens += uint64_t(position);
         // The state (and logits) of the whole prompt is already resident.
         if (size_t(position) == tokens.size()) return {};
-        auto result = prefill({tokens.begin() + position, tokens.end()}, capture);
+        auto result = prefill_spans({tokens.begin() + position, tokens.end()}, spans, capture);
         try { save_checkpoint(); } catch (...) { failed = true; throw; }
         return result;
+    }
+    std::vector<TensorPlacement> tensor_placements() const {
+        std::vector<TensorPlacement> out;
+        const std::string device = ggml_backend_name(backend.get());
+        const auto shape = [](const ggml_tensor * t) {
+            std::vector<int64_t> s;
+            for (int i = 0; i < ggml_n_dims(t); ++i) s.push_back(t->ne[i]);
+            return s;
+        };
+        for (const auto & g : model.groups)
+            for (const auto * t : g.tensors) {
+                TensorPlacement p;
+                p.name = ggml_get_name(t);
+                p.component = g.layer == c.layers && g.part != WeightPart::Head ? "mtp" : "text";
+                p.role = "weight"; p.group = g.name; p.type = ggml_type_name(t->type); p.shape = shape(t);
+                p.bytes = ggml_nbytes(t); p.resident = t->buffer != nullptr;
+                p.memory = t->buffer ? ggml_backend_buffer_name(t->buffer) : "";
+                p.compute = device;
+                out.push_back(std::move(p));
+            }
+        const std::string state_memory = ggml_backend_buffer_name(state_buffer.get());
+        const auto state = [&](std::string name, const char * role, std::string group, const ggml_tensor * t, const std::string & component = "text") {
+            if (!t) return;
+            TensorPlacement p;
+            p.name = std::move(name); p.component = component; p.role = role; p.group = std::move(group);
+            p.type = ggml_type_name(t->type); p.shape = shape(t); p.bytes = ggml_nbytes(t); p.resident = true;
+            p.memory = state_memory; p.compute = device;
+            out.push_back(std::move(p));
+        };
+        state("hidden", "state", "sequence", hidden);
+        state("logits", "state", "sequence", last_logits);
+        for (int l = 0; l < c.layers; ++l) {
+            const auto & s = states[size_t(l)];
+            const auto p = "blk." + std::to_string(l) + ".";
+            state(p + "gdn.conv_state", "state", p + "attention", s.conv);
+            state(p + "gdn.recurrent_state", "state", p + "attention", s.recurrent);
+            state(p + "ple.conv_state", "state", p + "ple", s.ple_conv);
+            state(p + "qsa.raw_index", "state", p + "attention", s.raw_index);
+            state(p + "qsa.index_cache", "state", p + "attention", s.index_cache);
+            state(p + "attn.gate", "state", p + "attention", s.gate);
+            state(p + "attn.inject", "state", p + "attention", s.inject);
+            state(p + "kv_cache.k", "kv_cache", p + "attention", s.device_keys);
+            state(p + "kv_cache.v", "kv_cache", p + "attention", s.device_values);
+            if (s.attention) {
+                // Host K/V rows; QK, softmax and V run on CPU worker threads.
+                TensorPlacement t;
+                t.name = p + "kv_cache"; t.component = "text"; t.role = "kv_cache"; t.group = p + "attention";
+                t.type = ggml_type_name(s.attention->type());
+                t.shape = {c.head_dim, c.context, c.kv_heads, 2};
+                t.bytes = s.attention->bytes(); t.resident = true; t.memory = "CPU"; t.compute = "CPU";
+                out.push_back(std::move(t));
+            }
+        }
+        state("mtp.kv_cache.k", "kv_cache", "mtp.attention", mtp_state.device_keys, "mtp");
+        state("mtp.kv_cache.v", "kv_cache", "mtp.attention", mtp_state.device_values, "mtp");
+        state("mtp.backlog", "state", "mtp.attention", mtp_backlog, "mtp");
+        if (vision) vision->placements(out);
+        return out;
     }
     void reset() {
         decode_graph.reset();
@@ -2511,6 +2780,9 @@ struct Engine::Impl {
         refresh_derived_weights();
         previous_tokens.clear();
         sequence.clear();
+        sequence_hash.clear(); pending_hash.clear();
+        rope_table.clear();
+        injected.clear(); injected_row = nullptr;
         checkpoints.clear();
         captured_logits.clear();
         sampler->reset();
@@ -2533,8 +2805,26 @@ std::vector<Step> Engine::prefill(const std::vector<int32_t> & tokens, bool capt
     return impl_->prefill(tokens, capture_logits);
 }
 std::vector<Step> Engine::prefill_cached(const std::vector<int32_t> & tokens, bool capture_logits) {
-    return impl_->prefill_cached(tokens, capture_logits);
+    return impl_->prefill_cached(tokens, {}, capture_logits);
 }
+std::vector<Step> Engine::prefill(const std::vector<int32_t> & tokens, const std::vector<ImageSpan> & images, bool capture_logits) {
+    return impl_->prefill_images(tokens, images, capture_logits);
+}
+std::vector<Step> Engine::prefill_cached(const std::vector<int32_t> & tokens, const std::vector<ImageSpan> & images,
+                                         bool capture_logits) {
+    return impl_->prefill_cached(tokens, images, capture_logits);
+}
+bool Engine::has_vision() const { return impl_->vision != nullptr; }
+VisionInfo Engine::vision_info() const { return impl_->vision ? impl_->vision->info() : VisionInfo{}; }
+int Engine::image_tokens(int width, int height) const {
+    if (!impl_->vision) throw std::logic_error("Image input requires Options::vision_model");
+    return impl_->vision->tokens(width, height);
+}
+ImageEmbedding Engine::encode_image(const Image & image) {
+    if (!impl_->vision) throw std::logic_error("Image input requires Options::vision_model");
+    return impl_->vision->encode(image, impl_->stats, impl_->profiler);
+}
+std::vector<TensorPlacement> Engine::tensor_placements() const { return impl_->tensor_placements(); }
 const std::vector<int32_t> & Engine::tokens() const { return impl_->sequence; }
 std::vector<int32_t> Engine::verify(int32_t token, const std::vector<int32_t> & drafts) { return impl_->verify(token, drafts); }
 std::vector<int32_t> Engine::draft(int32_t token, int count) { return impl_->draft(token, count); }
