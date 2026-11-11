@@ -197,6 +197,16 @@ if(BUILD_TESTING)
             add_test(NAME sampling COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_sampling.py --bin-dir $<TARGET_FILE_DIR:tidal-cli>)
             set_tests_properties(sampling PROPERTIES TIMEOUT 180)
+            if(TARGET tidal-server)
+                # CPU: sequential reference path; CUDA: hybrid, layer-major and GPU KV prefill.
+                add_test(NAME vision-cpu COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_vision.py --bin-dir $<TARGET_FILE_DIR:tidal-vision> --backend cpu)
+                set_tests_properties(vision-cpu PROPERTIES TIMEOUT 300)
+                if(TIDAL_CUDA)
+                    add_test(NAME vision COMMAND ${Python3_EXECUTABLE}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_vision.py --bin-dir $<TARGET_FILE_DIR:tidal-vision> --backend cuda)
+                    set_tests_properties(vision PROPERTIES TIMEOUT 300)
+                endif()
             endif()
             add_test(NAME qwen35-reference COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_qwen35.py --bin-dir $<TARGET_FILE_DIR:tidal-cli>)

@@ -44,7 +44,8 @@ def read_gguf(path, quantized=None):
         metadata_offsets[key] = position
         if kind == 9:
             element_kind, count = take("I"), take("Q")
-            metadata[key] = [take({4: "I", 10: "Q"}[element_kind]) for _ in range(count)]
+            metadata[key] = [string() if element_kind == 8 else take({4: "I", 5: "i", 6: "f", 7: "?", 10: "Q"}[element_kind])
+                             for _ in range(count)]
         else:
             metadata[key] = string() if kind == 8 else take({4: "I", 5: "i", 6: "f", 7: "?", 10: "Q"}[kind])
     tensors = []
@@ -133,6 +134,10 @@ class Reference:
         c = self.c
         self.position = 0
         self.tokens = []
+        # MRoPE (t, h, w, next) per consumed position; text has t == h == w.
+        self.rope_table = []
+        pairs = c["rope_dim"] // 2
+        self.sections = c.get("rope_sections") or [(pairs + 2) // 3, (pairs + 1) // 3, pairs // 3]
         self.states = []
         for layer in range(c["layers"]):
             if (layer + 1) % 4:
@@ -212,6 +217,14 @@ class Reference:
 
     def rope(self, x, position):
         n = self.c["rope_dim"]
+        if isinstance(position, (tuple, list)):
+            # Interleaved MRoPE: pair i follows the t, h or w axis by i % 3
+            # within each axis' section; text positions are equal on all axes.
+            t, h, w = position[:3]
+            s = self.sections
+            pairs = np.arange(n // 2)
+            position = np.where((pairs % 3 == 1) & (pairs < 3 * s[1]), h,
+                       np.where((pairs % 3 == 2) & (pairs < 3 * s[2]), w, t)).astype(np.float32)
         theta = position / (np.float32(self.c["rope_base"]) ** (np.arange(n // 2, dtype=np.float32) * 2 / n))
         x = x.copy()
         left, right = x[..., :n // 2].copy(), x[..., n // 2:n].copy()
@@ -306,19 +319,21 @@ class Reference:
 
     def attention(self, p, x, state):
         c, pos = self.c, self.position
+        rotary = self.rope_table[pos][:3]
         d, h, hk, di = c["head_dim"], c["q_heads"], c["kv_heads"], c["index_dim"]
         qg = self.mm(p + "attn.qg", x).reshape(h, 2 * d)
-        q = self.rope(self.norm(p + "attn.q_norm", qg[:, :d]), pos)
-        k = self.rope(self.norm(p + "attn.k_norm", self.mm(p + "attn.k", x).reshape(hk, d)), pos)
+        q = self.rope(self.norm(p + "attn.q_norm", qg[:, :d]), rotary)
+        k = self.rope(self.norm(p + "attn.k_norm", self.mm(p + "attn.k", x).reshape(hk, d)), rotary)
         v = self.mm(p + "attn.v", x).reshape(hk, d)
         state["keys"].append(self.kv_round(k))
         state["values"].append(self.kv_round(v))
-        iq = self.rope(self.norm(p + "index.q_norm", self.mm(p + "index.q", x).reshape(c["index_heads"], di)), pos)
+        iq = self.rope(self.norm(p + "index.q_norm", self.mm(p + "index.q", x).reshape(c["index_heads"], di)), rotary)
         state["raw"].append(self.mm(p + "index.k", x))
         block = c["block_size"]
         if (pos + 1) % block == 0:
             pooled = np.mean(state["raw"][-block:], axis=0)
-            pooled = self.rope(self.norm(p + "index.k_norm", pooled), pos + 1 - block)
+            # A block key rotates at its first token's (possibly image) position.
+            pooled = self.rope(self.norm(p + "index.k_norm", pooled), self.rope_table[pos + 1 - block][:3])
             state["pooled"].append(bf16(pooled.reshape(-1)))
         n = (pos + 1) // block
         selected = []
@@ -346,9 +361,16 @@ class Reference:
         output *= sigmoid(qg[:, d:])
         return self.mm(p + "attn.out", output.reshape(-1)), selected
 
-    def decode(self, token):
+    def decode(self, token, embedding=None, rotary=None):
+        """`embedding` replaces the token embedding (an image row); `rotary` is
+        its (t, h, w, next) MRoPE entry. Text continues at the previous next."""
         c = self.c
-        h = np.tile(self.w["token_embd.weight"][token], (c["branches"], 1))
+        if rotary is None:
+            t = self.rope_table[-1][3] if self.rope_table else 0
+            rotary = (t, t, t, t + 1)
+        self.rope_table.append(tuple(rotary))
+        row = self.w["token_embd.weight"][token] if embedding is None else np.asarray(embedding, dtype=np.float32)
+        h = np.tile(row, (c["branches"], 1))
         selections = []
         for layer, state in enumerate(self.states):
             p = f"blk.{layer}."
