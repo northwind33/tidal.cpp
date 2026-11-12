@@ -88,7 +88,7 @@ void Runtime::submit(std::function<void()> job) {
 
 void Runtime::erase() {
     if (state_ != State::Ready) throw ApiError(503, "unavailable_error", "Loading model");
-    submit([this] { engine_->reset(); });
+    submit([this] { engine_->reset(); ledger_.clear(); });
 }
 
 std::vector<TensorPlacement> Runtime::placements() const {
@@ -148,18 +148,24 @@ GenerationResult Runtime::execute(const Prompt & request, const GenerationParams
     decoded_ = 0; remaining_ = limit;
     try {
         const auto prompt_start = std::chrono::steady_clock::now();
+        // Snapshots stay pinned while a live cache entry may still read them.
+        ledger_.sweep(prompt_start);
+        engine.keep_checkpoints(ledger_.positions(size_t(std::max(config_.cache_snapshots, 0))));
         if (!params.cache_prompt) engine.reset();
         const uint64_t reused = engine.statistics().prompt_cache_reused_tokens, encoded = engine.statistics().images_encoded;
-        try { engine.prefill_cached(prompt, request.images, false); }
+        const auto pins = params.cache.enabled && config_.cache_snapshots > 0 ? params.cache.pins() : std::vector<int>{};
+        try { engine.prefill_cached(prompt, request.images, false, pins); }
         catch (const std::invalid_argument & e) {
             // Images are checked and encoded before the sequence changes.
             throw invalid_request(std::string("Invalid image input: ") + e.what());
         }
         result.cached_tokens = int(engine.statistics().prompt_cache_reused_tokens - reused);
         result.images_encoded = int(engine.statistics().images_encoded - encoded);
+        result.cache = ledger_.account(params.cache, params.cache.enabled ? prefix_hashes(prompt, request.images) : std::vector<uint64_t>(prompt.size() + 1),
+                                       result.cached_tokens, prompt_start);
         engine.set_sampling(params.sampling);
         result.prompt_ms = elapsed_ms(prompt_start);
-        if (callbacks.on_prompt) callbacks.on_prompt(result.prompt_tokens, result.cached_tokens);
+        if (callbacks.on_prompt) callbacks.on_prompt(result);
 
         const auto generation_start = std::chrono::steady_clock::now();
         std::string bytes, pending; // Undecoded token bytes; decoded but unreleased text.
@@ -266,6 +272,11 @@ GenerationResult Runtime::execute(const Prompt & request, const GenerationParams
     ++metrics_.requests;
     metrics_.prompt_tokens += uint64_t(result.prompt_tokens - result.cached_tokens);
     metrics_.cached_tokens += uint64_t(result.cached_tokens);
+    metrics_.cache_read_tokens += uint64_t(result.cache.read);
+    metrics_.cache_write_tokens += uint64_t(result.cache.written_total());
+    metrics_.cache_entries = ledger_.size();
+    metrics_.cache_snapshots = engine.checkpoints().size();
+    metrics_.cache_snapshot_bytes = engine.statistics().prompt_cache_checkpoint_bytes;
     metrics_.generated_tokens += result.tokens.size();
     metrics_.prompt_seconds += result.prompt_ms / 1000;
     metrics_.generation_seconds += result.generation_ms / 1000;

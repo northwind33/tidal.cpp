@@ -327,12 +327,12 @@ async function send() {
           else if (block.type === 'text') reply.content += block.text;
           else if (block.type === 'tool_use') reply.calls.push({id: block.id, name: block.name, arguments: block.input});
         }
-        stats = `stop_reason=${data.stop_reason} · input ${data.usage.input_tokens} (+${data.usage.cache_read_input_tokens} cached) · output ${data.usage.output_tokens}`;
+        stats = `stop_reason=${data.stop_reason} · input ${anthropicInput(data.usage)} · output ${data.usage.output_tokens}`;
       } else {
         const message = data.choices[0].message;
         reply.content = message.content || ''; reply.reasoning = message.reasoning_content || '';
         for (const c of message.tool_calls || []) reply.calls.push({id: c.id, name: c.function.name, arguments: JSON.parse(c.function.arguments)});
-        stats = `finish_reason=${data.choices[0].finish_reason} · prompt ${data.usage.prompt_tokens} (${data.usage.prompt_tokens_details.cached_tokens} cached) · completion ${data.usage.completion_tokens}` + speed(data.timings);
+        stats = `finish_reason=${data.choices[0].finish_reason} · prompt ${openaiPrompt(data.usage)} · completion ${data.usage.completion_tokens}` + speed(data.timings);
       }
     } else {
       const partial = {};
@@ -350,7 +350,7 @@ async function send() {
           } else if (data.type === 'content_block_stop' && partial[data.index]) {
             const p = partial[data.index];
             reply.calls.push({id: p.id, name: p.name, arguments: JSON.parse(p.json || '{}')});
-          } else if (data.type === 'message_start') stats = `input ${data.message.usage.input_tokens} (+${data.message.usage.cache_read_input_tokens} cached)`;
+          } else if (data.type === 'message_start') stats = `input ${anthropicInput(data.message.usage)}`;
           else if (data.type === 'message_delta') stats += ` · output ${data.usage.output_tokens} · stop_reason=${data.delta.stop_reason}`;
         } else {
           const choice = data.choices[0];
@@ -360,7 +360,7 @@ async function send() {
             if (d.content) reply.content += d.content;
             for (const c of d.tool_calls || []) reply.calls.push({id: c.id, name: c.function.name, arguments: JSON.parse(c.function.arguments)});
             if (choice.finish_reason) stats = `finish_reason=${choice.finish_reason}` + speed(data.timings);
-          } else if (data.usage) stats += ` · prompt ${data.usage.prompt_tokens} (${data.usage.prompt_tokens_details.cached_tokens} cached) · completion ${data.usage.completion_tokens}`;
+          } else if (data.usage) stats += ` · prompt ${openaiPrompt(data.usage)} · completion ${data.usage.completion_tokens}`;
         }
         render();
       });
@@ -377,6 +377,14 @@ async function send() {
     (key === 'url' || key === 'data') ? `<${value.length} characters of image data>` : value));
   $('chatraw').textContent = '// request\n' + pretty(shown) + '\n\n// response\n' + pretty(raw);
   $('send').disabled = false; $('abort').disabled = true; controller = null;
+}
+// Cache usage as each API reports it.
+function anthropicInput(u) {
+  return `${u.input_tokens} (+${u.cache_read_input_tokens} cache read, +${u.cache_creation_input_tokens} cache write)`;
+}
+function openaiPrompt(u) {
+  const d = u.prompt_tokens_details || {};
+  return `${u.prompt_tokens} (${d.cached_tokens || 0} cached, ${d.cache_write_tokens || 0} cache write)`;
 }
 const speed = t => t && t.predicted_per_second ? ` · ${t.predicted_per_second.toFixed(1)} tok/s` : '';
 $('send').onclick = send;

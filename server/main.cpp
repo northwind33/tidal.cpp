@@ -43,7 +43,7 @@ int main(int argc, char ** argv) {
         Args args(argc, argv, vision_options(prefill_options({"--help", "--model", "--host", "--port", "--alias", "--api-key", "--backend",
             "--device", "--threads", "--context", "--draft-tokens", "--mtp", "--thinking", "--chat-template", "--n-predict",
             "--webui", "--sampler", "--temp", "--top-k", "--top-p", "--min-p", "--repeat-penalty", "--frequency-penalty",
-            "--presence-penalty", "--penalty-last-n", "--seed"})));
+            "--presence-penalty", "--penalty-last-n", "--seed", "--cache-min-tokens", "--cache-snapshots"})));
         if (!args.get("--help").empty()) {
             std::cout <<
                 "tidal-server --model MODEL.gguf [--host 127.0.0.1] [--port 8080] [--alias NAME] [--api-key KEY]\n"
@@ -52,10 +52,15 @@ int main(int argc, char ** argv) {
                 "  [--chat-template auto|chatml|qwen35|qwen38] [--n-predict -1] [--webui 1]\n"
                 "  [--sampler device|cpu] [--temp T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R]\n"
                 "  [--frequency-penalty F] [--presence-penalty F] [--penalty-last-n N] [--seed S]\n"
+                "  [--cache-min-tokens 1024] [--cache-snapshots 16]\n"
                 "Serves OpenAI (/v1/chat/completions, /v1/completions, /v1/models), Anthropic (/v1/messages,\n"
                 "/v1/messages/count_tokens) and llama.cpp-style (/completion, /infill, /tokenize, /detokenize,\n"
                 "/apply-template, /props, /slots, /metrics, /health) endpoints, and a test page at /.\n"
                 "One request runs at a time; others wait. The consumed prompt prefix is reused across requests.\n"
+                "Prompt caching follows each API: OpenAI requests cache implicitly and accept prompt_cache_options,\n"
+                "prompt_cache_breakpoint and prompt_cache_key; Anthropic requests cache at cache_control breakpoints\n"
+                "(without any, the reused prefix is reported as read). --cache-min-tokens is the shortest prefix a\n"
+                "breakpoint caches; --cache-snapshots bounds the engine snapshots pinned for live cache entries.\n"
                 "--context bounds the sequence (prompt plus reply); it defaults to the model's capacity.\n"
                 "Sampling flags set the defaults of requests that do not give a value; unset flags use the\n"
                 "model's GGUF sampling metadata, then temperature 0.8, top-k 40, top-p 0.95, min-p 0.05.\n"
@@ -89,12 +94,16 @@ int main(int argc, char ** argv) {
             if (mtp != "mtp") options.mtp_model = mtp;
         } else if (!args.get("--mtp").empty()) throw std::invalid_argument("--mtp requires --draft-tokens");
         runtime_config.chat_template = args.get("--chat-template", "auto");
+        runtime_config.cache_snapshots = args.integer("--cache-snapshots", 16);
+        if (runtime_config.cache_snapshots < 0) throw std::invalid_argument("--cache-snapshots must not be negative");
         ChatFormat("", runtime_config.chat_template); // Rejects an unknown name before the model loads.
 
         AppConfig app_config;
         app_config.alias = args.get("--alias");
         app_config.api_key = args.get("--api-key");
         app_config.max_tokens = args.integer("--n-predict", -1);
+        app_config.cache_min_tokens = args.integer("--cache-min-tokens", 1024);
+        if (app_config.cache_min_tokens < 1) throw std::invalid_argument("--cache-min-tokens must be at least 1");
         const auto webui = args.integer("--webui", 1);
         if (webui != 0 && webui != 1) throw std::invalid_argument("--webui must be 0 or 1");
         app_config.webui = webui != 0;

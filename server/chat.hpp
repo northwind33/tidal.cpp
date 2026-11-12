@@ -6,6 +6,7 @@
 // stored in the GGUF; anything else falls back to plain ChatML.
 #include "json.hpp"
 
+#include <algorithm>
 #include <optional>
 #include <string>
 #include <vector>
@@ -33,8 +34,26 @@ struct ChatOptions {
     std::string forced_tool;
 };
 
+// Where a message's content landed in the rendered text: the emitted part of
+// Message::content is the contiguous range [source, source + length) of it,
+// written at text offset `begin`. `calls` holds the text offset just after
+// each rendered tool call.
+struct RenderedMessage {
+    size_t begin = 0, source = 0, length = 0;
+    std::vector<size_t> calls;
+    bool rendered = false;
+    // Text offset of the end of `content`'s first `offset` bytes, clamped to the emitted range.
+    size_t at(size_t offset) const {
+        return begin + (offset <= source ? 0 : std::min(offset - source, length));
+    }
+    size_t end() const { return calls.empty() ? begin + length : calls.back(); }
+};
+
 struct ChatPrompt {
     std::string text;
+    // Per input message (same order), and the text offset just after each tool definition.
+    std::vector<RenderedMessage> layout;
+    std::vector<size_t> tools;
     bool thinking = false; // The prompt ends inside an open <think> block.
     // Text the prompt already contains that belongs to the reply's structure
     // (a forced tool call opening); the output parser consumes it first.

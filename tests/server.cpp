@@ -1,7 +1,9 @@
 // Unit tests of the server's text layer: JSON, tokenizer, chat prompt and
-// output parsing. The HTTP API is covered by tests/test_server.py.
+// output parsing, and the prompt-cache accounting. The HTTP API is covered by
+// tests/test_server.py.
 #include "chat.hpp"
 #include "json.hpp"
+#include "prompt_cache.hpp"
 #include "tokenizer.hpp"
 
 #include "gguf.h"
@@ -209,6 +211,21 @@ static void test_render() {
     require(prompt.text.rfind("<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
             "{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", "
             "\"properties\": {\"city\": {\"type\": \"string\"}}}}}\n</tools>\n\nIf you choose", 0) == 0, "tool schema rendering");
+    // The layout locates every message's content, each tool definition and each call in the text.
+    require(prompt.layout.size() == tools_turn.size() && prompt.tools.size() == 1, "layout entries");
+    require(prompt.text.substr(0, prompt.tools[0]).ends_with("\"string\"}}}}}"), "tool definition end");
+    for (size_t i = 0; i < tools_turn.size(); ++i) {
+        const auto & entry = prompt.layout[i];
+        require(entry.rendered && prompt.text.substr(entry.begin, entry.length) == tools_turn[i].content.substr(entry.source, entry.length),
+                "layout of message " + std::to_string(i));
+        require(entry.at(tools_turn[i].content.size()) == entry.begin + entry.length && entry.at(0) == entry.begin, "layout clamps");
+    }
+    require(prompt.layout[2].calls.size() == 1 && prompt.text.substr(0, prompt.layout[2].calls[0]).ends_with("</tool_call>"), "call end");
+    {
+        const std::vector<Message> padded = {{"user", "  spaced  ", std::nullopt, {}}};
+        const auto p = chatml.render(padded, {});
+        require(p.layout[0].source == 2 && p.layout[0].length == 6 && p.text.substr(p.layout[0].at(6), 4) == "ed<|", "trimmed layout");
+    }
     // The older template writes scalars as Python does.
     require(v35.render(tools_turn, with_tools).text.find("<parameter=flag>\nFalse\n</parameter>") != std::string::npos, "qwen35 scalar arguments");
 
@@ -305,6 +322,99 @@ static void test_parser() {
     require(delta.tool_calls.size() == 1 && delta.tool_calls[0].name == "f" && forced.finish().empty(), "forced call");
 }
 
+static void test_cache() {
+    using std::chrono::seconds;
+    std::vector<int32_t> tokens(6000);
+    for (size_t i = 0; i < tokens.size(); ++i) tokens[i] = int32_t(i % 97);
+    const auto hashes = prefix_hashes(tokens, {});
+    const auto t0 = CacheClock::time_point{} + std::chrono::hours(1000);
+    const auto plan = [](std::string space, std::vector<int> lookups, std::vector<CacheWrite> writes, bool openai) {
+        CachePlan p;
+        p.enabled = true; p.space = std::move(space); p.lookups = std::move(lookups); p.writes = std::move(writes);
+        p.upgrade = openai; p.read_ttl = openai ? 1800 : 0;
+        return p;
+    };
+    const int all = int(tokens.size());
+
+    // Anthropic: a 5-minute entry is read while alive, each read renews it, and it expires after 5 idle minutes.
+    {
+        CacheLedger ledger;
+        const auto p = plan("a", {100}, {{100, 300}}, false);
+        auto u = ledger.account(p, hashes, all, t0);
+        require(u.read == 0 && u.written_for(300) == 100 && u.written_total() == 100, "anthropic: first request writes");
+        u = ledger.account(p, hashes, all, t0 + seconds(299));
+        require(u.read == 100 && u.written_total() == 0, "anthropic: read within the lifetime");
+        u = ledger.account(p, hashes, all, t0 + seconds(598));
+        require(u.read == 100, "anthropic: a read renews the lifetime");
+        u = ledger.account(p, hashes, all, t0 + seconds(898) + seconds(1));
+        require(u.read == 0 && u.written_for(300) == 100, "anthropic: an idle entry expires");
+        // Not reused by the engine: not a read, and the write is billed again.
+        u = ledger.account(p, hashes, 50, t0 + seconds(900));
+        require(u.read == 0 && u.written_for(300) == 100, "anthropic: reads are limited to the reused prefix");
+        // Lookback: a later breakpoint reads the earlier entry and writes only past it.
+        u = ledger.account(plan("a", {100, 250}, {{250, 300}}, false), hashes, all, t0 + seconds(901));
+        require(u.read == 100 && u.written_for(300) == 150, "anthropic: writes bill only past the hit");
+        // Mixed lifetimes: each segment is billed at its breakpoint's lifetime.
+        u = ledger.account(plan("a", {400, 500}, {{400, 3600}, {500, 300}}, false), hashes, all, t0 + seconds(902));
+        require(u.read == 0 && u.written_for(3600) == 400 && u.written_for(300) == 100, "anthropic: mixed lifetimes");
+        // A disabled plan reports the physical reuse.
+        CachePlan off;
+        require(ledger.account(off, hashes, 77, t0).read == 77 && ledger.account(off, hashes, 77, t0).written_total() == 0, "disabled plan");
+    }
+    // OpenAI's billing table for overlapping writes and lifetime changes.
+    {
+        CacheLedger ledger;
+        auto u = ledger.account(plan("x", {2000, 5000}, {{2000, 43200}, {5000, 1800}}, true), hashes, all, t0);
+        require(u.read == 0 && u.written_for(1800) == 3000 && u.written_for(43200) == 2000, "openai: 12h at 2000, then 30m at 5000");
+    }
+    {
+        CacheLedger ledger;
+        auto u = ledger.account(plan("x", {2000, 5000}, {{2000, 1800}, {5000, 43200}}, true), hashes, all, t0);
+        require(u.read == 0 && u.written_for(1800) == 0 && u.written_for(43200) == 5000, "openai: 30m at 2000, then 12h at 5000");
+    }
+    {
+        CacheLedger ledger;
+        ledger.account(plan("x", {2000}, {{2000, 1800}}, true), hashes, all, t0);
+        auto u = ledger.account(plan("x", {2000, 5000}, {{5000, 43200}}, true), hashes, all, t0 + seconds(10));
+        require(u.read == 0 && u.written_for(43200) == 5000, "openai: upgrading 30-minute coverage to 12 hours is a write");
+    }
+    {
+        CacheLedger ledger;
+        ledger.account(plan("x", {2000}, {{2000, 43200}}, true), hashes, all, t0);
+        auto u = ledger.account(plan("x", {2000, 5000}, {{5000, 1800}}, true), hashes, all, t0 + seconds(10));
+        require(u.read == 2000 && u.written_for(1800) == 3000, "openai: valid 12-hour coverage is read");
+        // Reads keep 30 minutes from the read; the 12-hour entry outlives that.
+        u = ledger.account(plan("x", {2000}, {{2000, 1800}}, true), hashes, all, t0 + std::chrono::hours(11));
+        require(u.read == 2000, "openai: a 12-hour entry is still read after 11 hours");
+        // Namespaces (prompt_cache_key) do not share entries.
+        u = ledger.account(plan("y", {2000}, {{2000, 1800}}, true), hashes, all, t0 + std::chrono::hours(11));
+        require(u.read == 0 && u.written_for(1800) == 2000, "openai: keys separate cache entries");
+        // A 30-minute entry lapses after 30 idle minutes.
+        u = ledger.account(plan("y", {2000}, {{2000, 1800}}, true), hashes, all, t0 + std::chrono::hours(11) + seconds(1801));
+        require(u.read == 0 && u.written_for(1800) == 2000, "openai: 30-minute entries expire");
+        // A different prefix with the same length is a different entry.
+        auto other = tokens;
+        other[5] = 96;
+        u = ledger.account(plan("y", {2000}, {{2000, 1800}}, true), prefix_hashes(other, {}), all, t0 + std::chrono::hours(11) + seconds(1802));
+        require(u.read == 0, "openai: entries are keyed by content");
+        // Lookups without writes (explicit mode without breakpoints) read nothing.
+        u = ledger.account(plan("y", {}, {}, true), hashes, all, t0 + std::chrono::hours(11) + seconds(1803));
+        require(u.read == 0 && u.written_total() == 0, "openai: no breakpoints, no caching");
+    }
+    // Positions to pin: most recently used first, distinct.
+    {
+        CacheLedger ledger;
+        ledger.account(plan("a", {}, {{10, 300}}, false), hashes, all, t0);
+        ledger.account(plan("a", {}, {{20, 300}}, false), hashes, all, t0 + seconds(1));
+        ledger.account(plan("b", {}, {{20, 300}}, false), hashes, all, t0 + seconds(2));
+        const auto positions = ledger.positions(8);
+        require(positions == std::vector<int>({20, 10}), "pinned positions");
+        require(ledger.positions(1) == std::vector<int>({20}), "pinned position limit");
+        ledger.sweep(t0 + seconds(400));
+        require(ledger.size() == 0, "sweep drops expired entries");
+    }
+}
+
 int main() {
     const auto directory = std::filesystem::temp_directory_path() / ("tidal-server-test-" + std::to_string(::getpid()));
     try {
@@ -314,6 +424,7 @@ int main() {
         test_tokenizer(directory);
         test_render();
         test_parser();
+        test_cache();
         std::filesystem::remove_all(directory);
         std::cout << "server text tests passed\n";
         return 0;

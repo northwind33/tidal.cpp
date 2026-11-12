@@ -2,6 +2,7 @@
 // The model runtime behind the HTTP handlers: one engine with one sequence,
 // used from a single worker thread. Requests queue and run one at a time.
 #include "chat.hpp"
+#include "prompt_cache.hpp"
 #include "tokenizer.hpp"
 #include "tidal/tidal.hpp"
 
@@ -39,6 +40,7 @@ struct GenerationParams {
     bool logprobs = false;
     int top_logprobs = 0;
     bool render_special = false;    // Include control tokens in the text.
+    CachePlan cache;                // API cache semantics; disabled reports the physical reuse.
 };
 
 enum class StopType { None, Eos, Limit, Word, Cancelled };
@@ -48,15 +50,16 @@ struct GenerationResult {
     std::vector<GeneratedToken> tokens;
     StopType stop = StopType::None;
     std::string stopping_word;
-    int prompt_tokens = 0, cached_tokens = 0, images_encoded = 0;
+    int prompt_tokens = 0, cached_tokens = 0, images_encoded = 0; // cached_tokens: physically reused.
+    CacheUsage cache;               // Reads and writes as the request's API reports them.
     double prompt_ms = 0, generation_ms = 0;
 };
 
 struct GenerationCallbacks {
     // The request reached the engine; nothing has been evaluated yet.
     std::function<void()> on_start;
-    // The prompt is evaluated: its token count and how many were reused.
-    std::function<void(int, int)> on_prompt;
+    // The prompt is evaluated: the result's prompt and cache fields are set.
+    std::function<void(const GenerationResult &)> on_prompt;
     // Newly released text with the tokens generated since the last call.
     // Returning false cancels the generation.
     std::function<bool(std::string_view, const std::vector<GeneratedToken> &)> on_text;
@@ -75,10 +78,13 @@ struct RuntimeConfig {
     Options options;
     int draft_tokens = 0;       // Speculative decoding with MTP drafts.
     std::string chat_template;  // auto | chatml | qwen35 | qwen38
+    int cache_snapshots = 16;   // Snapshots kept pinned for live cache entries.
 };
 
 struct Metrics {
     uint64_t requests = 0, prompt_tokens = 0, cached_tokens = 0, generated_tokens = 0, images = 0;
+    uint64_t cache_read_tokens = 0, cache_write_tokens = 0; // As reported to clients.
+    uint64_t cache_entries = 0, cache_snapshots = 0, cache_snapshot_bytes = 0;
     double prompt_seconds = 0, generation_seconds = 0;
 };
 
@@ -114,7 +120,7 @@ public:
                               const GenerationCallbacks & callbacks) {
         return generate(Prompt{prompt, {}}, params, callbacks);
     }
-    // Drops the cached sequence and its snapshots.
+    // Drops the cached sequence, its snapshots and all cache entries.
     void erase();
     // Asks a running generation to stop; later requests are rejected.
     void shutdown();
@@ -145,6 +151,7 @@ private:
     std::condition_variable wake_;
     std::deque<std::packaged_task<void()>> jobs_;
     Metrics metrics_;
+    CacheLedger ledger_; // Worker thread only.
     std::thread worker_;
 
     void work();

@@ -13,6 +13,21 @@
 namespace tidal::server {
 
 struct App::ChatTask {
+    // The end of a content block of the request, mapped to a prompt position by prepare().
+    struct Block {
+        enum class At { None, Tool, Content, Call } at = At::None;
+        size_t index = 0;      // Tool: rendered tool number; Content and Call: message number.
+        size_t offset = 0;     // Content: bytes of the message content through the block; Call: call number.
+        int ttl = 0;           // Lifetime in seconds of an explicit breakpoint on the block, 0 without one.
+        bool cacheable = true; // Anthropic: may take the automatic breakpoint.
+        int run = -1;          // Anthropic: run of tool_use or tool_result blocks, one lookback position.
+        // OpenAI: message endings that can take the implicit breakpoint.
+        enum class End { None, User, Tool, Developer } end = End::None;
+        int position = 0;
+    };
+    std::vector<Block> blocks;
+    bool openai_explicit = false;  // prompt_cache_options.mode == "explicit"
+    std::string cache_key;         // prompt_cache_key
     std::string model;
     std::vector<Message> messages;
     ChatOptions options;
@@ -150,23 +165,29 @@ std::shared_ptr<const Image> image_part(const Json & part) {
 // Message content: a string, null, or an array of text and image parts. Text
 // parts are joined with `separator`; each image becomes the chat template's
 // image marker and is appended to `images` (null rejects images).
-std::string content_text(const Json & content, const char * separator = "", Images * images = nullptr) {
+// A content part and the length of the joined text through it.
+struct PartEnd { const Json * part; size_t end; };
+std::string content_text(const Json & content, const char * separator = "", Images * images = nullptr,
+                         std::vector<PartEnd> * ends = nullptr) {
     if (content.is_null()) return {};
     if (content.is_string()) return content.string();
     if (!content.is_array()) throw invalid_request("Message content must be a string or an array of content parts");
     std::string out;
     bool first = true;
     for (const auto & part : content.items()) {
-        if (part.is_string()) { if (!first) out += separator; out += part.string(); first = false; continue; }
-        const auto type = part.at("type").is_string() ? part.at("type").string() : std::string();
-        if ((type == "text" || type.empty()) && part.at("text").is_string()) {
-            if (!first) out += separator;
-            out += part.at("text").string(); first = false;
-        } else if (auto image = image_part(part)) {
-            if (!images) throw invalid_request("Images are not allowed in this message");
-            images->push_back(std::move(image));
-            out += image_marker;
-        } else throw invalid_request("Unsupported content part '" + type + "': this server accepts text and images");
+        if (part.is_string()) { if (!first) out += separator; out += part.string(); first = false; }
+        else {
+            const auto type = part.at("type").is_string() ? part.at("type").string() : std::string();
+            if ((type == "text" || type.empty()) && part.at("text").is_string()) {
+                if (!first) out += separator;
+                out += part.at("text").string(); first = false;
+            } else if (auto image = image_part(part)) {
+                if (!images) throw invalid_request("Images are not allowed in this message");
+                images->push_back(std::move(image));
+                out += image_marker;
+            } else throw invalid_request("Unsupported content part '" + type + "': this server accepts text and images");
+        }
+        if (ends) ends->push_back({&part, out.size()});
     }
     return out;
 }
@@ -183,11 +204,16 @@ Json timings(const GenerationResult & r) {
 Json openai_usage(const GenerationResult & r) {
     return Json::object({{"prompt_tokens", r.prompt_tokens}, {"completion_tokens", int(r.tokens.size())},
         {"total_tokens", r.prompt_tokens + int(r.tokens.size())},
-        {"prompt_tokens_details", Json::object({{"cached_tokens", r.cached_tokens}})}});
+        {"prompt_tokens_details", Json::object({{"cached_tokens", r.cache.read}, {"cache_write_tokens", r.cache.written_total()}})}});
 }
+constexpr int five_minutes = 300, one_hour = 3600, thirty_minutes = 1800, twelve_hours = 43200;
 Json anthropic_usage(const GenerationResult & r) {
-    return Json::object({{"input_tokens", r.prompt_tokens - r.cached_tokens}, {"cache_creation_input_tokens", 0},
-        {"cache_read_input_tokens", r.cached_tokens}, {"output_tokens", int(r.tokens.size())}});
+    const int created = r.cache.written_total();
+    return Json::object({{"input_tokens", r.prompt_tokens - r.cache.read - created}, {"cache_creation_input_tokens", created},
+        {"cache_read_input_tokens", r.cache.read},
+        {"cache_creation", Json::object({{"ephemeral_5m_input_tokens", r.cache.written_for(five_minutes)},
+                                         {"ephemeral_1h_input_tokens", r.cache.written_for(one_hour)}})},
+        {"output_tokens", int(r.tokens.size())}});
 }
 Json bytes_json(std::string_view bytes) {
     Json out = Json::array();
@@ -371,6 +397,50 @@ void App::prepare(ChatTask & task) const {
     task.prompt = runtime_.chat().render(task.messages, task.options);
     task.input = tokenize_with_images(task.prompt.text, task.images);
     task.tokens = task.input.tokens;
+    if (task.blocks.empty()) return;
+
+    // Text offset of each block's end, then the number of prompt tokens that
+    // lie entirely before it.
+    const auto & prompt = task.prompt;
+    const auto offset = [&](const ChatTask::Block & block) -> std::optional<size_t> {
+        using At = ChatTask::Block::At;
+        if (block.at == At::Tool) {
+            if (block.index < prompt.tools.size()) return prompt.tools[block.index];
+        } else if (block.at != At::None && block.index < prompt.layout.size() && prompt.layout[block.index].rendered) {
+            const auto & message = prompt.layout[block.index];
+            if (block.at == At::Content) return message.at(block.offset);
+            if (block.offset < message.calls.size()) return message.calls[block.offset];
+        }
+        return std::nullopt;
+    };
+    // ends[i]: text bytes covered by tokens 0..i. An image's placeholder run
+    // stands for its <|image_pad|> marker and ends with its last token.
+    const auto & tokenizer = runtime_.tokenizer();
+    std::vector<size_t> ends(task.tokens.size());
+    size_t at = 0, image = 0;
+    for (size_t i = 0; i < task.tokens.size(); ++i) {
+        if (image < task.input.images.size() && size_t(task.input.images[image].offset) == i) {
+            const int32_t pad = task.tokens[i];
+            while (i + 1 < task.tokens.size() && task.tokens[i + 1] == pad) ends[i++] = at;
+            at += std::string_view("<|image_pad|>").size();
+            ++image;
+        } else at += tokenizer.piece(task.tokens[i], true).size();
+        ends[i] = at;
+    }
+    const bool exact = at == prompt.text.size();
+    for (auto & block : task.blocks) {
+        const auto end = offset(block);
+        if (!end) { block.position = 0; continue; }
+        if (exact) block.position = int(std::upper_bound(ends.begin(), ends.end(), *end) - ends.begin());
+        else {
+            // The tokenizer's pieces do not spell the text: tokenize the prefix itself.
+            const auto head = prompt.text.substr(0, *end);
+            size_t count = 0;
+            for (size_t i = 0; (i = head.find("<|image_pad|>", i)) != std::string::npos; i += 13) ++count;
+            const Images used(task.images.begin(), task.images.begin() + long(std::min(count, task.images.size())));
+            block.position = int(tokenize_with_images(head, used).tokens.size());
+        }
+    }
 }
 
 // The text is tokenized between its <|image_pad|> markers, which then expand
@@ -390,10 +460,43 @@ Prompt App::tokenize_with_images(const std::string & text, const std::vector<std
 App::ChatTask App::openai_task(const Json & body) const {
     ChatTask task;
     task.model = text(body, "model").value_or(model_name());
+    // Prompt caching (GPT-5.6 and later semantics).
+    int request_ttl = thirty_minutes;
+    if (const auto * options = present(body, "prompt_cache_options")) {
+        if (!options->is_object()) throw invalid_request("Invalid type for 'prompt_cache_options': expected an object.");
+        if (const auto mode = text(*options, "mode")) {
+            if (*mode != "implicit" && *mode != "explicit")
+                throw invalid_request("Invalid value for 'prompt_cache_options.mode': '" + *mode + "'. Supported values are: 'implicit' and 'explicit'.");
+            task.openai_explicit = *mode == "explicit";
+        }
+        if (const auto ttl = text(*options, "ttl"); ttl && *ttl != "30m")
+            throw invalid_request("Invalid value for 'prompt_cache_options.ttl': '" + *ttl + "'. Supported values are: '30m'.");
+    }
+    if (const auto key = text(body, "prompt_cache_key")) task.cache_key = *key;
+    if (const auto retention = text(body, "prompt_cache_retention"); retention && *retention != "in_memory" && *retention != "24h")
+        throw invalid_request("Invalid value for 'prompt_cache_retention': '" + *retention + "'. Supported values are: 'in_memory' and '24h'.");
+    // The lifetime of a content part's prompt_cache_breakpoint, 0 without one.
+    const auto breakpoint = [&](const Json & part, const std::string & path) {
+        if (!part.is_object()) return 0;
+        const auto * marker = present(part, "prompt_cache_breakpoint");
+        if (!marker) return 0;
+        const std::string where = path + ".prompt_cache_breakpoint";
+        if (!marker->is_object()) throw invalid_request("Invalid type for '" + where + "': expected an object.");
+        if (const auto mode = text(*marker, "mode"); mode && *mode != "explicit")
+            throw invalid_request("Invalid value for '" + where + ".mode': '" + *mode + "'. Supported values are: 'explicit'.");
+        const auto ttl = text(*marker, "ttl");
+        if (!ttl) return request_ttl;
+        if (*ttl == "30m") return thirty_minutes;
+        if (*ttl == "12h") return twelve_hours;
+        throw invalid_request("Invalid value for '" + where + ".ttl': '" + *ttl + "'. Supported values are: '30m' and '12h'.");
+    };
+    using Block = ChatTask::Block;
     const auto * messages = present(body, "messages");
     if (!messages || !messages->is_array() || !messages->size()) throw invalid_request("'messages' must be a non-empty array");
     bool only_system = true;
+    size_t number = 0;
     for (const auto & item : messages->items()) {
+        const std::string path = "messages[" + std::to_string(number++) + "]";
         if (!item.is_object() || !item.at("role").is_string()) throw invalid_request("Each message needs a string 'role'");
         Message message;
         message.role = item.at("role").string();
@@ -401,7 +504,23 @@ App::ChatTask App::openai_task(const Json & body) const {
         if (message.role == "function") message.role = "tool";
         if (message.role != "system" && message.role != "user" && message.role != "assistant" && message.role != "tool")
             throw invalid_request("Unexpected message role '" + message.role + "'");
-        message.content = content_text(item.at("content"), "", message.role == "system" ? nullptr : &task.images);
+        std::vector<PartEnd> ends;
+        message.content = content_text(item.at("content"), "", message.role == "system" ? nullptr : &task.images, &ends);
+        // Several leading system messages become one; the template allows a single one.
+        const bool merge = message.role == "system" && only_system && !task.messages.empty();
+        const size_t index = merge ? task.messages.size() - 1 : task.messages.size();
+        const size_t base = merge ? task.messages.back().content.size() + 2 : 0;
+        if (merge) // Only the end of the whole leading block is an implicit boundary.
+            for (auto & block : task.blocks) if (block.end == Block::End::Developer) block.end = Block::End::None;
+        if (message.role == "tool" && !task.messages.empty() && task.messages.back().role == "tool")
+            for (auto & block : task.blocks) if (block.end == Block::End::Tool) block.end = Block::End::None;
+        for (size_t k = 0; k < ends.size(); ++k)
+            if (const int ttl = breakpoint(*ends[k].part, path + ".content[" + std::to_string(k) + "]"))
+                task.blocks.push_back({Block::At::Content, index, base + ends[k].end, ttl});
+        Block end{Block::At::Content, index, base + message.content.size()};
+        end.end = message.role == "user" ? Block::End::User : message.role == "tool" ? Block::End::Tool
+                : message.role == "system" && only_system ? Block::End::Developer : Block::End::None;
+        if (end.end != Block::End::None) task.blocks.push_back(end);
         if (message.role == "assistant") {
             if (item.at("reasoning_content").is_string()) message.reasoning = item.at("reasoning_content").string();
             if (const auto * calls = present(item, "tool_calls")) {
@@ -423,8 +542,7 @@ App::ChatTask App::openai_task(const Json & body) const {
                 }
             }
         }
-        // Several leading system messages become one; the template allows a single one.
-        if (message.role == "system" && only_system && !task.messages.empty()) {
+        if (merge) {
             task.messages.back().content += "\n\n" + message.content;
             continue;
         }
@@ -491,41 +609,112 @@ App::ChatTask App::openai_task(const Json & body) const {
 App::ChatTask App::anthropic_task(const Json & body, bool counting) const {
     ChatTask task;
     task.model = text(body, "model").value_or(model_name());
+    using Block = ChatTask::Block;
+    // The lifetime of a block's cache_control, 0 without one.
+    const auto cache_ttl = [](const Json & block, const std::string & path) {
+        if (!block.is_object()) return 0;
+        const auto * control = present(block, "cache_control");
+        if (!control) return 0;
+        const std::string where = path.empty() ? std::string("cache_control") : path + ".cache_control";
+        if (!control->is_object()) throw invalid_request(where + ": Input should be a valid dictionary");
+        const auto & type = control->at("type");
+        if (!type.is_string() || type.string() != "ephemeral") throw invalid_request(where + ".type: Input should be 'ephemeral'");
+        const auto * ttl = present(*control, "ttl");
+        if (!ttl) return five_minutes;
+        if (ttl->is_string() && ttl->string() == "5m") return five_minutes;
+        if (ttl->is_string() && ttl->string() == "1h") return one_hour;
+        throw invalid_request(where + ".ephemeral.ttl: Input should be '5m' or '1h'");
+    };
+    // Tools render first, then the system prompt, then the messages; blocks
+    // are recorded in that order.
+    if (const auto * tools = present(body, "tools")) {
+        if (!tools->is_array()) throw invalid_request("tools: must be an array");
+        Json converted = Json::array();
+        size_t number = 0;
+        for (const auto & tool : tools->items()) {
+            const int ttl = cache_ttl(tool, "tools." + std::to_string(number++));
+            // Only client tools carry a schema; server-side tools cannot run here.
+            if (tool.at("name").is_string() && tool.contains("input_schema")) {
+                Json function = Json::object({{"name", tool.at("name")}});
+                if (tool.at("description").is_string()) function["description"] = tool.at("description");
+                function["parameters"] = tool.at("input_schema");
+                converted.push(Json::object({{"type", "function"}, {"function", std::move(function)}}));
+            }
+            // A skipped tool ends where the previous rendered one does.
+            const size_t rendered = converted.size();
+            task.blocks.push_back({rendered ? Block::At::Tool : Block::At::None, rendered ? rendered - 1 : 0, 0, ttl});
+        }
+        if (converted.size()) task.options.tools = std::move(converted);
+    }
     if (const auto * system = present(body, "system")) {
-        const auto content = content_text(*system, "\n\n");
-        if (!content.empty()) task.messages.push_back({"system", content, std::nullopt, {}});
+        std::vector<PartEnd> ends;
+        const auto content = content_text(*system, "\n\n", nullptr, &ends);
+        const bool rendered = !content.empty();
+        for (size_t k = 0; k < ends.size(); ++k) {
+            const std::string path = "system." + std::to_string(k);
+            const auto & part = *ends[k].part;
+            const bool empty = part.is_object() && part.at("text").is_string() && part.at("text").string().empty();
+            const int ttl = cache_ttl(part, path);
+            if (ttl && empty) throw invalid_request(path + ".text: cache_control cannot be set for empty text blocks");
+            Block block{rendered ? Block::At::Content : Block::At::None, 0, ends[k].end, ttl};
+            block.cacheable = !empty;
+            task.blocks.push_back(block);
+        }
+        if (rendered) task.messages.push_back({"system", content, std::nullopt, {}});
     }
     const auto * messages = present(body, "messages");
     if (!messages || !messages->is_array() || !messages->size()) throw invalid_request("messages: Field required");
+    int runs = 0;
+    size_t number = 0;
     for (const auto & item : messages->items()) {
+        const std::string where = "messages." + std::to_string(number++);
         if (!item.is_object() || !item.at("role").is_string()) throw invalid_request("messages: each message needs a role");
         const auto & role = item.at("role").string();
         const auto & content = item.at("content");
         if (role != "user" && role != "assistant") throw invalid_request("messages: role must be user or assistant");
         Message message;
         message.role = role;
-        if (content.is_string()) { message.content = content.string(); task.messages.push_back(std::move(message)); continue; }
+        if (content.is_string()) {
+            message.content = content.string();
+            Block block{Block::At::Content, task.messages.size(), message.content.size()};
+            block.cacheable = !message.content.empty();
+            task.blocks.push_back(block);
+            task.messages.push_back(std::move(message));
+            continue;
+        }
         if (!content.is_array()) throw invalid_request("messages: content must be a string or an array of blocks");
         bool any = false, after_text = false;
         const auto flush = [&] {
             if (any) task.messages.push_back(std::move(message));
             message = Message(); message.role = role; any = false; after_text = false;
         };
+        std::string previous; // Type of the previous block of this message.
+        size_t index = 0;
         for (const auto & block : content.items()) {
+            const std::string path = where + ".content." + std::to_string(index++);
             const auto type = block.at("type").is_string() ? block.at("type").string() : std::string();
+            Block mark{Block::At::Content, task.messages.size()};
+            int ttl = 0;
+            if (type == "thinking" || type == "redacted_thinking") {
+                if (present(block, "cache_control")) throw invalid_request(path + "." + type + ".cache_control: Extra inputs are not permitted");
+            } else ttl = cache_ttl(block, path);
             if (type == "text" && block.at("text").is_string()) {
+                const auto & value = block.at("text").string();
+                if (ttl && value.empty()) throw invalid_request(path + ".text: cache_control cannot be set for empty text blocks");
                 // Consecutive user text blocks are separate lines; an image
                 // marker joins the following text directly, as content parts do.
                 if (after_text && role == "user") message.content += "\n";
-                message.content += block.at("text").string(); any = true; after_text = true;
+                message.content += value; any = true; after_text = true;
+                mark.offset = message.content.size(); mark.cacheable = !value.empty();
             } else if (type == "image") {
                 task.images.push_back(image_part(block));
                 message.content += image_marker; any = true; after_text = false;
-            } else if (type == "thinking" && role == "assistant") {
-                if (block.at("thinking").is_string()) message.reasoning = message.reasoning.value_or("") + block.at("thinking").string();
+                mark.offset = message.content.size();
+            } else if ((type == "thinking" || type == "redacted_thinking") && role == "assistant") {
+                if (type == "thinking" && block.at("thinking").is_string())
+                    message.reasoning = message.reasoning.value_or("") + block.at("thinking").string();
                 any = true;
-            } else if (type == "redacted_thinking" && role == "assistant") {
-                any = true;
+                mark.at = Block::At::None; mark.cacheable = false;
             } else if (type == "tool_use" && role == "assistant") {
                 if (!block.at("name").is_string()) throw invalid_request("messages: tool_use needs a name");
                 ToolCall call;
@@ -533,27 +722,49 @@ App::ChatTask App::anthropic_task(const Json & body, bool counting) const {
                 if (block.at("id").is_string()) call.id = block.at("id").string();
                 if (block.at("input").is_object()) call.arguments = block.at("input");
                 message.tool_calls.push_back(std::move(call)); any = true;
+                mark.at = Block::At::Call; mark.offset = message.tool_calls.size() - 1;
+                mark.run = previous == type ? runs : ++runs;
             } else if (type == "tool_result" && role == "user") {
                 flush();
-                std::string result = content_text(block.at("content"), "\n", &task.images);
+                std::vector<PartEnd> ends;
+                std::string result = content_text(block.at("content"), "\n", &task.images, &ends);
+                mark.index = task.messages.size();
+                for (size_t k = 0; k < ends.size(); ++k)
+                    if (const int nested = cache_ttl(*ends[k].part, path + ".content." + std::to_string(k)))
+                        task.blocks.push_back({Block::At::Content, mark.index, ends[k].end, nested});
+                mark.offset = result.size();
+                mark.run = previous == type ? runs : ++runs;
                 task.messages.push_back({"tool", std::move(result), std::nullopt, {}});
             } else throw invalid_request("messages: unsupported content block '" + type + "' (this server accepts text, image, thinking and tool blocks)");
+            mark.ttl = ttl;
+            task.blocks.push_back(mark);
+            previous = type;
         }
         flush();
     }
-    if (const auto * tools = present(body, "tools")) {
-        if (!tools->is_array()) throw invalid_request("tools: must be an array");
-        Json converted = Json::array();
-        for (const auto & tool : tools->items()) {
-            // Only client tools carry a schema; server-side tools cannot run here.
-            if (!tool.at("name").is_string() || !tool.contains("input_schema")) continue;
-            Json function = Json::object({{"name", tool.at("name")}});
-            if (tool.at("description").is_string()) function["description"] = tool.at("description");
-            function["parameters"] = tool.at("input_schema");
-            converted.push(Json::object({{"type", "function"}, {"function", std::move(function)}}));
+    // A top-level cache_control places a breakpoint on the last block that can take one.
+    if (present(body, "cache_control")) {
+        const int ttl = cache_ttl(body, "");
+        for (size_t k = task.blocks.size(); k-- > 0;) {
+            auto & block = task.blocks[k];
+            if (!block.cacheable || block.at == Block::At::None) continue;
+            if (block.ttl && block.ttl != ttl)
+                throw invalid_request("cache_control: the automatic breakpoint falls on the last cacheable block, whose own "
+                                      "cache_control has a different ttl");
+            if (!block.ttl) block.ttl = ttl;
+            break;
         }
-        if (converted.size()) task.options.tools = std::move(converted);
     }
+    int count = 0, shortest = 0;
+    for (const auto & block : task.blocks) {
+        if (!block.ttl) continue;
+        ++count;
+        if (shortest && block.ttl > shortest)
+            throw invalid_request("a ttl='1h' cache_control block must not come after a ttl='5m' cache_control block. "
+                                  "Note that blocks are processed in the following order: `tools`, `system`, `messages`.");
+        shortest = shortest ? std::min(shortest, block.ttl) : block.ttl;
+    }
+    if (count > 4) throw invalid_request("A maximum of 4 blocks with cache_control may be provided. Found " + std::to_string(count) + ".");
     if (const auto * choice = present(body, "tool_choice")) {
         const auto type = choice->at("type").is_string() ? choice->at("type").string() : std::string();
         if (type == "none") task.options.tools = Json();
@@ -564,8 +775,11 @@ App::ChatTask App::anthropic_task(const Json & body, bool counting) const {
     }
     // Without a `thinking` field the Messages API does not think.
     task.options.enable_thinking = false;
-    if (const auto * thinking = present(body, "thinking"); thinking && thinking->at("type").is_string())
-        task.options.enable_thinking = thinking->at("type").string() != "disabled";
+    std::string thinking_type;
+    if (const auto * thinking = present(body, "thinking"); thinking && thinking->at("type").is_string()) {
+        thinking_type = thinking->at("type").string();
+        task.options.enable_thinking = thinking_type != "disabled";
+    }
     if (const auto * output = present(body, "output_config"))
         if (const auto value = text(*output, "effort"))
             task.options.reasoning_effort = *value == "low" ? "low" : *value == "medium" ? "medium" : "xhigh";
@@ -576,11 +790,80 @@ App::ChatTask App::anthropic_task(const Json & body, bool counting) const {
     if (!max_tokens && !counting) throw invalid_request("max_tokens: Field required");
     task.params.max_tokens = int(std::clamp<int64_t>(max_tokens.value_or(0), 0, 1 << 30));
     task.stream = boolean(body, "stream").value_or(false);
+    // max_tokens 0 only evaluates the prompt, which pre-warms the cache.
+    if (max_tokens && *max_tokens == 0 && !counting) {
+        if (task.stream) throw invalid_request("max_tokens: 0 is not supported with stream: true");
+        if (thinking_type == "enabled") throw invalid_request("max_tokens: 0 is not supported with thinking type 'enabled'");
+        if (const auto * choice = present(body, "tool_choice"); choice && choice->at("type").is_string() &&
+            (choice->at("type").string() == "any" || choice->at("type").string() == "tool"))
+            throw invalid_request("max_tokens: 0 is not supported with tool_choice type '" + choice->at("type").string() + "'");
+    }
     return task;
 }
 
+// OpenAI (GPT-5.6 and later): an implicit breakpoint at the end of the latest
+// eligible message unless the mode is explicit; up to four writes per
+// request; lookups at the first 2 and latest 50 explicit breakpoints and, in
+// implicit mode, the implicit breakpoint, up to 20 earlier eligible message
+// endings and the end of the leading developer messages.
+CachePlan App::openai_cache(const ChatTask & task) const {
+    using Block = ChatTask::Block;
+    CachePlan plan;
+    plan.enabled = true;
+    plan.space = "openai:" + task.cache_key;
+    plan.upgrade = true;
+    plan.read_ttl = thirty_minutes;
+    std::vector<const Block *> marked, endings;
+    const Block * developer = nullptr;
+    for (const auto & block : task.blocks) {
+        if (block.position <= 0) continue;
+        if (block.ttl) marked.push_back(&block);
+        if (block.end != Block::End::None) endings.push_back(&block);
+        if (block.end == Block::End::Developer) developer = &block;
+    }
+    const int minimum = std::max(config_.cache_min_tokens, 1);
+    std::vector<const Block *> writable;
+    for (const auto * block : marked) if (block->position >= minimum) writable.push_back(block);
+    const size_t explicit_writes = task.openai_explicit ? 4 : 3;
+    for (size_t k = writable.size() > explicit_writes ? writable.size() - explicit_writes : 0; k < writable.size(); ++k)
+        plan.writes.push_back({writable[k]->position, writable[k]->ttl});
+    for (size_t k = 0; k < marked.size(); ++k)
+        if (k < 2 || k + 50 >= marked.size()) plan.lookups.push_back(marked[k]->position);
+    if (!task.openai_explicit && !endings.empty()) {
+        const int implicit = endings.back()->position;
+        if (implicit >= minimum) plan.writes.push_back({implicit, thirty_minutes});
+        for (size_t k = endings.size(), taken = 0; k-- > 0 && taken <= 20; ++taken) plan.lookups.push_back(endings[k]->position);
+        if (developer) plan.lookups.push_back(developer->position);
+    }
+    return plan;
+}
+
+// Anthropic: breakpoints are the blocks with cache_control (including the
+// automatic one); each writes an entry when its prefix reaches the minimum
+// length, and each looks for an earlier entry over at most 20 block positions
+// before it (a run of tool_use or tool_result blocks is one position).
+// Without any breakpoint the request reports the physical reuse as before.
+CachePlan App::anthropic_cache(const ChatTask & task) const {
+    using Block = ChatTask::Block;
+    CachePlan plan;
+    plan.space = "anthropic";
+    const int minimum = std::max(config_.cache_min_tokens, 1);
+    const auto & blocks = task.blocks;
+    for (size_t j = 0; j < blocks.size(); ++j) {
+        if (!blocks[j].ttl) continue;
+        plan.enabled = true;
+        if (blocks[j].position >= minimum) plan.writes.push_back({blocks[j].position, blocks[j].ttl});
+        int steps = 0;
+        for (size_t k = j + 1; k-- > 0;) {
+            if (k < j && !(blocks[k].run >= 0 && blocks[k].run == blocks[k + 1].run) && ++steps > 20) break;
+            if (blocks[k].at != Block::At::None && blocks[k].position > 0) plan.lookups.push_back(blocks[k].position);
+        }
+    }
+    return plan;
+}
+
 App::ChatRun App::run_chat(ChatTask & task, const char * id_prefix, Response & response, std::function<void()> on_start,
-                           std::function<void(int, int)> on_prompt,
+                           std::function<void(const GenerationResult &)> on_prompt,
                            std::function<bool(const ChatDelta &, const std::vector<GeneratedToken> &)> on_delta) {
     ChatRun run;
     ChatParser parser(task.prompt.thinking, &task.options.tools, task.inline_reasoning);
@@ -604,6 +887,7 @@ App::ChatRun App::run_chat(ChatTask & task, const char * id_prefix, Response & r
 void App::chat_completions(const Request & request, Response & response) {
     auto task = openai_task(parse_body(request));
     prepare(task);
+    task.params.cache = openai_cache(task);
     const std::string id = "chatcmpl-" + random_token(24);
     const int64_t created = unix_time();
     const auto finish_reason = [](const ChatRun & run) {
@@ -635,7 +919,7 @@ void App::chat_completions(const Request & request, Response & response) {
     std::vector<GeneratedToken> unreported;
     const auto run = run_chat(task, "call_", response,
         [&] { response.begin(200, "text/event-stream"); },
-        [&](int, int) { sse(response, chunk(Json::object({{"role", "assistant"}, {"content", Json()}}), Json())); },
+        [&](const GenerationResult &) { sse(response, chunk(Json::object({{"role", "assistant"}, {"content", Json()}}), Json())); },
         [&](const ChatDelta & delta, const std::vector<GeneratedToken> & tokens) {
             if (task.params.logprobs) unreported.insert(unreported.end(), tokens.begin(), tokens.end());
             const auto send = [&](Json body) {
@@ -736,6 +1020,7 @@ void App::completions(const Request & request, Response & response) {
 void App::messages(const Request & request, Response & response) {
     auto task = anthropic_task(parse_body(request), false);
     prepare(task);
+    task.params.cache = anthropic_cache(task);
     const std::string id = "msg_" + random_token(24);
     const auto stop_reason = [](const ChatRun & run) {
         return run.result.stop == StopType::Limit ? "max_tokens" : !run.calls.empty() ? "tool_use"
@@ -748,7 +1033,9 @@ void App::messages(const Request & request, Response & response) {
         const auto run = run_chat(task, "toolu_", response, {}, {}, {});
         Json content = Json::array();
         if (!run.reasoning.empty()) content.push(Json::object({{"type", "thinking"}, {"thinking", run.reasoning}, {"signature", ""}}));
-        if (!run.content.empty() || (run.calls.empty() && run.reasoning.empty())) content.push(Json::object({{"type", "text"}, {"text", run.content}}));
+        // A pre-warming request (max_tokens 0) has no content at all.
+        if (!run.content.empty() || (run.calls.empty() && run.reasoning.empty() && task.params.max_tokens != 0))
+            content.push(Json::object({{"type", "text"}, {"text", run.content}}));
         for (const auto & call : run.calls)
             content.push(Json::object({{"type", "tool_use"}, {"id", call.id}, {"name", call.name}, {"input", call.arguments}}));
         send_json(response, 200, Json::object({{"id", id}, {"type", "message"}, {"role", "assistant"}, {"model", task.model},
@@ -775,8 +1062,7 @@ void App::messages(const Request & request, Response & response) {
     };
     const auto run = run_chat(task, "toolu_", response,
         [&] { response.begin(200, "text/event-stream"); sse(response, "ping", Json::object({{"type", "ping"}})); },
-        [&](int prompt, int cached) {
-            GenerationResult usage; usage.prompt_tokens = prompt; usage.cached_tokens = cached;
+        [&](const GenerationResult & usage) {
             sse(response, "message_start", Json::object({{"type", "message_start"}, {"message", Json::object({{"id", id},
                 {"type", "message"}, {"role", "assistant"}, {"model", task.model}, {"content", Json::array()},
                 {"stop_reason", Json()}, {"stop_sequence", Json()}, {"usage", anthropic_usage(usage)}})}}));
@@ -838,7 +1124,7 @@ void App::native_completion(const Request & request, Response & response, bool i
             std::string rendered = text.string();
             for (size_t at = 0; (at = rendered.find(media_marker, at)) != std::string::npos;) {
                 rendered.replace(at, std::string_view(media_marker).size(), image_marker);
-                at += std::string_view(image_marker).size();
+                at += std::string_view("<|image_pad|>").size();
             }
             if (const auto & data = prompt->at("multimodal_data"); data.is_array())
                 for (const auto & item : data.items()) {
@@ -1078,6 +1364,11 @@ void App::metrics(const Request &, Response & response) {
     metric("tidal:requests_total", "counter", "Number of completed generation requests.", double(m.requests));
     metric("tidal:prompt_tokens_cached_total", "counter", "Number of prompt tokens reused from the prompt cache.", double(m.cached_tokens));
     metric("tidal:images_encoded_total", "counter", "Number of images run through the vision tower.", double(m.images));
+    metric("tidal:cache_read_tokens_total", "counter", "Prompt tokens reported to clients as cache reads.", double(m.cache_read_tokens));
+    metric("tidal:cache_write_tokens_total", "counter", "Prompt tokens reported to clients as cache writes.", double(m.cache_write_tokens));
+    metric("tidal:cache_entries", "gauge", "API cache entries as of the last request.", double(m.cache_entries));
+    metric("tidal:cache_snapshots", "gauge", "Engine state snapshots as of the last request.", double(m.cache_snapshots));
+    metric("tidal:cache_snapshot_bytes", "gauge", "Host memory held by engine state snapshots.", double(m.cache_snapshot_bytes));
     response.send(200, "text/plain; version=0.0.4; charset=utf-8", out);
 }
 

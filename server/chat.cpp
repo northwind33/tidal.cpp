@@ -61,6 +61,16 @@ ChatPrompt ChatFormat::render(const std::vector<Message> & all, const ChatOption
     if (all.empty()) throw ChatError("No messages provided.");
     ChatPrompt prompt;
     std::string & out = prompt.text;
+    prompt.layout.resize(all.size());
+    // Appends `part`, a substring of message i's content, and records where it went.
+    const auto emit = [&](size_t i, std::string_view part) {
+        auto & entry = prompt.layout[i];
+        const auto & content = all[i].content;
+        entry.source = part.empty() ? 0 : size_t(part.data() - content.data());
+        if (part.data() < content.data() || entry.source > content.size()) entry.source = 0; // Not a view of the content.
+        entry.begin = out.size(); entry.length = part.size(); entry.rendered = true;
+        out += part;
+    };
     // A trailing assistant message is continued instead of closed.
     const bool resume = options.add_generation_prompt && all.back().role == "assistant" && all.back().tool_calls.empty();
     const size_t count = all.size() - (resume ? 1 : 0);
@@ -72,10 +82,12 @@ ChatPrompt ChatFormat::render(const std::vector<Message> & all, const ChatOption
     if (kind_ == Kind::ChatML) {
         for (size_t i = 0; i < count; ++i) {
             const auto & message = all[i];
-            out += "<|im_start|>" + message.role + "\n" + std::string(trim(message.content)) + "<|im_end|>\n";
+            out += "<|im_start|>" + message.role + "\n";
+            emit(i, trim(message.content));
+            out += "<|im_end|>\n";
         }
         if (options.add_generation_prompt) out += "<|im_start|>assistant\n";
-        if (resume) out += all.back().content;
+        if (resume) emit(all.size() - 1, all.back().content);
         return prompt;
     }
 
@@ -89,20 +101,23 @@ ChatPrompt ChatFormat::render(const std::vector<Message> & all, const ChatOption
             throw ChatError("Unexpected reasoning effort " + effort + ". Supported types are xhigh (default), medium, and low.");
     }
     const bool system = all[0].role == "system";
-    const std::string system_text(system ? trim(all[0].content) : std::string_view());
+    const std::string_view system_text = system ? trim(all[0].content) : std::string_view();
     if (options.tools.is_array() && options.tools.size()) {
         out += "<|im_start|>system\n";
         if (!instructions.empty()) out += instructions + "\n\n";
         out += "# Tools\n\nYou have access to the following functions:\n\n<tools>";
-        for (const auto & tool : options.tools.items()) { out += "\n"; out += tool.dump(true); }
+        for (const auto & tool : options.tools.items()) { out += "\n"; out += tool.dump(true); prompt.tools.push_back(out.size()); }
         out += "\n</tools>";
         out += tool_instructions;
-        if (!system_text.empty()) out += "\n\n" + system_text;
+        if (!system_text.empty()) { out += "\n\n"; emit(0, system_text); }
         out += "<|im_end|>\n";
     } else if (v38) {
-        if (!system_text.empty()) out += "<|im_start|>system\n" + (instructions.empty() ? "" : instructions + "\n\n") + system_text + "<|im_end|>\n";
-        else if (!instructions.empty()) out += "<|im_start|>system\n" + instructions + "<|im_end|>\n";
-    } else if (system) out += "<|im_start|>system\n" + system_text + "<|im_end|>\n";
+        if (!system_text.empty()) {
+            out += "<|im_start|>system\n" + (instructions.empty() ? "" : instructions + "\n\n");
+            emit(0, system_text);
+            out += "<|im_end|>\n";
+        } else if (!instructions.empty()) out += "<|im_start|>system\n" + instructions + "<|im_end|>\n";
+    } else if (system) { out += "<|im_start|>system\n"; emit(0, system_text); out += "<|im_end|>\n"; }
 
     // The last user message that is a query, not a tool response.
     size_t last_query = count - 1;
@@ -116,11 +131,13 @@ ChatPrompt ChatFormat::render(const std::vector<Message> & all, const ChatOption
 
     for (size_t i = 0; i < count; ++i) {
         const auto & message = all[i];
-        std::string content(trim(message.content));
+        std::string_view content = trim(message.content);
         if (message.role == "system") {
             if (i) throw ChatError("System message must be at the beginning.");
         } else if (message.role == "user") {
-            out += "<|im_start|>user\n" + content + "<|im_end|>\n";
+            out += "<|im_start|>user\n";
+            emit(i, content);
+            out += "<|im_end|>\n";
         } else if (message.role == "assistant") {
             std::string reasoning;
             if (message.reasoning) reasoning = *message.reasoning;
@@ -131,15 +148,15 @@ ChatPrompt ChatFormat::render(const std::vector<Message> & all, const ChatOption
                 if (const auto open = head.rfind("<think>"); open != std::string_view::npos) head.remove_prefix(open + 7);
                 while (!head.empty() && head.front() == '\n') head.remove_prefix(1);
                 reasoning = std::string(head);
-                std::string_view tail = std::string_view(content).substr(content.rfind("</think>") + 8);
+                std::string_view tail = content.substr(content.rfind("</think>") + 8);
                 while (!tail.empty() && tail.front() == '\n') tail.remove_prefix(1);
-                content = std::string(tail);
+                content = tail;
             }
             reasoning = std::string(trim(reasoning));
             const bool keep = i > last_query || (v38 && options.preserve_thinking.value_or(true));
             out += "<|im_start|>assistant\n";
             if (keep) out += "<think>\n" + reasoning + "\n</think>\n\n";
-            out += content;
+            emit(i, content);
             for (size_t k = 0; k < message.tool_calls.size(); ++k) {
                 const auto & call = message.tool_calls[k];
                 out += k ? "\n" : trim(content).empty() ? "" : "\n\n";
@@ -152,11 +169,14 @@ ChatPrompt ChatFormat::render(const std::vector<Message> & all, const ChatOption
                     out += "\n</parameter>\n";
                 }
                 out += "</function>\n</tool_call>";
+                prompt.layout[i].calls.push_back(out.size());
             }
             out += "<|im_end|>\n";
         } else if (message.role == "tool") {
             if (i && all[i - 1].role != "tool") out += "<|im_start|>user";
-            out += "\n<tool_response>\n" + content + "\n</tool_response>";
+            out += "\n<tool_response>\n";
+            emit(i, content);
+            out += "\n</tool_response>";
             if (i + 1 == count || all[i + 1].role != "tool") out += "<|im_end|>\n";
         } else throw ChatError("Unexpected message role.");
     }
@@ -164,7 +184,7 @@ ChatPrompt ChatFormat::render(const std::vector<Message> & all, const ChatOption
         out += "<|im_start|>assistant\n";
         prompt.thinking = v38 ? thinking.value_or(true) : thinking.value_or(false);
         out += prompt.thinking ? "<think>\n" : "<think>\n\n</think>\n\n";
-        if (resume) out += all.back().content;
+        if (resume) emit(all.size() - 1, all.back().content);
         if (forced) {
             prompt.reply_prefix = "<tool_call>\n<function=";
             if (options.forced_tool != "*") prompt.reply_prefix += options.forced_tool + ">\n";

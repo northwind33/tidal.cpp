@@ -4,7 +4,8 @@
 The model has random weights and no tokenizer, so the server uses its byte
 tokenizer and plain ChatML. That is enough to check the protocol: request
 validation, the OpenAI, Anthropic and llama.cpp response shapes, streaming,
-stop strings, prompt-cache accounting, queuing, authentication and shutdown.
+stop strings, prompt-cache accounting (OpenAI and Anthropic caching semantics),
+queuing, authentication and shutdown.
 Chat-template and tokenizer correctness are covered by tests/server.cpp.
 """
 import argparse
@@ -204,8 +205,9 @@ def openai_endpoints(server, reference):
     assert reply['object'] == 'chat.completion' and reply['model'] == 'custom-name' and reply['id'].startswith('chatcmpl-')
     choice = reply['choices'][0]
     assert choice['index'] == 0 and choice['finish_reason'] == 'length' and choice['message']['role'] == 'assistant'
+    # The prompt is shorter than the 1024-token minimum, so nothing is cached in the OpenAI sense.
     assert reply['usage'] == {'prompt_tokens': len(rendered), 'completion_tokens': 10, 'total_tokens': len(rendered) + 10,
-                              'prompt_tokens_details': {'cached_tokens': 0}}
+                              'prompt_tokens_details': {'cached_tokens': 0, 'cache_write_tokens': 0}}
     assert server.post('/chat/completions', body)['choices'][0]['message'] == choice['message']
 
     events = server.events('/v1/chat/completions', {**body, 'stream': True, 'stream_options': {'include_usage': True}})
@@ -216,7 +218,8 @@ def openai_endpoints(server, reference):
     assert ''.join(c['choices'][0]['delta'].get('content') or '' for c in chunks if c['choices']) == choice['message']['content']
     assert chunks[-2]['choices'][0]['finish_reason'] == 'length' and chunks[-2]['choices'][0]['delta'] == {}
     assert chunks[-1]['choices'] == [] and chunks[-1]['usage']['completion_tokens'] == 10
-    assert chunks[-1]['usage']['prompt_tokens_details']['cached_tokens'] == len(rendered)
+    assert chunks[-1]['usage']['prompt_tokens_details'] == {'cached_tokens': 0, 'cache_write_tokens': 0}
+    assert chunks[-2]['timings']['cache_n'] == len(rendered)  # The engine still reused the whole prompt.
 
     scored = server.post('/v1/chat/completions', {**body, 'logprobs': True, 'top_logprobs': 2})['choices'][0]['logprobs']['content']
     assert len(scored) == 10 and all(len(entry['top_logprobs']) == 2 and entry['logprob'] <= 0 for entry in scored)
@@ -256,7 +259,8 @@ def anthropic_endpoints(server):
     assert reply['type'] == 'message' and reply['role'] == 'assistant' and reply['model'] == 'claude-test' and reply['id'].startswith('msg_')
     assert reply['stop_reason'] == 'max_tokens' and reply['stop_sequence'] is None
     assert [block['type'] for block in reply['content']] == ['text']
-    assert reply['usage'] == {'input_tokens': len(rendered), 'cache_creation_input_tokens': 0, 'cache_read_input_tokens': 0, 'output_tokens': 9}
+    assert reply['usage'] == {'input_tokens': len(rendered), 'cache_creation_input_tokens': 0, 'cache_read_input_tokens': 0,
+                              'cache_creation': {'ephemeral_5m_input_tokens': 0, 'ephemeral_1h_input_tokens': 0}, 'output_tokens': 9}
     text = reply['content'][0]['text']
 
     events = server.events('/v1/messages', {**body, 'stream': True})
@@ -265,6 +269,7 @@ def anthropic_endpoints(server):
     assert names[:3] == ['ping', 'message_start', 'content_block_start'] and names[-3:] == ['content_block_stop', 'message_delta', 'message_stop']
     assert set(names[3:-3]) == {'content_block_delta'}
     start = events[1][1]['message']
+    # Without cache_control, the reused prefix is reported as read.
     assert start['content'] == [] and start['usage']['cache_read_input_tokens'] == len(rendered) and start['usage']['input_tokens'] == 0
     assert events[2][1] == {'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}}
     deltas = [data['delta'] for name, data in events if name == 'content_block_delta']
@@ -288,6 +293,160 @@ def anthropic_endpoints(server):
         assert error['type'] == 'error' and error['error']['type'] == 'invalid_request_error' and error['error']['message']
     error = server.post('/v1/messages', {**body, 'messages': [{'role': 'user', 'content': 'x' * CONTEXT}]}, 400)
     assert error['type'] == 'error' and error['error']['type'] == 'invalid_request_error'
+
+
+def chatml(messages):
+    """ChatML as the server renders it for the dummy model (one byte per token)."""
+    return ''.join(f'<|im_start|>{role}\n{content.strip()}<|im_end|>\n' for role, content in messages) + '<|im_start|>assistant\n'
+
+
+def end_of(rendered, text, after=0):
+    """Prompt position (byte offset) just after `text` in the rendered prompt."""
+    return rendered.index(text, after) + len(text)
+
+
+def openai_caching(server):
+    """OpenAI prompt caching (GPT-5.6 semantics) with --cache-min-tokens 64."""
+    system = ('You are a careful assistant. ' * 4).strip()
+    first = 'Question one: ' + 'a' * 80
+    body = {'messages': [{'role': 'system', 'content': system}, {'role': 'user', 'content': first}], 'max_tokens': 4, 'temperature': 0}
+    rendered = chatml([('system', system), ('user', first)])
+    user_end = end_of(rendered, first)
+
+    def details(reply):
+        usage = reply['usage']
+        assert usage['prompt_tokens'] + usage['completion_tokens'] == usage['total_tokens']
+        return usage['prompt_tokens_details']['cached_tokens'], usage['prompt_tokens_details']['cache_write_tokens']
+
+    # Implicit mode: a breakpoint at the end of the latest user message.
+    reply = server.post('/v1/chat/completions', body)
+    assert reply['usage']['prompt_tokens'] == len(rendered) and details(reply) == (0, user_end), reply['usage']
+    assert details(server.post('/v1/chat/completions', body)) == (user_end, 0)
+    # The next turn reads the previous user message's ending and writes only the new part.
+    second = 'Question two: ' + 'b' * 50
+    turn = {**body, 'messages': body['messages'] + [{'role': 'assistant', 'content': 'ok'}, {'role': 'user', 'content': second}]}
+    rendered_turn = chatml([('system', system), ('user', first), ('assistant', 'ok'), ('user', second)])
+    assert details(server.post('/v1/chat/completions', turn)) == (user_end, end_of(rendered_turn, second) - user_end)
+    # Streaming reports the same accounting in the usage chunk.
+    events = server.events('/v1/chat/completions', {**turn, 'stream': True, 'stream_options': {'include_usage': True}})
+    usage = events[-2][1]['usage']['prompt_tokens_details']
+    assert usage == {'cached_tokens': end_of(rendered_turn, second), 'cache_write_tokens': 0}, usage
+
+    # Explicit mode: only the marked developer prefix is written and read; the
+    # engine keeps a snapshot there, so a different question reuses it.
+    reference = ('Reference material. ' * 6).strip()
+    developer = {'role': 'developer', 'content': [{'type': 'text', 'text': reference, 'prompt_cache_breakpoint': {'mode': 'explicit'}}]}
+    marked = {'prompt_cache_options': {'mode': 'explicit'}, 'messages': [developer, {'role': 'user', 'content': 'first question'}],
+              'max_tokens': 3, 'temperature': 0}
+    prefix = end_of(chatml([('system', reference)]), reference)
+    assert details(server.post('/v1/chat/completions', marked)) == (0, prefix)
+    other = {**marked, 'messages': [developer, {'role': 'user', 'content': 'second question'}]}
+    reply = server.post('/v1/chat/completions', other)
+    assert details(reply) == (prefix, 0) and reply['timings']['cache_n'] == prefix, (reply['usage'], reply['timings'])
+    # prompt_cache_key separates cache accounting.
+    keyed = {**other, 'prompt_cache_key': 'tenant-b'}
+    assert details(server.post('/v1/chat/completions', keyed)) == (0, prefix)
+    assert details(server.post('/v1/chat/completions', keyed)) == (prefix, 0)
+    # A 12-hour breakpoint over 30-minute coverage is a new write, then reads.
+    long_lived = {**other, 'messages': [{**developer, 'content': [{**developer['content'][0], 'prompt_cache_breakpoint': {'ttl': '12h'}}]},
+                                        other['messages'][1]]}
+    assert details(server.post('/v1/chat/completions', long_lived)) == (0, prefix)
+    assert details(server.post('/v1/chat/completions', long_lived)) == (prefix, 0)
+    # Explicit mode without breakpoints does not cache; prefixes below the minimum are not written.
+    plain = {**body, 'prompt_cache_options': {'mode': 'explicit', 'ttl': '30m'}}
+    assert details(server.post('/v1/chat/completions', plain)) == (0, 0)
+    short = {'messages': [{'role': 'user', 'content': 'hi'}], 'max_tokens': 2}
+    assert details(server.post('/v1/chat/completions', short)) == (0, 0) and details(server.post('/v1/chat/completions', short)) == (0, 0)
+
+    for bad in [{'prompt_cache_options': {'ttl': '12h'}}, {'prompt_cache_options': {'mode': 'sometimes'}},
+                {'prompt_cache_options': 'implicit'}, {'prompt_cache_retention': 'forever'},
+                {'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': 'x', 'prompt_cache_breakpoint': {'ttl': '1h'}}]}]},
+                {'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': 'x', 'prompt_cache_breakpoint': {'mode': 'implicit'}}]}]}]:
+        error = server.post('/v1/chat/completions', {**body, **bad}, 400)['error']
+        assert error['type'] == 'invalid_request_error' and 'prompt_cache' in error['message'], error
+    assert details(server.post('/v1/chat/completions', {**short, 'prompt_cache_retention': '24h', 'prompt_cache_key': 'k'})) == (0, 0)
+
+
+def anthropic_caching(server):
+    """Anthropic prompt caching at cache_control breakpoints with --cache-min-tokens 64."""
+    def usage(reply, read, created_5m=0, created_1h=0, total=None):
+        value = reply['usage']
+        expected = {'cache_read_input_tokens': read, 'cache_creation_input_tokens': created_5m + created_1h,
+                    'cache_creation': {'ephemeral_5m_input_tokens': created_5m, 'ephemeral_1h_input_tokens': created_1h}}
+        assert {k: value[k] for k in expected} == expected, value
+        if total is not None:
+            assert value['input_tokens'] == total - read - created_5m - created_1h, value
+
+    system = ('Anthropic system prompt. ' * 5).strip()
+    cached_system = [{'type': 'text', 'text': system, 'cache_control': {'type': 'ephemeral'}}]
+    body = {'max_tokens': 3, 'temperature': 0, 'system': cached_system, 'messages': [{'role': 'user', 'content': 'Q1 please answer'}]}
+    rendered = chatml([('system', system), ('user', 'Q1 please answer')])
+    prefix = end_of(rendered, system)
+    usage(server.post('/v1/messages', body), 0, prefix, total=len(rendered))
+    reply = server.post('/v1/messages', {**body, 'messages': [{'role': 'user', 'content': 'Q2 something else'}]})
+    usage(reply, prefix, total=len(chatml([('system', system), ('user', 'Q2 something else')])))
+    # The streamed message_start carries the same usage.
+    events = server.events('/v1/messages', {**body, 'stream': True, 'messages': [{'role': 'user', 'content': 'Q2 something else'}]})
+    start = events[1][1]['message']
+    usage(start, prefix)
+
+    # Automatic caching: the top-level cache_control lands on the last block and
+    # reads the system entry within the lookback window.
+    question = 'Q3 ' + 'c' * 70
+    automatic = {**body, 'cache_control': {'type': 'ephemeral'}, 'messages': [{'role': 'user', 'content': question}]}
+    rendered = chatml([('system', system), ('user', question)])
+    usage(server.post('/v1/messages', automatic), prefix, end_of(rendered, question) - prefix, total=len(rendered))
+    usage(server.post('/v1/messages', automatic), end_of(rendered, question), total=len(rendered))
+
+    # Mixed lifetimes: the 1-hour breakpoint comes first.
+    other_system = ('A different system prompt that lives longer. ' * 2).strip()
+    mixed = {'max_tokens': 2, 'system': [{'type': 'text', 'text': other_system, 'cache_control': {'type': 'ephemeral', 'ttl': '1h'}}],
+             'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': 'Q4 ' + 'd' * 40, 'cache_control': {'type': 'ephemeral'}},
+                                                       {'type': 'text', 'text': 'tail'}]}]}
+    rendered = chatml([('system', other_system), ('user', 'Q4 ' + 'd' * 40 + '\ntail')])
+    first_end, second_end = end_of(rendered, other_system), end_of(rendered, 'd' * 40)
+    usage(server.post('/v1/messages', mixed), 0, second_end - first_end, first_end, total=len(rendered))
+
+    # Pre-warming: max_tokens 0 evaluates the prompt only.
+    warm_system = ('Warm this prefix before traffic arrives. ' * 3).strip()
+    warm = {'max_tokens': 0, 'system': [{'type': 'text', 'text': warm_system, 'cache_control': {'type': 'ephemeral'}}],
+            'messages': [{'role': 'user', 'content': 'warmup'}]}
+    reply = server.post('/v1/messages', warm)
+    warm_prefix = end_of(chatml([('system', warm_system)]), warm_system)
+    assert reply['content'] == [] and reply['stop_reason'] == 'max_tokens' and reply['usage']['output_tokens'] == 0, reply
+    usage(reply, 0, warm_prefix)
+    usage(server.post('/v1/messages', {**warm, 'max_tokens': 2, 'messages': [{'role': 'user', 'content': 'real question'}]}), warm_prefix)
+    # Prefixes below the minimum are not cached even with a breakpoint.
+    tiny = {'max_tokens': 1, 'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': 'hi', 'cache_control': {'type': 'ephemeral'}}]}]}
+    usage(server.post('/v1/messages', tiny), 0)
+    usage(server.post('/v1/messages', tiny), 0)
+    # Token counting accepts cache_control.
+    assert server.post('/v1/messages/count_tokens', {k: v for k, v in mixed.items() if k != 'max_tokens'})['input_tokens'] == len(rendered)
+
+    text = lambda value, **control: {'type': 'text', 'text': value, **({'cache_control': control} if control else {})}
+    for bad, words in [
+            ({'system': [text('a', type='ephemeral')], 'messages': [{'role': 'user', 'content': [text('b', type='ephemeral', ttl='1h')]}]},
+             "ttl='1h'"),
+            ({'messages': [{'role': 'user', 'content': [text(str(i), type='ephemeral') for i in range(5)]}]}, 'maximum of 4'),
+            ({'messages': [{'role': 'user', 'content': [text('', type='ephemeral')]}]}, 'empty text'),
+            ({'messages': [{'role': 'user', 'content': [text('x', type='persistent')]}]}, "'ephemeral'"),
+            ({'messages': [{'role': 'user', 'content': [text('x', type='ephemeral', ttl='2h')]}]}, "'5m' or '1h'"),
+            ({'messages': [{'role': 'user', 'content': 'q'}, {'role': 'assistant', 'content': [
+                {'type': 'thinking', 'thinking': 't', 'signature': '', 'cache_control': {'type': 'ephemeral'}}]}]}, 'Extra inputs'),
+            ({'cache_control': {'type': 'ephemeral', 'ttl': '1h'}, 'messages': [{'role': 'user', 'content': [text('x', type='ephemeral')]}]},
+             'automatic'),
+            ({'max_tokens': 0, 'stream': True, 'messages': [{'role': 'user', 'content': 'x'}]}, 'stream')]:
+        error = server.post('/v1/messages', {'max_tokens': 2, **bad}, 400)
+        assert error['type'] == 'error' and error['error']['type'] == 'invalid_request_error' and words in error['error']['message'], error
+
+    metrics = server.get('/metrics')
+    values = dict(line.split(' ') for line in metrics.splitlines() if line and not line.startswith('#'))
+    assert int(values['tidal:cache_read_tokens_total']) > 0 and int(values['tidal:cache_write_tokens_total']) > 0
+    assert int(values['tidal:cache_entries']) > 0 and int(values['tidal:cache_snapshots']) > 0
+
+    # Erasing the slot drops the cache entries with the sequence.
+    server.post('/slots/0?action=erase', {})
+    usage(server.post('/v1/messages', body), 0, prefix)
 
 
 def transport(server, reference):
@@ -365,6 +524,22 @@ def main():
         assert server.stop() == 0, 'SIGTERM must end the server cleanly'
         print('endpoints, streaming, prompt cache, queuing and shutdown passed', flush=True)
 
+        # API prompt caching needs longer prompts than the main model's context.
+        cache_model = Path(directory) / 'cache-model'
+        subprocess.run([str(args.bin_dir / 'tidal-dummy'), '--output', str(cache_model), '--context', '1024', '--type', 'f32'],
+                       check=True, capture_output=True, timeout=120)
+        server = Server(binary, '--model', cache_model, '--backend', 'cpu', '--cache-min-tokens', '64', '--cache-snapshots', '8')
+        try:
+            assert server.port, server.output()
+            openai_caching(server)
+            anthropic_caching(server)
+        except BaseException:
+            print(server.output()[-3000:])
+            server.stop()
+            raise
+        assert server.stop() == 0
+        print('OpenAI and Anthropic prompt caching passed', flush=True)
+
         # Defaults and authentication come from the command line.
         server = Server(binary, '--model', model, '--backend', 'cpu', '--api-key', 'secret', '--alias', 'named',
                         '--temp', '0', '--n-predict', '5', '--webui', '0', '--context', '64')
@@ -392,7 +567,8 @@ def main():
         # Startup failures exit with an error instead of serving.
         for flags in [['--model', Path(directory) / 'missing.gguf', '--backend', 'cpu'], ['--backend', 'cpu'],
                       ['--model', model, '--backend', 'cpu', '--thinking', 'maybe'],
-                      ['--model', model, '--backend', 'cpu', '--temp', '-2']]:
+                      ['--model', model, '--backend', 'cpu', '--temp', '-2'],
+                      ['--model', model, '--backend', 'cpu', '--cache-min-tokens', '0']]:
             failed = Server(binary, *flags)
             assert failed.process.wait(timeout=60) == 1, flags
             assert 'tidal-server: ' in failed.output()

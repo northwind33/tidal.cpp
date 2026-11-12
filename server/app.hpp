@@ -22,6 +22,7 @@ struct AppConfig {
     int max_tokens = -1;            // Default generation limit; negative means until the context is full.
     std::optional<bool> thinking;   // Default for chat requests that do not say; unset follows the template.
     bool webui = true;
+    int cache_min_tokens = 1024;    // Shortest prefix that a cache breakpoint writes.
 };
 
 class App {
@@ -42,10 +43,12 @@ private:
     void sampling(const Json & body, GenerationParams & params) const;
     std::vector<int32_t> prompt_tokens(const Json & prompt) const;
     void prepare(ChatTask & task) const;
+    CachePlan openai_cache(const ChatTask & task) const;
+    CachePlan anthropic_cache(const ChatTask & task) const;
     ChatTask openai_task(const Json & body) const;
     ChatTask anthropic_task(const Json & body, bool counting) const;
     ChatRun run_chat(ChatTask & task, const char * id_prefix, Response & response, std::function<void()> on_start,
-                     std::function<void(int, int)> on_prompt,
+                     std::function<void(const GenerationResult &)> on_prompt,
                      std::function<bool(const ChatDelta &, const std::vector<GeneratedToken> &)> on_delta);
     Json token_logprob(const GeneratedToken & token) const;
 

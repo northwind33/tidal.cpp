@@ -264,19 +264,20 @@ def check_server(root, bins, text, vision, backend):
         # The image adds its 3x2 placeholder tokens plus <|vision_start|>/<|vision_end|> rendered as bytes.
         markers = len("<|vision_start|><|vision_end|>")
         assert first["usage"]["prompt_tokens"] == text_only["usage"]["prompt_tokens"] + 6 + markers, (first["usage"], text_only["usage"])
-        # Extending the conversation reuses the prefix, image included.
+        # Extending the conversation reuses the prefix, image included (the engine reuse; the prompt is
+        # below the OpenAI caching minimum, so usage reports no cached tokens).
         reply = first["choices"][0]["message"]["content"]
         turns = [message, {"role": "assistant", "content": reply}, {"role": "user", "content": "more"}]
         before = server.get("/metrics")
         extended = server.post("/v1/chat/completions", {**body, "messages": turns})
-        assert extended["usage"]["prompt_tokens_details"]["cached_tokens"] >= first["usage"]["prompt_tokens"] - 1, extended["usage"]
+        assert extended["timings"]["cache_n"] >= first["usage"]["prompt_tokens"] - 1, extended["timings"]
         after = server.get("/metrics")
         count = lambda text: float(re.search(r"^tidal:images_encoded_total (\S+)$", text, re.M).group(1))
         assert count(after) == count(before), (before, after)
         # A different image of the same size is not mistaken for the cached one.
         other = {**message, "content": [{"type": "image_url", "image_url": {"url": png_data_uri(255 - image)}}, {"type": "text", "text": "hi"}]}
         changed = server.post("/v1/chat/completions", {**body, "messages": [other]})
-        assert changed["usage"]["prompt_tokens_details"]["cached_tokens"] < first["usage"]["prompt_tokens"] - 6, changed["usage"]
+        assert changed["timings"]["cache_n"] < first["usage"]["prompt_tokens"] - 6, changed["timings"]
         # Anthropic image blocks and llama.cpp multimodal_data.
         data = uri.split(",", 1)[1]
         anthropic = server.post("/v1/messages", {"max_tokens": 4, "temperature": 0, "messages": [{"role": "user", "content": [
