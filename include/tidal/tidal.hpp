@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace tidal {
@@ -256,6 +257,7 @@ struct Statistics {
     uint64_t prompt_cache_reused_tokens = 0; // prefill_cached positions not re-evaluated.
     uint64_t prompt_cache_restores = 0;      // Rollbacks to a snapshot (or to an empty sequence).
     uint64_t prompt_cache_checkpoint_bytes = 0; // Host memory held by current snapshots.
+    uint64_t prompt_cache_pinned = 0;           // Current snapshots exempt from the count limit.
     uint64_t speculative_verifications = 0, speculative_drafted = 0, speculative_accepted = 0;
     uint64_t mtp_drafts = 0; // Engine::draft calls.
     uint64_t images_encoded = 0, image_tokens = 0; // Vision tower runs and their output tokens.
@@ -302,6 +304,21 @@ public:
     // reach past the reused prefix.
     std::vector<Step> prefill_cached(const std::vector<int32_t> & tokens, const std::vector<ImageSpan> & images,
                                      bool capture_logits = true);
+    // As above, and additionally keeps a pinned snapshot at each of
+    // `pin_positions` (prefix lengths in (0, tokens.size()]) that this call
+    // evaluates or that already has a snapshot: the prefill stops at those
+    // positions to take it. Positions inside the reused prefix without a
+    // snapshot are skipped. Pinned snapshots are exempt from the
+    // prompt_cache_checkpoints limit until unpinned by keep_checkpoints();
+    // like all snapshots they are dropped when the sequence is rewound below
+    // them or reset.
+    std::vector<Step> prefill_cached(const std::vector<int32_t> & tokens, const std::vector<ImageSpan> & images,
+                                     bool capture_logits, const std::vector<int> & pin_positions);
+    // Pins the snapshots at `positions` and unpins all others; unpinned ones
+    // beyond prompt_cache_checkpoints are dropped, oldest first.
+    void keep_checkpoints(const std::vector<int> & positions);
+    // Positions of the current snapshots, ascending, and whether each is pinned.
+    std::vector<std::pair<int, bool>> checkpoints() const;
     // Vision (Options::vision_model).
     bool has_vision() const;
     VisionInfo vision_info() const;

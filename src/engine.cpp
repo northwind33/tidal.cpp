@@ -339,6 +339,7 @@ struct Engine::Impl {
     struct Checkpoint {
         int position; std::vector<std::vector<uint8_t>> state; std::vector<float> captured;
         int mtp_next = 0; int32_t mtp_drafted_for = -1;
+        bool pinned = false; // Exempt from options.prompt_cache_checkpoints.
     };
     std::deque<Checkpoint> checkpoints;
     int position = 0;
@@ -2510,27 +2511,48 @@ struct Engine::Impl {
             for (auto * t : {s.conv, s.recurrent, s.ple_conv, s.raw_index}) if (t) result.push_back(t);
         return result;
     }
-    void save_checkpoint() {
-        if (!options.prompt_cache_checkpoints || !position) return;
-        if (!checkpoints.empty() && checkpoints.back().position == position) checkpoints.pop_back();
+    // Snapshots the current position; `pin` exempts it from the count limit.
+    void save_checkpoint(bool pin = false) {
+        if ((!options.prompt_cache_checkpoints && !pin) || !position) return;
+        if (!checkpoints.empty() && checkpoints.back().position == position) {
+            pin = pin || checkpoints.back().pinned;
+            checkpoints.pop_back();
+        }
         ProfileScope scope(&profiler, "host", "prompt_checkpoint_save", "prompt_cache", position, -1, "CPU");
         ggml_backend_synchronize(backend.get());
-        Checkpoint checkpoint{position, {}, captured_logits, mtp_next, mtp_drafted_for};
+        Checkpoint checkpoint{position, {}, captured_logits, mtp_next, mtp_drafted_for, pin};
         for (auto * t : rollback_tensors()) {
             auto & bytes = checkpoint.state.emplace_back(ggml_nbytes(t));
             ggml_backend_tensor_get(t, bytes.data(), 0, bytes.size());
             stats.device_to_host_bytes += bytes.size();
         }
         checkpoints.push_back(std::move(checkpoint));
-        while (checkpoints.size() > size_t(options.prompt_cache_checkpoints)) checkpoints.pop_front();
+        trim_checkpoints();
+    }
+    // Drops the oldest unpinned snapshots beyond the count limit.
+    void trim_checkpoints() {
+        size_t unpinned = 0;
+        for (const auto & checkpoint : checkpoints) unpinned += !checkpoint.pinned;
+        for (auto it = checkpoints.begin(); unpinned > size_t(options.prompt_cache_checkpoints) && it != checkpoints.end();) {
+            if (it->pinned) { ++it; continue; }
+            it = checkpoints.erase(it);
+            --unpinned;
+        }
         update_checkpoint_bytes();
     }
     void update_checkpoint_bytes() {
         stats.prompt_cache_checkpoint_bytes = 0;
+        stats.prompt_cache_pinned = 0;
         for (const auto & checkpoint : checkpoints) {
             for (const auto & bytes : checkpoint.state) stats.prompt_cache_checkpoint_bytes += bytes.size();
             stats.prompt_cache_checkpoint_bytes += checkpoint.captured.size() * sizeof(float);
+            stats.prompt_cache_pinned += checkpoint.pinned;
         }
+    }
+    void keep_checkpoints(const std::vector<int> & positions) {
+        for (auto & checkpoint : checkpoints)
+            checkpoint.pinned = std::find(positions.begin(), positions.end(), checkpoint.position) != positions.end();
+        trim_checkpoints();
     }
     // Rewinds to `checkpoint` (or to an empty sequence when null).
     void restore_checkpoint(const Checkpoint * checkpoint) {
@@ -2679,7 +2701,8 @@ struct Engine::Impl {
         if (failed) throw std::runtime_error("Previous execution failed; call reset() before prefill");
         return prefill_spans(tokens, describe(tokens, images, position), capture);
     }
-    std::vector<Step> prefill_cached(const std::vector<int32_t> & tokens, const std::vector<ImageSpan> & images, bool capture) {
+    std::vector<Step> prefill_cached(const std::vector<int32_t> & tokens, const std::vector<ImageSpan> & images, bool capture,
+                                     const std::vector<int> & pins = {}) {
         if (failed) throw std::runtime_error("Previous execution failed; call reset() before prefill");
         if (tokens.empty()) throw std::invalid_argument("Empty prompt");
         if (tokens.size() > size_t(c.context)) throw std::out_of_range("Prompt exceeds context capacity");
@@ -2697,10 +2720,31 @@ struct Engine::Impl {
             try { restore_checkpoint(checkpoint); } catch (...) { failed = true; throw; }
         }
         stats.prompt_cache_reused_tokens += uint64_t(position);
+        std::vector<int> stops;
+        for (const int p : pins) if (p > 0 && size_t(p) <= tokens.size()) stops.push_back(p);
+        std::sort(stops.begin(), stops.end());
+        stops.erase(std::unique(stops.begin(), stops.end()), stops.end());
+        // Snapshots that already exist inside the reused prefix are pinned as they are.
+        for (auto & checkpoint : checkpoints)
+            if (checkpoint.position <= position && std::binary_search(stops.begin(), stops.end(), checkpoint.position))
+                checkpoint.pinned = true;
+        update_checkpoint_bytes();
+        const bool pin_end = std::binary_search(stops.begin(), stops.end(), int(tokens.size()));
         // The state (and logits) of the whole prompt is already resident.
-        if (size_t(position) == tokens.size()) return {};
-        auto result = prefill_spans({tokens.begin() + position, tokens.end()}, spans, capture);
-        try { save_checkpoint(); } catch (...) { failed = true; throw; }
+        if (size_t(position) == tokens.size()) {
+            if (pin_end) try { save_checkpoint(true); } catch (...) { failed = true; throw; }
+            return {};
+        }
+        std::vector<Step> result;
+        for (const int stop : stops) {
+            if (stop <= position || size_t(stop) >= tokens.size()) continue;
+            auto steps = prefill_spans({tokens.begin() + position, tokens.begin() + stop}, spans, capture);
+            result.insert(result.end(), std::make_move_iterator(steps.begin()), std::make_move_iterator(steps.end()));
+            try { save_checkpoint(true); } catch (...) { failed = true; throw; }
+        }
+        auto steps = prefill_spans({tokens.begin() + position, tokens.end()}, spans, capture);
+        result.insert(result.end(), std::make_move_iterator(steps.begin()), std::make_move_iterator(steps.end()));
+        try { save_checkpoint(pin_end); } catch (...) { failed = true; throw; }
         return result;
     }
     std::vector<TensorPlacement> tensor_placements() const {
@@ -2813,6 +2857,16 @@ std::vector<Step> Engine::prefill(const std::vector<int32_t> & tokens, const std
 std::vector<Step> Engine::prefill_cached(const std::vector<int32_t> & tokens, const std::vector<ImageSpan> & images,
                                          bool capture_logits) {
     return impl_->prefill_cached(tokens, images, capture_logits);
+}
+std::vector<Step> Engine::prefill_cached(const std::vector<int32_t> & tokens, const std::vector<ImageSpan> & images,
+                                         bool capture_logits, const std::vector<int> & pin_positions) {
+    return impl_->prefill_cached(tokens, images, capture_logits, pin_positions);
+}
+void Engine::keep_checkpoints(const std::vector<int> & positions) { impl_->keep_checkpoints(positions); }
+std::vector<std::pair<int, bool>> Engine::checkpoints() const {
+    std::vector<std::pair<int, bool>> out;
+    for (const auto & checkpoint : impl_->checkpoints) out.emplace_back(checkpoint.position, checkpoint.pinned);
+    return out;
 }
 bool Engine::has_vision() const { return impl_->vision != nullptr; }
 VisionInfo Engine::vision_info() const { return impl_->vision ? impl_->vision->info() : VisionInfo{}; }

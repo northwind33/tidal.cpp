@@ -21,6 +21,10 @@ void equal_steps(const std::vector<tidal::Step> & a, const std::vector<tidal::St
 std::vector<int32_t> join(std::vector<int32_t> a, const std::vector<int32_t> & b) {
     a.insert(a.end(), b.begin(), b.end()); return a;
 }
+std::vector<tidal::Step> join_steps(std::vector<tidal::Step> a, std::vector<tidal::Step> b) {
+    for (auto & step : b) a.push_back(std::move(step));
+    return a;
+}
 // Reuse and rollback must reproduce, bit for bit, a fresh engine that runs the
 // same prefill/decode partition: the restored state is the state at that position.
 void prompt_cache(const char * model, tidal::Options options) {
@@ -73,6 +77,44 @@ void prompt_cache(const char * model, tidal::Options options) {
     bare.prefill_cached(prompt); bare.decode((extra[0] + 1) % c.vocab);
     require(bare.prefill_cached(join(prompt, extra)).size() == prompt.size() + extra.size() &&
             !bare.statistics().prompt_cache_checkpoint_bytes, "Snapshot-free rollback reused state");
+
+    // Pinned snapshots (API cache breakpoints): the prefill stops at each pin,
+    // matching a fresh engine with the same partition, and a later divergence
+    // restores the pin even though only one unpinned snapshot is kept.
+    options.prompt_cache_checkpoints = 1;
+    tidal::Engine pinned(model, options);
+    const int stop = length / 3;
+    const std::vector<int32_t> head(prompt.begin(), prompt.begin() + stop), rest(prompt.begin() + stop, prompt.end());
+    const auto split = pinned.prefill_cached(prompt, {}, true, {stop, int(prompt.size()), 0, int(prompt.size()) + 5});
+    fresh.reset();
+    auto expected = fresh.prefill(head);
+    expected = join_steps(std::move(expected), fresh.prefill(rest));
+    equal_steps(expected, split);
+    using Snapshots = std::vector<std::pair<int, bool>>;
+    require(pinned.checkpoints() == Snapshots({{stop, true}, {int(prompt.size()), true}}), "Pinned snapshot positions");
+    require(pinned.statistics().prompt_cache_pinned == 2, "Pinned snapshot count");
+    for (int i = 0; i < 3; ++i) pinned.decode((i + 11) % c.vocab);
+    const auto branch = join(head, other);
+    const auto restored = pinned.prefill_cached(branch, {}, true, {});
+    require(pinned.statistics().prompt_cache_reused_tokens == uint64_t(stop), "Divergence after a pin did not restore it");
+    fresh.reset(); fresh.prefill(head);
+    equal_steps(fresh.prefill(other), restored);
+    require(pinned.sample() == fresh.sample(), "Pin restore changed sampling");
+    require(pinned.checkpoints() == Snapshots({{stop, true}, {int(branch.size()), false}}), "Snapshots after a pin restore");
+    // A prompt that is already resident pins its end without evaluating anything.
+    require(pinned.prefill_cached(branch, {}, false, {int(branch.size())}).empty(), "Resident prompt was re-evaluated");
+    require(pinned.checkpoints() == Snapshots({{stop, true}, {int(branch.size()), true}}), "Pin of a resident prompt");
+    // Unpinning returns snapshots to the count limit, oldest dropped first.
+    pinned.keep_checkpoints({});
+    require(pinned.checkpoints() == Snapshots({{int(branch.size()), false}}) && !pinned.statistics().prompt_cache_pinned,
+            "Unpinned snapshots beyond the limit");
+    pinned.keep_checkpoints({int(branch.size())});
+    require(pinned.checkpoints() == Snapshots({{int(branch.size()), true}}), "Pin of an existing snapshot");
+    // Pins are kept even when unpinned snapshots are disabled.
+    options.prompt_cache_checkpoints = 0;
+    tidal::Engine only_pins(model, options);
+    only_pins.prefill_cached(prompt, {}, false, {stop});
+    require(only_pins.checkpoints() == Snapshots({{stop, true}}), "Pins without unpinned snapshots");
 }
 template<class F> void rejects(F f) {
     try { f(); } catch (const std::out_of_range &) { return; }

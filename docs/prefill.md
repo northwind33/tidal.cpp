@@ -203,8 +203,14 @@ caching:
   first and zero disables rollback reuse. A prompt that ends exactly at a
   snapshot (regeneration) evaluates nothing and `sample()` uses the restored
   logits.
+- The `prefill_cached` overload with `pin_positions` also stops the prefill at
+  each of those positions to take a snapshot there, and pins it: pinned
+  snapshots are exempt from the count limit until `keep_checkpoints` unpins
+  them (`checkpoints()` lists them). tidal-server pins its API cache
+  breakpoints this way ([prompt caching](server.md#prompt-caching)).
 - Penalty history is rebuilt from the kept tokens; the sampler's random state
-  continues. Statistics report reused tokens, restores and snapshot bytes.
+  continues. Statistics report reused tokens, restores, snapshot bytes and
+  pinned snapshots.
 
 A restored sequence is bit-identical to a fresh engine that ran the same
 prefill/decode partition (`tidal-state-test`). Plain `prefill`/`decode` still
