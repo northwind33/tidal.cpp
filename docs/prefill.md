@@ -268,7 +268,9 @@ BF16 index rows, F32 state), so saving and restoring are copies:
 and the time spent, and `Engine::cache_store()` reports the store's contents.
 What `tidal-session-cache-test` checks is that a sequence that left the engine
 continues bit-identically to one that never did, across the memory and disk
-tiers, a restart, eviction and MTP drafting. The one exception is shared
+tiers, a restart, eviction and MTP drafting. For a large model,
+`tidal-session-cache-test MODEL cuda long TOKENS DIRECTORY` runs the disk
+round trip of one long sequence by hand. The one exception is shared
 chunks: rows of a common prefix are those of the sequence that stored them
 first, and a CUDA batch of another length rounds them differently in the last
 bits, as layer-major, hybrid and decode already do among themselves.
