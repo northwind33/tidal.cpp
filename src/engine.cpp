@@ -1,4 +1,5 @@
 #include "internal.hpp"
+#include "cache_store.hpp"
 #include "sampling.hpp"
 #include "prefill_tensor.hpp"
 #include "prefill_chunks.hpp"
@@ -17,8 +18,10 @@
 #include <cstring>
 #include <functional>
 #include <deque>
+#include <filesystem>
 #include <map>
 #include <numeric>
+#include <optional>
 
 namespace tidal {
 namespace {
@@ -337,11 +340,21 @@ struct Engine::Impl {
     // state KV truncation cannot rewind, ordered by ascending position.
     std::vector<int32_t> sequence;
     struct Checkpoint {
-        int position; std::vector<std::vector<uint8_t>> state; std::vector<float> captured;
+        int position;
+        Blob state;          // The rollback tensors in order, then `captured` logits.
+        size_t captured = 0;
         int mtp_next = 0; int32_t mtp_drafted_for = -1;
         bool pinned = false; // Exempt from options.prompt_cache_checkpoints.
+        // Cache store bookkeeping: what the snapshot marks, and the end of the
+        // prompt it belongs to (its own position unless it follows a reply).
+        SnapshotRole role = SnapshotRole::End;
+        int anchor = 0;
     };
     std::deque<Checkpoint> checkpoints;
+    // Cache store: state of sequences this engine no longer holds.
+    std::unique_ptr<CacheStore> store;
+    int store_chunk = 0;     // KV rows per stored chunk.
+    int last_prompt_end = 0; // Length of the latest prefill_cached prompt.
     int position = 0;
     bool failed = false;
     PrefillMemory * prefill_memory = nullptr;
@@ -474,7 +487,37 @@ struct Engine::Impl {
             vision = std::make_unique<VisionEncoder>(options.vision_model, options, c.hidden);
         } else if (options.vision_placement != VisionPlacement::Auto || options.image_min_tokens || options.image_max_tokens)
             throw std::invalid_argument("Vision options require a vision model");
+        if (options.cache_store.enabled()) open_store(path);
+        else if (!options.cache_store.directory.empty()) throw std::invalid_argument("A cache store directory requires a disk budget");
         reset();
+    }
+    void open_store(const std::string & path) {
+        const auto & o = options.cache_store;
+        if (o.chunk_tokens < 0 || o.branch_tokens < 0) throw std::invalid_argument("Negative cache store chunk or branch size");
+        if (o.disk_bytes && o.directory.empty()) throw std::invalid_argument("The cache store's disk budget requires a directory");
+        const int block = c.architecture == Architecture::Qwen4Exp ? c.block_size : 1;
+        store_chunk = o.chunk_tokens ? o.chunk_tokens : (256 + block - 1) / block * block;
+        if (store_chunk % block) throw std::invalid_argument("Cache store chunks must be a multiple of the QSA block size");
+        // Stored state is only valid for the files and the layout it came from.
+        std::string identity = "tidal cache store 1";
+        const auto file = [&](const std::string & name) {
+            std::error_code error;
+            const auto canonical = std::filesystem::weakly_canonical(name, error);
+            identity += "|" + (error ? name : canonical.string());
+            identity += ":" + std::to_string(std::filesystem::file_size(name, error));
+            identity += ":" + std::to_string(std::filesystem::last_write_time(name, error).time_since_epoch().count());
+        };
+        file(path);
+        if (options.mtp) { identity += "|mtp"; if (!options.mtp_model.empty()) file(options.mtp_model); }
+        if (!options.vision_model.empty()) file(options.vision_model);
+        identity += "|" + options.backend + (options.kv_placement == KVPlacement::GPU ? "|gpu-kv" : "|cpu-kv") + "|chunk " +
+                    std::to_string(store_chunk) + "|context " + std::to_string(c.context) + "|block " + std::to_string(block);
+        for (auto * t : rollback_tensors()) identity += ":" + std::to_string(ggml_nbytes(t));
+        identity += "|rows " + std::to_string(rows_bytes(rows_of(0, store_chunk, store_chunk - 1)));
+        for (const auto & s : states)
+            identity += std::string(":") + (s.attention ? ggml_type_name(s.attention->type()) : s.device_keys ? ggml_type_name(s.device_keys->type) : "-");
+        if (mtp_state.device_keys) identity += std::string("|mtp rows ") + ggml_type_name(mtp_state.device_keys->type);
+        store = std::make_unique<CacheStore>(CacheStore::Config{o.ram_bytes, o.disk_bytes, o.directory, hash_bytes(identity.data(), identity.size())});
     }
     ggml_type cpu_kv_type() const { return options.cpu_kv_precision == CpuKVPrecision::FP16 ? GGML_TYPE_F16 : GGML_TYPE_BF16; }
     Graph graph(const std::string & phase, int layer = -1, int token_offset = 0) {
@@ -2511,22 +2554,36 @@ struct Engine::Impl {
             for (auto * t : {s.conv, s.recurrent, s.ple_conv, s.raw_index}) if (t) result.push_back(t);
         return result;
     }
+    size_t checkpoint_bytes(size_t captured) const {
+        size_t bytes = captured * sizeof(float);
+        for (auto * t : rollback_tensors()) bytes += ggml_nbytes(t);
+        return bytes;
+    }
+    // Copies the state of the current position to host memory.
+    Checkpoint take_checkpoint(bool pin, SnapshotRole role) {
+        ProfileScope scope(&profiler, "host", "prompt_checkpoint_save", "prompt_cache", position, -1, "CPU");
+        ggml_backend_synchronize(backend.get());
+        auto state = std::make_shared<Bytes>(checkpoint_bytes(captured_logits.size()));
+        uint8_t * at = state->data.get();
+        for (auto * t : rollback_tensors()) {
+            const size_t bytes = ggml_nbytes(t);
+            ggml_backend_tensor_get(t, at, 0, bytes);
+            at += bytes;
+            stats.device_to_host_bytes += bytes;
+        }
+        if (!captured_logits.empty()) std::memcpy(at, captured_logits.data(), captured_logits.size() * sizeof(float));
+        const int anchor = role == SnapshotRole::Generated ? std::min(last_prompt_end, position) : position;
+        return {position, std::move(state), captured_logits.size(), mtp_next, mtp_drafted_for, pin, role, anchor};
+    }
     // Snapshots the current position; `pin` exempts it from the count limit.
-    void save_checkpoint(bool pin = false) {
+    void save_checkpoint(bool pin = false, SnapshotRole role = SnapshotRole::End) {
         if ((!options.prompt_cache_checkpoints && !pin) || !position) return;
         if (!checkpoints.empty() && checkpoints.back().position == position) {
             pin = pin || checkpoints.back().pinned;
+            if (checkpoints.back().role == SnapshotRole::Break) role = SnapshotRole::Break;
             checkpoints.pop_back();
         }
-        ProfileScope scope(&profiler, "host", "prompt_checkpoint_save", "prompt_cache", position, -1, "CPU");
-        ggml_backend_synchronize(backend.get());
-        Checkpoint checkpoint{position, {}, captured_logits, mtp_next, mtp_drafted_for, pin};
-        for (auto * t : rollback_tensors()) {
-            auto & bytes = checkpoint.state.emplace_back(ggml_nbytes(t));
-            ggml_backend_tensor_get(t, bytes.data(), 0, bytes.size());
-            stats.device_to_host_bytes += bytes.size();
-        }
-        checkpoints.push_back(std::move(checkpoint));
+        checkpoints.push_back(take_checkpoint(pin, role));
         trim_checkpoints();
     }
     // Drops the oldest unpinned snapshots beyond the count limit.
@@ -2544,8 +2601,7 @@ struct Engine::Impl {
         stats.prompt_cache_checkpoint_bytes = 0;
         stats.prompt_cache_pinned = 0;
         for (const auto & checkpoint : checkpoints) {
-            for (const auto & bytes : checkpoint.state) stats.prompt_cache_checkpoint_bytes += bytes.size();
-            stats.prompt_cache_checkpoint_bytes += checkpoint.captured.size() * sizeof(float);
+            stats.prompt_cache_checkpoint_bytes += checkpoint.state->size;
             stats.prompt_cache_pinned += checkpoint.pinned;
         }
     }
@@ -2561,11 +2617,13 @@ struct Engine::Impl {
         decode_graph.reset();
         hybrid.clear();
         ggml_backend_synchronize(backend.get());
-        const auto tensors = rollback_tensors();
-        for (size_t i = 0; i < tensors.size(); ++i) {
-            if (!checkpoint) { ggml_backend_tensor_memset(tensors[i], 0, 0, ggml_nbytes(tensors[i])); continue; }
-            ggml_backend_tensor_set(tensors[i], checkpoint->state[i].data(), 0, checkpoint->state[i].size());
-            stats.host_to_device_bytes += checkpoint->state[i].size();
+        const uint8_t * saved = checkpoint ? checkpoint->state->data.get() : nullptr;
+        for (auto * t : rollback_tensors()) {
+            const size_t bytes = ggml_nbytes(t);
+            if (!checkpoint) { ggml_backend_tensor_memset(t, 0, 0, bytes); continue; }
+            ggml_backend_tensor_set(t, saved, 0, bytes);
+            saved += bytes;
+            stats.host_to_device_bytes += bytes;
         }
         for (auto & s : states) {
             if (s.attention) s.attention->truncate(target);
@@ -2578,7 +2636,8 @@ struct Engine::Impl {
         if (!c.ple.layers.empty())
             previous_tokens.assign(sequence.end() - std::min<size_t>(sequence.size(), c.ple.ngram_size - 1), sequence.end());
         sampler->rewind(sequence);
-        captured_logits = checkpoint ? checkpoint->captured : std::vector<float>{};
+        captured_logits.assign(checkpoint ? checkpoint->captured : 0, 0.0f);
+        if (!captured_logits.empty()) std::memcpy(captured_logits.data(), saved, captured_logits.size() * sizeof(float));
         // MTP KV rows below the snapshot's mtp_next belong to the shared prefix.
         mtp_next = checkpoint ? checkpoint->mtp_next : 0;
         mtp_drafted_for = checkpoint ? checkpoint->mtp_drafted_for : -1;
@@ -2587,6 +2646,209 @@ struct Engine::Impl {
         while (!checkpoints.empty() && checkpoints.back().position > target) checkpoints.pop_back();
         update_checkpoint_bytes();
         ++stats.prompt_cache_restores;
+    }
+    // Sequence rows a cache-store blob carries: the MRoPE positions and KV rows
+    // of [first, first + count) in every attention layer, the index-cache rows
+    // of the blocks complete within them, and MTP KV rows. MTP row i is
+    // computed with token i + 1, so the MTP rows of a range trail it by one.
+    struct Rows { int first = 0, count = 0, index_first = 0, index_count = 0, mtp_first = 0, mtp_count = 0; };
+    Rows rows_of(int first, int end, int mtp_end) const {
+        Rows rows{first, end - first};
+        if (c.architecture == Architecture::Qwen4Exp) {
+            rows.index_first = first / c.block_size;
+            rows.index_count = end / c.block_size - rows.index_first;
+        }
+        if (mtp_backlog) {
+            rows.mtp_first = std::max(first - 1, 0);
+            rows.mtp_count = std::max(mtp_end - rows.mtp_first, 0);
+        }
+        return rows;
+    }
+    Rows chunk_rows(int index) const { return rows_of(index * store_chunk, (index + 1) * store_chunk, (index + 1) * store_chunk - 1); }
+    static size_t kv_bytes(const LayerState & s, int count) {
+        if (s.attention) return s.attention->rows_bytes(count);
+        return s.device_keys ? 2 * size_t(s.device_keys->ne[2]) * size_t(count) * s.device_keys->nb[1] : 0;
+    }
+    size_t rows_bytes(const Rows & rows) const {
+        size_t bytes = size_t(rows.count) * sizeof(rope_table[0]) + kv_bytes(mtp_state, rows.mtp_count);
+        for (const auto & s : states) {
+            bytes += kv_bytes(s, rows.count);
+            if (s.index_cache) bytes += size_t(rows.index_count) * s.index_cache->nb[1];
+        }
+        return bytes;
+    }
+    // Rows of a device KV tensor ([dim, token, kv_head]) are contiguous per head.
+    template<class Copy> static void device_rows(ggml_tensor * t, int first, int count, Copy && copy) {
+        if (!count) return;
+        for (int64_t head = 0; head < t->ne[2]; ++head)
+            copy(t, size_t(head) * t->nb[2] + size_t(first) * t->nb[1], size_t(count) * t->nb[1]);
+    }
+    template<class Copy> void each_device_range(const Rows & rows, Copy && copy) {
+        for (const auto & s : states)
+            if (s.index_cache && rows.index_count)
+                copy(s.index_cache, size_t(rows.index_first) * s.index_cache->nb[1], size_t(rows.index_count) * s.index_cache->nb[1]);
+        if (rows.mtp_count) {
+            device_rows(mtp_state.device_keys, rows.mtp_first, rows.mtp_count, copy);
+            device_rows(mtp_state.device_values, rows.mtp_first, rows.mtp_count, copy);
+        }
+    }
+    void read_rows(const Rows & rows, uint8_t * out) {
+        ggml_backend_synchronize(backend.get());
+        std::memcpy(out, rope_table.data() + rows.first, size_t(rows.count) * sizeof(rope_table[0]));
+        out += size_t(rows.count) * sizeof(rope_table[0]);
+        const auto get = [&](ggml_tensor * t, size_t offset, size_t bytes) {
+            ggml_backend_tensor_get(t, out, offset, bytes);
+            out += bytes;
+            if (!ggml_backend_is_cpu(backend.get())) stats.device_to_host_bytes += bytes;
+        };
+        for (const auto & s : states) {
+            if (s.attention) { s.attention->read_rows(rows.first, rows.count, out); out += s.attention->rows_bytes(rows.count); }
+            else if (s.device_keys) { device_rows(s.device_keys, rows.first, rows.count, get); device_rows(s.device_values, rows.first, rows.count, get); }
+        }
+        each_device_range(rows, get);
+    }
+    // KV sizes and the sequence are left as they are; `rope` receives the positions.
+    void write_rows(const Rows & rows, const uint8_t * in, std::vector<std::array<int32_t, 4>> & rope) {
+        if (rope.size() < size_t(rows.first + rows.count)) rope.resize(size_t(rows.first + rows.count));
+        std::memcpy(rope.data() + rows.first, in, size_t(rows.count) * sizeof(rope[0]));
+        in += size_t(rows.count) * sizeof(rope[0]);
+        const auto set = [&](ggml_tensor * t, size_t offset, size_t bytes) {
+            ggml_backend_tensor_set(t, in, offset, bytes);
+            in += bytes;
+            if (!ggml_backend_is_cpu(backend.get())) stats.host_to_device_bytes += bytes;
+        };
+        for (auto & s : states) {
+            if (s.attention) { s.attention->write_rows(rows.first, rows.count, in); in += s.attention->rows_bytes(rows.count); }
+            else if (s.device_keys) { device_rows(s.device_keys, rows.first, rows.count, set); device_rows(s.device_values, rows.first, rows.count, set); }
+        }
+        each_device_range(rows, set);
+    }
+    // Copies to the cache store the snapshots of the current sequence beyond
+    // `beyond` that it lacks, each with the KV rows below it: the snapshots
+    // inside prompts, the latest prompt end (earlier ends are superseded by
+    // it) and `extra`. False when `interrupt` stopped the copy.
+    bool sync_store(const std::function<bool()> & interrupt, int beyond = 0, const Checkpoint * extra = nullptr) {
+        if (!store || failed || !position) return true;
+        std::vector<const Checkpoint *> targets;
+        const Checkpoint * end = nullptr;
+        for (const auto & checkpoint : checkpoints) {
+            if (checkpoint.role == SnapshotRole::End) end = &checkpoint;
+            else targets.push_back(&checkpoint);
+        }
+        if (end) targets.push_back(end);
+        if (extra) targets.push_back(extra);
+        std::sort(targets.begin(), targets.end(), [](const Checkpoint * a, const Checkpoint * b) { return a->position < b->position; });
+        std::vector<uint64_t> chain;
+        uint64_t stamp = 0;
+        const auto start = Clock::now();
+        const auto finish = [&](bool complete) {
+            if (stamp) stats.cache_store_save_ms += elapsed(start);
+            return complete;
+        };
+        const auto describe_rows = [&](StoreKind kind, int first, int last) {
+            StoreMeta meta;
+            meta.key = {kind, last, chain[size_t(last)]};
+            meta.first = first;
+            meta.parent = chain[size_t(first)];
+            meta.tokens.assign(sequence.begin() + first, sequence.begin() + last);
+            if (std::any_of(sequence_hash.begin() + first, sequence_hash.begin() + last, [](uint64_t hash) { return hash != 0; }))
+                meta.images.assign(sequence_hash.begin() + first, sequence_hash.begin() + last);
+            return meta;
+        };
+        for (const auto * checkpoint : targets) {
+            const int p = checkpoint->position;
+            if (p <= beyond || p > position) continue;
+            if (chain.empty()) chain = prefix_chain(sequence, sequence_hash, sequence.size());
+            if (store->contains({StoreKind::Snapshot, p, chain[size_t(p)]})) continue;
+            if (!stamp) stamp = store->tick();
+            ProfileScope scope(&profiler, "host", "cache_store_save", "prompt_cache", p, -1, "CPU");
+            const int tail = p / store_chunk * store_chunk;
+            for (int index = 0; index < tail / store_chunk; ++index) {
+                const int last = (index + 1) * store_chunk;
+                if (store->contains({StoreKind::Chunk, last, chain[size_t(last)]})) continue;
+                if (interrupt && interrupt()) return finish(false);
+                const auto rows = chunk_rows(index);
+                auto payload = std::make_shared<Bytes>(rows_bytes(rows));
+                read_rows(rows, payload->data.get());
+                stats.cache_store_saved_bytes += payload->size;
+                // Refused: the store has no room beside what is more recent.
+                if (!store->put(describe_rows(StoreKind::Chunk, index * store_chunk, last), {std::move(payload)}, stamp)) return finish(true);
+            }
+            if (interrupt && interrupt()) return finish(false);
+            auto meta = describe_rows(StoreKind::Snapshot, tail, p);
+            meta.role = checkpoint->role;
+            meta.anchor_position = std::min(checkpoint->anchor, p);
+            meta.anchor_hash = chain[size_t(meta.anchor_position)];
+            // An MTP row drafted for a token that was not consumed yet is redone after a restore.
+            meta.mtp_next = std::min(checkpoint->mtp_next, p - 1);
+            meta.captured = checkpoint->captured;
+            const auto rows = rows_of(tail, p, meta.mtp_next);
+            auto payload = std::make_shared<Bytes>(rows_bytes(rows));
+            read_rows(rows, payload->data.get());
+            stats.cache_store_saved_bytes += payload->size + checkpoint->state->size;
+            if (!store->put(std::move(meta), {checkpoint->state, std::move(payload)}, stamp, &chain)) return finish(true);
+        }
+        return finish(true);
+    }
+    // Saves the sequence up to its last position, as when another replaces it.
+    void save_sequence(int beyond, bool with_reply) {
+        const int saved = checkpoints.empty() ? 0 : checkpoints.back().position;
+        if (with_reply && position > saved) {
+            const auto reply = take_checkpoint(false, SnapshotRole::Generated);
+            sync_store({}, beyond, &reply);
+        } else sync_store({}, beyond);
+    }
+    void flush_store() {
+        if (!store) return;
+        if (!failed && position) save_sequence(0, true);
+        store->flush();
+    }
+    // Makes the stored snapshot `match` the sequence: KV rows beyond the first
+    // `live` positions, which the engine holds, come from the store. False
+    // when a blob could not be read; the sequence is then unchanged, though
+    // rows above the live prefix may hold stored copies of the same prefix.
+    bool restore_stored(const StoreMatch & match, const std::vector<int32_t> & tokens, const std::vector<uint64_t> & hashes,
+                        int live, int floor) {
+        const auto start = Clock::now();
+        const int p = match.snapshot.key.position;
+        ProfileScope scope(&profiler, "host", "cache_store_restore", "prompt_cache", p, -1, "CPU");
+        decode_graph.reset();
+        hybrid.clear();
+        ggml_backend_synchronize(backend.get());
+        std::vector<std::array<int32_t, 4>> rope(rope_table.begin(), rope_table.begin() + std::min<long>(long(rope_table.size()), std::min(live, p)));
+        std::vector<Blob> snapshot;
+        try {
+            for (size_t i = 0; i < match.chunks.size(); ++i) {
+                for (size_t ahead = i + 1; ahead < std::min(match.chunks.size(), i + 4); ++ahead) store->prefetch(match.chunks[ahead].key);
+                if (i + 3 >= match.chunks.size()) store->prefetch(match.snapshot.key);
+                const auto & chunk = match.chunks[i];
+                const auto parts = store->load(chunk.key);
+                const auto rows = rows_of(chunk.first, chunk.key.position, chunk.key.position - 1);
+                if (parts.size() != 1 || parts[0]->size != rows_bytes(rows)) throw std::runtime_error("Cache store: a chunk does not fit the engine");
+                write_rows(rows, parts[0]->data.get(), rope);
+            }
+            snapshot = store->load(match.snapshot.key);
+            const auto rows = rows_of(match.snapshot.first, p, match.snapshot.mtp_next);
+            if (snapshot.size() != 2 || snapshot[0]->size != checkpoint_bytes(size_t(match.snapshot.captured)) || snapshot[1]->size != rows_bytes(rows))
+                throw std::runtime_error("Cache store: a snapshot does not fit the engine");
+            if (p > live) write_rows(rows, snapshot[1]->data.get(), rope);
+            if (rope.size() != size_t(p)) throw std::runtime_error("Cache store: the stored rows do not reach the snapshot");
+        } catch (const std::runtime_error &) { return false; }
+        // From here the sequence is the stored one. Snapshots of the replaced
+        // sequence stay valid within the prefix both share.
+        while (!checkpoints.empty() && checkpoints.back().position > std::min(live, p)) checkpoints.pop_back();
+        sequence.assign(tokens.begin(), tokens.begin() + p);
+        sequence_hash.assign(hashes.begin(), hashes.begin() + p);
+        rope_table = std::move(rope);
+        for (auto & s : states) if (s.attention) s.attention->resize(p);
+        checkpoints.push_back({p, snapshot[0], size_t(match.snapshot.captured), match.snapshot.mtp_next, -1, false, match.snapshot.role,
+                               match.snapshot.anchor_position});
+        restore_checkpoint(&checkpoints.back());
+        trim_checkpoints();
+        ++stats.cache_store_restores;
+        stats.cache_store_restored_tokens += uint64_t(p - floor);
+        stats.cache_store_restore_ms += elapsed(start);
+        return true;
     }
     void commit_hashes(int n) {
         if (pending_hash.size() == size_t(n)) sequence_hash.insert(sequence_hash.end(), pending_hash.begin(), pending_hash.end());
@@ -2702,7 +2964,7 @@ struct Engine::Impl {
         return prefill_spans(tokens, describe(tokens, images, position), capture);
     }
     std::vector<Step> prefill_cached(const std::vector<int32_t> & tokens, const std::vector<ImageSpan> & images, bool capture,
-                                     const std::vector<int> & pins = {}) {
+                                     const std::vector<int> & pins = {}, bool reuse = true) {
         if (failed) throw std::runtime_error("Previous execution failed; call reset() before prefill");
         if (tokens.empty()) throw std::invalid_argument("Empty prompt");
         if (tokens.size() > size_t(c.context)) throw std::out_of_range("Prompt exceeds context capacity");
@@ -2712,13 +2974,42 @@ struct Engine::Impl {
         for (const auto & s : spans) std::fill(hashes.begin() + s.offset, hashes.begin() + s.offset + s.count, s.hash);
         // A position matches when its token and its image content both match.
         size_t common = 0;
-        while (common < sequence.size() && common < tokens.size() && sequence[common] == tokens[common] &&
+        while (reuse && common < sequence.size() && common < tokens.size() && sequence[common] == tokens[common] &&
                sequence_hash[common] == hashes[common]) ++common;
-        if (common < sequence.size()) {
-            const Checkpoint * checkpoint = nullptr;
-            for (const auto & candidate : checkpoints) if (size_t(candidate.position) <= common) checkpoint = &candidate;
-            try { restore_checkpoint(checkpoint); } catch (...) { failed = true; throw; }
-        }
+        // The prompt either extends the sequence or rolls it back to a snapshot.
+        const bool extends = common == sequence.size();
+        const Checkpoint * checkpoint = nullptr;
+        if (!extends) for (const auto & candidate : checkpoints) if (size_t(candidate.position) <= common) checkpoint = &candidate;
+        bool restored = false;
+        int branch = 0;
+        if (store) try {
+            const auto prefix = prefix_chain(tokens, hashes, tokens.size());
+            const uint64_t stamp = store->tick();
+            const int floor = extends ? position : checkpoint ? checkpoint->position : 0;
+            // The match is pinned first: saving the replaced sequence may evict.
+            std::optional<StoreMatch> match;
+            if (reuse) match = store->find({prefix, tokens, hashes, int(common), floor}, stamp);
+            struct Release {
+                CacheStore & store; const std::optional<StoreMatch> & match;
+                ~Release() { if (match) store.release(*match); }
+            } release{*store, match};
+            // A prompt that does not even keep the previous prompt belongs to
+            // another sequence: the replaced one is saved up to its last reply.
+            const bool replaces = !extends && int(common) < last_prompt_end;
+            if (!extends) save_sequence(int(common), replaces);
+            if (match) restored = restore_stored(*match, tokens, hashes, int(common), floor);
+            if (!restored && checkpoint) store->used({StoreKind::Snapshot, checkpoint->position, prefix[size_t(checkpoint->position)]}, stamp);
+            if (reuse && options.cache_store.branch_tokens > 0) {
+                // Where this prompt parts from the sequence it replaces, or from a stored one.
+                int parting = replaces ? int(common) : 0;
+                for (int end = store_chunk; size_t(end) <= tokens.size() && store->contains({StoreKind::Chunk, end, prefix[size_t(end)]}); end += store_chunk)
+                    parting = std::max(parting, end);
+                const int resume = restored || extends ? position : checkpoint ? checkpoint->position : 0;
+                if (parting - resume >= options.cache_store.branch_tokens && size_t(parting) < tokens.size()) branch = parting;
+            }
+        } catch (...) { failed = true; throw; }
+        if (!restored && !extends) try { restore_checkpoint(checkpoint); } catch (...) { failed = true; throw; }
+        last_prompt_end = int(tokens.size());
         stats.prompt_cache_reused_tokens += uint64_t(position);
         std::vector<int> stops;
         for (const int p : pins) if (p > 0 && size_t(p) <= tokens.size()) stops.push_back(p);
@@ -2736,11 +3027,14 @@ struct Engine::Impl {
             return {};
         }
         std::vector<Step> result;
-        for (const int stop : stops) {
+        // The parting point is a stop like the pins, with an unpinned snapshot.
+        std::vector<int> breaks = stops;
+        if (branch && !std::binary_search(stops.begin(), stops.end(), branch)) breaks.insert(std::upper_bound(breaks.begin(), breaks.end(), branch), branch);
+        for (const int stop : breaks) {
             if (stop <= position || size_t(stop) >= tokens.size()) continue;
             auto steps = prefill_spans({tokens.begin() + position, tokens.begin() + stop}, spans, capture);
             result.insert(result.end(), std::make_move_iterator(steps.begin()), std::make_move_iterator(steps.end()));
-            try { save_checkpoint(true); } catch (...) { failed = true; throw; }
+            try { save_checkpoint(std::binary_search(stops.begin(), stops.end(), stop), SnapshotRole::Break); } catch (...) { failed = true; throw; }
         }
         auto steps = prefill_spans({tokens.begin() + position, tokens.end()}, spans, capture);
         result.insert(result.end(), std::make_move_iterator(steps.begin()), std::make_move_iterator(steps.end()));
@@ -2828,6 +3122,7 @@ struct Engine::Impl {
         rope_table.clear();
         injected.clear(); injected_row = nullptr;
         checkpoints.clear();
+        last_prompt_end = 0;
         captured_logits.clear();
         sampler->reset();
         position = 0;
@@ -2861,6 +3156,27 @@ std::vector<Step> Engine::prefill_cached(const std::vector<int32_t> & tokens, co
 std::vector<Step> Engine::prefill_cached(const std::vector<int32_t> & tokens, const std::vector<ImageSpan> & images,
                                          bool capture_logits, const std::vector<int> & pin_positions) {
     return impl_->prefill_cached(tokens, images, capture_logits, pin_positions);
+}
+std::vector<Step> Engine::prefill_cached(const std::vector<int32_t> & tokens, const std::vector<ImageSpan> & images,
+                                         bool capture_logits, const std::vector<int> & pin_positions, bool reuse) {
+    return impl_->prefill_cached(tokens, images, capture_logits, pin_positions, reuse);
+}
+bool Engine::cache_sync(const std::function<bool()> & interrupt) { return impl_->sync_store(interrupt); }
+void Engine::cache_flush() { impl_->flush_store(); }
+void Engine::cache_clear() { if (impl_->store) impl_->store->clear(); }
+CacheStoreInfo Engine::cache_store() const {
+    CacheStoreInfo out;
+    if (!impl_->store) return out;
+    const auto info = impl_->store->info();
+    const auto & o = impl_->options.cache_store;
+    out.enabled = true;
+    out.ram_bytes = info.ram_bytes; out.ram_limit = o.ram_bytes; out.disk_bytes = info.disk_bytes; out.disk_limit = o.disk_bytes;
+    out.chunks = info.chunks; out.snapshots = info.snapshots; out.tokens = info.tokens;
+    out.written_bytes = info.written_bytes; out.read_bytes = info.read_bytes;
+    out.dropped = info.dropped; out.dropped_bytes = info.dropped_bytes;
+    out.chunk_tokens = impl_->store_chunk;
+    out.error = info.error;
+    return out;
 }
 void Engine::keep_checkpoints(const std::vector<int> & positions) { impl_->keep_checkpoints(positions); }
 std::vector<std::pair<int, bool>> Engine::checkpoints() const {

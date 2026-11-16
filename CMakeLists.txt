@@ -163,6 +163,8 @@ if(BUILD_TESTING)
     target_link_libraries(tidal-cache-store-test PRIVATE tidal)
     target_include_directories(tidal-cache-store-test PRIVATE src)
     add_test(NAME cache-store COMMAND tidal-cache-store-test)
+    add_executable(tidal-session-cache-test tests/session_cache.cpp)
+    target_link_libraries(tidal-session-cache-test PRIVATE tidal)
     if(TARGET tidal-server)
         add_executable(tidal-server-test tests/server.cpp)
         target_link_libraries(tidal-server-test PRIVATE tidal-server-core)
@@ -195,6 +197,14 @@ if(BUILD_TESTING)
             add_test(NAME prefill COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_prefill.py --bin-dir $<TARGET_FILE_DIR:tidal-cli>)
             set_tests_properties(prefill PROPERTIES TIMEOUT 240)
+            add_test(NAME session-cache COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_session_cache.py --bin-dir $<TARGET_FILE_DIR:tidal-cli> --backend cpu)
+            set_tests_properties(session-cache PROPERTIES TIMEOUT 300)
+            if(TIDAL_CUDA)
+                add_test(NAME session-cache-cuda COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_session_cache.py --bin-dir $<TARGET_FILE_DIR:tidal-cli> --backend cuda)
+                set_tests_properties(session-cache-cuda PROPERTIES TIMEOUT 600)
+            endif()
             add_test(NAME residency COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_residency.py --bin-dir $<TARGET_FILE_DIR:tidal-cli>)
             set_tests_properties(residency PROPERTIES TIMEOUT 180)

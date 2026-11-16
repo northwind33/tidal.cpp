@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -111,6 +112,26 @@ struct ProfileEvent {
     double start_us = 0, wall_us = 0;
 };
 
+// Session cache of Engine::prefill_cached: KV rows and state snapshots of
+// sequences the engine no longer holds, kept in host memory up to `ram_bytes`
+// and spilled to files under `directory` up to `disk_bytes`. A prompt that
+// returns to one of those sequences resumes from the stored state instead of
+// being prefilled again. Files are tied to the model file and the options that
+// shape the state, and a later engine with the same ones adopts them.
+struct CacheStoreOptions {
+    uint64_t ram_bytes = 0;
+    uint64_t disk_bytes = 0;  // Requires `directory`.
+    std::string directory;
+    // KV rows per stored chunk; sequences share the chunks of a common prefix.
+    // Zero selects 256, rounded up to a multiple of the QSA block size.
+    int chunk_tokens = 0;
+    // A prompt that parts from another sequence at least this many tokens past
+    // the state it resumes from leaves a snapshot at the parting point, where
+    // later prompts with the same prefix resume. Zero disables it.
+    int branch_tokens = 512;
+    bool enabled() const { return ram_bytes || disk_bytes; }
+};
+
 struct Options {
     std::string backend = "cuda";
     int device = 0;
@@ -163,6 +184,7 @@ struct Options {
     // Image token budget after resizing (one token per 2x2 merged patches);
     // zero keeps the defaults of 8 and 4096 tokens.
     int image_min_tokens = 0, image_max_tokens = 0;
+    CacheStoreOptions cache_store;
 };
 
 // Decoded 8-bit RGB pixels, row-major, width * height * 3 bytes.
@@ -258,10 +280,24 @@ struct Statistics {
     uint64_t prompt_cache_restores = 0;      // Rollbacks to a snapshot (or to an empty sequence).
     uint64_t prompt_cache_checkpoint_bytes = 0; // Host memory held by current snapshots.
     uint64_t prompt_cache_pinned = 0;           // Current snapshots exempt from the count limit.
+    uint64_t cache_store_restores = 0;          // prefill_cached calls that resumed from the cache store.
+    uint64_t cache_store_restored_tokens = 0;   // Positions they took from it beyond the engine's own reuse.
+    uint64_t cache_store_saved_bytes = 0;       // KV rows and snapshots copied into the store.
+    double cache_store_restore_ms = 0, cache_store_save_ms = 0;
     uint64_t speculative_verifications = 0, speculative_drafted = 0, speculative_accepted = 0;
     uint64_t mtp_drafts = 0; // Engine::draft calls.
     uint64_t images_encoded = 0, image_tokens = 0; // Vision tower runs and their output tokens.
     double vision_ms = 0;                          // Preprocessing and encoding.
+};
+
+struct CacheStoreInfo {
+    bool enabled = false;
+    uint64_t ram_bytes = 0, ram_limit = 0, disk_bytes = 0, disk_limit = 0;
+    uint64_t chunks = 0, snapshots = 0, tokens = 0;  // Stored blobs; KV rows held by the chunks.
+    uint64_t written_bytes = 0, read_bytes = 0;      // Disk traffic of this engine.
+    uint64_t dropped = 0, dropped_bytes = 0;         // Blobs that no longer fit either budget.
+    int chunk_tokens = 0;
+    std::string error;                               // Latest disk failure; the disk tier stops growing after one.
 };
 
 struct ModelInfo {
@@ -314,6 +350,23 @@ public:
     // them or reset.
     std::vector<Step> prefill_cached(const std::vector<int32_t> & tokens, const std::vector<ImageSpan> & images,
                                      bool capture_logits, const std::vector<int> & pin_positions);
+    // As above; `reuse` false evaluates the whole prompt. The sequence it
+    // replaces is still saved to the cache store first.
+    std::vector<Step> prefill_cached(const std::vector<int32_t> & tokens, const std::vector<ImageSpan> & images,
+                                     bool capture_logits, const std::vector<int> & pin_positions, bool reuse);
+    // Cache store (Options::cache_store). prefill_cached saves the state it is
+    // about to overwrite and looks stored state up on its own; cache_sync does
+    // the saving ahead of time, while the engine is idle: it copies the
+    // snapshots of the current sequence and the KV rows below them that the
+    // store lacks. `interrupt` is polled between blobs; the result is false
+    // when it stopped the copy, which a later call continues.
+    bool cache_sync(const std::function<bool()> & interrupt = {});
+    // Saves the current sequence up to its last position and waits until the
+    // store has written what fits on disk; for an orderly shutdown.
+    void cache_flush();
+    // Drops everything the store holds, files included.
+    void cache_clear();
+    CacheStoreInfo cache_store() const;
     // Pins the snapshots at `positions` and unpins all others; unpinned ones
     // beyond prompt_cache_checkpoints are dropped, oldest first.
     void keep_checkpoints(const std::vector<int> & positions);

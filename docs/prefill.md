@@ -216,6 +216,63 @@ A restored sequence is bit-identical to a fresh engine that ran the same
 prefill/decode partition (`tidal-state-test`). Plain `prefill`/`decode` still
 append and track the consumed tokens but take no snapshots.
 
+### Cache store
+
+The engine holds one sequence: a prompt that shares little with it overwrites
+its KV rows and drops its snapshots. `Options::cache_store` (`ram_bytes`,
+`disk_bytes`, `directory`) keeps that state outside the sequence so that a
+later `prefill_cached` can resume from it:
+
+- State is stored as immutable blobs addressed by a hash of the prefix they
+  complete (token ids and image hashes). A *chunk* holds the MRoPE positions
+  and KV rows of `chunk_tokens` positions in every attention layer, the QSA
+  index-cache rows of the blocks inside them and the MTP KV rows; a *snapshot*
+  holds the rollback state of one position plus the same rows since the last
+  chunk boundary. A snapshot is restorable when the chunks below it are
+  present, so sequences with a common prefix share its chunks.
+- `prefill_cached` looks every prompt up. When a stored snapshot lies beyond
+  what the sequence and its own snapshots can reuse, the chunks that reach past
+  the common prefix are written back into the KV cache, the snapshot is
+  restored and becomes one of the engine's snapshots, and only the rest is
+  prefilled. The chunk tokens are compared with the prompt, not just hashed.
+- Before a prompt overwrites rows, the snapshots beyond the common prefix that
+  the store lacks are copied to it with the chunks below them. When the prompt
+  does not even keep the previous prompt (another conversation), a snapshot of
+  the last position is saved too, so that the replaced sequence can resume
+  after its generated tokens. `cache_sync(interrupt)` does this copying ahead
+  of time, between requests, and `cache_flush()` saves everything and waits for
+  the disk; tidal-server calls them while idle and at shutdown.
+- A prompt that parts from the replaced sequence, or from a stored one, at
+  least `branch_tokens` past the position it resumes from stops there to take
+  a snapshot, like a pin without being pinned.
+- New blobs enter host memory. A background thread writes the least recently
+  used ones to disk when `ram_bytes` fills up (and some ahead of need), drops
+  memory copies that are also on disk, and deletes what fits in neither
+  budget: leaves first, least recently used first, never a chunk before the
+  blobs that need it. A snapshot is superseded when a later prompt end of the
+  same sequence is stored; superseded snapshots go first and are not written,
+  unless a prompt restores one again, which makes it a kept branch point.
+  Blobs read from disk stay in memory while colder, already written blobs can
+  make room. `put` refuses a blob rather than evict state of the same age.
+- Files live under `directory/<fingerprint>/`, one per blob, with a header
+  (key, token range, tokens) and a checksummed payload. The fingerprint covers
+  the model file (path, size, modification time), MTP and vision files, the
+  backend, KV placement and types, context, chunk size and the sizes of the
+  rollback tensors, so an engine only ever sees files it can use, and adopts
+  them at start. Unreadable or unreachable files are removed. One process at
+  a time holds a fingerprint's directory (an advisory lock).
+
+The stored bytes are the engine's working formats (16-bit KV rows as placed,
+BF16 index rows, F32 state), so saving and restoring are copies:
+`Statistics::cache_store_*` count restores, restored positions, copied bytes
+and the time spent, and `Engine::cache_store()` reports the store's contents.
+What `tidal-session-cache-test` checks is that a sequence that left the engine
+continues bit-identically to one that never did, across the memory and disk
+tiers, a restart, eviction and MTP drafting. The one exception is shared
+chunks: rows of a common prefix are those of the sequence that stored them
+first, and a CUDA batch of another length rounds them differently in the last
+bits, as layer-major, hybrid and decode already do among themselves.
+
 ## Controls and measurements
 
 The CLI and benchmark accept:

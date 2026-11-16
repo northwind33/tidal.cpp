@@ -154,6 +154,16 @@ public:
     }
     int size() const { return size_; }
     size_t bytes() const { return (keys_.size() + values_.size()) * sizeof(uint16_t); }
+    // Raw rows [first, first + count) for the cache store: the keys of every
+    // KV head, then the values, each as [kv_head][token][dim].
+    size_t rows_bytes(int count) const { return 2 * size_t(kv_heads_) * size_t(count) * dim_ * sizeof(uint16_t); }
+    void read_rows(int first, int count, uint8_t * out) const;
+    // Rows written beyond size() join the sequence with resize().
+    void write_rows(int first, int count, const uint8_t * in);
+    void resize(int tokens) {
+        if (tokens < 0 || tokens > capacity_) throw std::out_of_range("KV size beyond the cache capacity");
+        size_ = tokens;
+    }
 private:
     void store(const uint16_t * key, const uint16_t * value, int tokens);
     size_t row_offset(int head, int token) const { return (size_t(head) * capacity_ + token) * dim_; }

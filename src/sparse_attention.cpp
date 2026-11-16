@@ -614,6 +614,19 @@ std::vector<float> SparseAttention::attend_batch(const std::vector<float> & quer
     return result;
 }
 
+void SparseAttention::read_rows(int first, int count, uint8_t * out) const {
+    if (first < 0 || count < 0 || first + count > size_) throw std::out_of_range("KV rows outside the cached sequence");
+    const size_t bytes = size_t(count) * dim_ * sizeof(uint16_t);
+    for (const auto * store : {&keys_, &values_})
+        for (int head = 0; head < kv_heads_; ++head, out += bytes) std::memcpy(out, store->data() + row_offset(head, first), bytes);
+}
+void SparseAttention::write_rows(int first, int count, const uint8_t * in) {
+    if (first < 0 || count < 0 || first + count > capacity_) throw std::out_of_range("KV rows beyond the cache capacity");
+    const size_t bytes = size_t(count) * dim_ * sizeof(uint16_t);
+    for (auto * store : {&keys_, &values_})
+        for (int head = 0; head < kv_heads_; ++head, in += bytes) std::memcpy(store->data() + row_offset(head, first), in, bytes);
+}
+
 std::vector<int32_t> expand_blocks(const std::vector<int32_t> & blocks, int visible, int block_size) {
     if (visible <= 0 || block_size <= 0) throw std::invalid_argument("Invalid QSA block geometry");
     const int complete = visible / block_size;
