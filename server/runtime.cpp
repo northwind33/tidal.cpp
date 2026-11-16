@@ -34,7 +34,13 @@ void Runtime::shutdown() {
 }
 
 std::string Runtime::error() const { std::lock_guard lock(mutex_); return error_; }
-Metrics Runtime::metrics() const { std::lock_guard lock(mutex_); return metrics_; }
+Metrics Runtime::metrics() const {
+    std::lock_guard lock(mutex_);
+    auto metrics = metrics_;
+    // The store answers from any thread; the engine is released under this lock.
+    if (engine_ && state_ == State::Ready) metrics.store = engine_->cache_store();
+    return metrics;
+}
 
 void Runtime::work() {
     // The engine is created, used and destroyed on this thread only.
@@ -69,8 +75,32 @@ void Runtime::work() {
         busy_ = true;
         job();
         busy_ = false;
+        idle();
     }
+    if (engine_ && config_.options.cache_store.enabled()) {
+        // An orderly shutdown keeps the current sequence, and on disk what fits there.
+        notice("cache store: saving the current sequence");
+        try { engine_->cache_flush(); }
+        catch (const std::exception & e) { notice(std::string("cache store: ") + e.what()); }
+    }
+    std::lock_guard lock(mutex_);
     engine_.reset();
+}
+
+// Between requests: copies what the cache store lacks of the current sequence,
+// so that a request that replaces it does not have to wait for the copy. A
+// request that arrives meanwhile interrupts it after the blob in progress.
+void Runtime::idle() {
+    if (!engine_ || !config_.options.cache_store.enabled()) return;
+    const double before = engine_->statistics().cache_store_save_ms;
+    try { engine_->cache_sync([&] { return stopping_ || queued_ > 0; }); }
+    catch (const std::exception & e) { notice(std::string("cache store: ") + e.what()); }
+    if (const double spent = engine_->statistics().cache_store_save_ms - before; spent > 0) {
+        std::lock_guard lock(mutex_);
+        metrics_.store_save_seconds += spent / 1000;
+    }
+    const auto error = engine_->cache_store().error;
+    if (!error.empty() && error != store_error_) notice("cache store: " + (store_error_ = error));
 }
 
 void Runtime::submit(std::function<void()> job) {
@@ -88,7 +118,7 @@ void Runtime::submit(std::function<void()> job) {
 
 void Runtime::erase() {
     if (state_ != State::Ready) throw ApiError(503, "unavailable_error", "Loading model");
-    submit([this] { engine_->reset(); ledger_.clear(); });
+    submit([this] { engine_->reset(); engine_->cache_clear(); ledger_.clear(); });
 }
 
 std::vector<TensorPlacement> Runtime::placements() const {
@@ -151,16 +181,29 @@ GenerationResult Runtime::execute(const Prompt & request, const GenerationParams
         // Snapshots stay pinned while a live cache entry may still read them.
         ledger_.sweep(prompt_start);
         engine.keep_checkpoints(ledger_.positions(size_t(std::max(config_.cache_snapshots, 0))));
-        if (!params.cache_prompt) engine.reset();
         const uint64_t reused = engine.statistics().prompt_cache_reused_tokens, encoded = engine.statistics().images_encoded;
+        const uint64_t restores = engine.statistics().cache_store_restores, restored = engine.statistics().cache_store_restored_tokens;
+        const double restore_ms = engine.statistics().cache_store_restore_ms, save_ms = engine.statistics().cache_store_save_ms;
         const auto pins = params.cache.enabled && config_.cache_snapshots > 0 ? params.cache.pins() : std::vector<int>{};
-        try { engine.prefill_cached(prompt, request.images, false, pins); }
+        // Without cache_prompt the whole prompt is evaluated; the sequence it
+        // replaces still goes to the cache store.
+        try { engine.prefill_cached(prompt, request.images, false, pins, params.cache_prompt); }
         catch (const std::invalid_argument & e) {
             // Images are checked and encoded before the sequence changes.
             throw invalid_request(std::string("Invalid image input: ") + e.what());
         }
         result.cached_tokens = int(engine.statistics().prompt_cache_reused_tokens - reused);
         result.images_encoded = int(engine.statistics().images_encoded - encoded);
+        result.restored_tokens = int(engine.statistics().cache_store_restored_tokens - restored);
+        result.restore_ms = engine.statistics().cache_store_restore_ms - restore_ms;
+        result.save_ms = engine.statistics().cache_store_save_ms - save_ms;
+        if (config_.options.cache_store.enabled()) {
+            std::lock_guard lock(mutex_);
+            metrics_.store_restores += engine.statistics().cache_store_restores - restores;
+            metrics_.store_restored_tokens += uint64_t(result.restored_tokens);
+            metrics_.store_restore_seconds += result.restore_ms / 1000;
+            metrics_.store_save_seconds += result.save_ms / 1000;
+        }
         result.cache = ledger_.account(params.cache, params.cache.enabled ? prefix_hashes(prompt, request.images) : std::vector<uint64_t>(prompt.size() + 1),
                                        result.cached_tokens, prompt_start);
         engine.set_sampling(params.sampling);

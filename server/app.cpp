@@ -196,7 +196,8 @@ Json timings(const GenerationResult & r) {
     const int evaluated = r.prompt_tokens - r.cached_tokens, predicted = int(r.tokens.size());
     const auto rate = [](int count, double ms) { return ms > 0 ? Json(count * 1000.0 / ms) : Json(); };
     const auto each = [](int count, double ms) { return count > 0 ? Json(ms / count) : Json(); };
-    return Json::object({{"cache_n", r.cached_tokens}, {"prompt_n", evaluated}, {"prompt_ms", r.prompt_ms},
+    return Json::object({{"cache_n", r.cached_tokens}, {"cache_store_n", r.restored_tokens}, {"cache_store_ms", r.restore_ms},
+        {"cache_save_ms", r.save_ms}, {"prompt_n", evaluated}, {"prompt_ms", r.prompt_ms},
         {"prompt_per_token_ms", each(evaluated, r.prompt_ms)}, {"prompt_per_second", rate(evaluated, r.prompt_ms)},
         {"predicted_n", predicted}, {"predicted_ms", r.generation_ms},
         {"predicted_per_token_ms", each(predicted, r.generation_ms)}, {"predicted_per_second", rate(predicted, r.generation_ms)}});
@@ -1273,7 +1274,21 @@ void App::props(const Request &, Response & response) {
         {"build_info", version}, {"backend", runtime_.backend()}, {"n_vocab", runtime_.model().vocab},
         {"tokenizer", tokenizer.byte_fallback() ? "bytes" : "bpe"},
         {"speculative", Json::object({{"draft_tokens", runtime_.config().draft_tokens}})},
+        {"cache_store", cache_store_json(runtime_.metrics())},
         {"thinking_default", config_.thinking.value_or(runtime_.chat().thinking_default())}}));
+}
+
+// The cache store's budgets and contents; null when it is disabled.
+Json App::cache_store_json(const Metrics & m) const {
+    const auto & s = m.store;
+    if (!s.enabled) return Json();
+    return Json::object({{"ram_bytes", s.ram_bytes}, {"ram_limit", s.ram_limit}, {"disk_bytes", s.disk_bytes}, {"disk_limit", s.disk_limit},
+        {"directory", runtime_.config().options.cache_store.directory}, {"chunk_tokens", s.chunk_tokens},
+        {"chunks", s.chunks}, {"snapshots", s.snapshots}, {"tokens", s.tokens},
+        {"restores", m.store_restores}, {"restored_tokens", m.store_restored_tokens},
+        {"restore_seconds", m.store_restore_seconds}, {"save_seconds", m.store_save_seconds},
+        {"written_bytes", s.written_bytes}, {"read_bytes", s.read_bytes}, {"dropped", s.dropped}, {"dropped_bytes", s.dropped_bytes},
+        {"error", s.error.empty() ? Json() : Json(s.error)}});
 }
 
 Json App::vision_json() const {
@@ -1331,7 +1346,7 @@ void App::slots(const Request &, Response & response) {
     params.max_tokens = config_.max_tokens;
     send_json(response, 200, list({Json::object({{"id", 0}, {"n_ctx", runtime_.context()},
         {"speculative", runtime_.config().draft_tokens > 0}, {"is_processing", runtime_.busy()},
-        {"queued", runtime_.queued()}, {"params", sampling_json(params)},
+        {"queued", runtime_.queued()}, {"params", sampling_json(params)}, {"cache_store", cache_store_json(runtime_.metrics())},
         {"next_token", Json::object({{"n_decoded", runtime_.decoded()}, {"n_remain", runtime_.remaining()}})}})}));
 }
 
@@ -1369,6 +1384,19 @@ void App::metrics(const Request &, Response & response) {
     metric("tidal:cache_entries", "gauge", "API cache entries as of the last request.", double(m.cache_entries));
     metric("tidal:cache_snapshots", "gauge", "Engine state snapshots as of the last request.", double(m.cache_snapshots));
     metric("tidal:cache_snapshot_bytes", "gauge", "Host memory held by engine state snapshots.", double(m.cache_snapshot_bytes));
+    if (m.store.enabled) {
+        metric("tidal:cache_store_ram_bytes", "gauge", "Host memory held by the cache store.", double(m.store.ram_bytes));
+        metric("tidal:cache_store_disk_bytes", "gauge", "Disk space held by the cache store.", double(m.store.disk_bytes));
+        metric("tidal:cache_store_snapshots", "gauge", "State snapshots in the cache store.", double(m.store.snapshots));
+        metric("tidal:cache_store_tokens", "gauge", "Token positions whose KV rows the cache store holds.", double(m.store.tokens));
+        metric("tidal:cache_store_restores_total", "counter", "Requests that resumed from the cache store.", double(m.store_restores));
+        metric("tidal:cache_store_restored_tokens_total", "counter", "Prompt tokens resumed from the cache store.", double(m.store_restored_tokens));
+        metric("tidal:cache_store_restore_seconds_total", "counter", "Time spent loading state from the cache store.", m.store_restore_seconds);
+        metric("tidal:cache_store_save_seconds_total", "counter", "Time spent copying state into the cache store.", m.store_save_seconds);
+        metric("tidal:cache_store_written_bytes_total", "counter", "Bytes the cache store wrote to disk.", double(m.store.written_bytes));
+        metric("tidal:cache_store_read_bytes_total", "counter", "Bytes the cache store read from disk.", double(m.store.read_bytes));
+        metric("tidal:cache_store_dropped_total", "counter", "Blobs dropped for lack of room in the cache store.", double(m.store.dropped));
+    }
     response.send(200, "text/plain; version=0.0.4; charset=utf-8", out);
 }
 

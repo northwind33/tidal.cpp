@@ -51,6 +51,8 @@ struct GenerationResult {
     StopType stop = StopType::None;
     std::string stopping_word;
     int prompt_tokens = 0, cached_tokens = 0, images_encoded = 0; // cached_tokens: physically reused.
+    int restored_tokens = 0;        // Of cached_tokens, those whose state came from the cache store.
+    double restore_ms = 0, save_ms = 0; // Of prompt_ms: loading that state, and saving the sequence it replaced.
     CacheUsage cache;               // Reads and writes as the request's API reports them.
     double prompt_ms = 0, generation_ms = 0;
 };
@@ -79,12 +81,19 @@ struct RuntimeConfig {
     int draft_tokens = 0;       // Speculative decoding with MTP drafts.
     std::string chat_template;  // auto | chatml | qwen35 | qwen38
     int cache_snapshots = 16;   // Snapshots kept pinned for live cache entries.
+    // Receives notices from the worker thread (cache store saves and failures).
+    std::function<void(const std::string &)> log;
 };
 
 struct Metrics {
     uint64_t requests = 0, prompt_tokens = 0, cached_tokens = 0, generated_tokens = 0, images = 0;
     uint64_t cache_read_tokens = 0, cache_write_tokens = 0; // As reported to clients.
     uint64_t cache_entries = 0, cache_snapshots = 0, cache_snapshot_bytes = 0;
+    // Cache store (Options::cache_store): requests resumed from it and the
+    // prompt tokens that saved, then its contents as of now.
+    uint64_t store_restores = 0, store_restored_tokens = 0;
+    double store_restore_seconds = 0, store_save_seconds = 0; // Saving includes the copies made while idle.
+    CacheStoreInfo store;
     double prompt_seconds = 0, generation_seconds = 0;
 };
 
@@ -120,7 +129,8 @@ public:
                               const GenerationCallbacks & callbacks) {
         return generate(Prompt{prompt, {}}, params, callbacks);
     }
-    // Drops the cached sequence, its snapshots and all cache entries.
+    // Drops the cached sequence, its snapshots, all cache entries and
+    // everything in the cache store.
     void erase();
     // Asks a running generation to stop; later requests are rejected.
     void shutdown();
@@ -152,9 +162,12 @@ private:
     std::deque<std::packaged_task<void()>> jobs_;
     Metrics metrics_;
     CacheLedger ledger_; // Worker thread only.
+    std::string store_error_; // Latest cache store failure that was reported.
     std::thread worker_;
 
     void work();
+    void idle();
+    void notice(const std::string & message) const { if (config_.log) config_.log(message); }
     void submit(std::function<void()> job);
     GenerationResult execute(const Prompt & prompt, const GenerationParams & params, const GenerationCallbacks & callbacks);
 };

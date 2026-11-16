@@ -69,6 +69,7 @@ private:
     void metrics(const Request &, Response &);
     void placement(const Request &, Response &);
     Json vision_json() const;
+    Json cache_store_json(const Metrics & metrics) const;
     Prompt tokenize_with_images(const std::string & text, const std::vector<std::shared_ptr<const Image>> & images) const;
     void health(const Request &, Response &);
 };

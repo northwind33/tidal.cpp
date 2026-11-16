@@ -501,6 +501,107 @@ def transport(server, reference):
     assert not server.get('/slots')[0]['is_processing']
 
 
+def session_cache(binary, model, directory):
+    """Conversations that take turns resume from the cache store (--cache-ram, --cache-disk)."""
+    flags = ['--model', model, '--backend', 'cpu', '--cache-ram', '64M', '--cache-disk', '1G', '--cache-dir', directory,
+             '--cache-chunk-tokens', '64', '--cache-branch-tokens', '64']
+    system = [ord(c) for c in 'Shared instructions. ' + 'Be brief and precise. ' * 6]
+    alpha = system + [ord(c) for c in 'First conversation: ' + 'alpha ' * 30]
+    beta = system + [ord(c) for c in 'Second conversation: ' + 'beta ' * 25]
+    gamma = system + [ord(c) for c in 'Third conversation: ' + 'gamma ' * 20]
+    parting = len(system)  # The conversations part right after the shared instructions.
+    more = [ord(c) for c in ' and then?']
+
+    def ask(server, prompt, **extra):
+        return server.post('/completion', {'prompt': prompt, 'n_predict': 6, 'temperature': 0, 'return_tokens': True, **extra})
+
+    def store(server):
+        return server.get('/slots')[0]['cache_store']
+
+    def turns(server):
+        """alpha, beta, alpha again after its reply, beta with another reply, a third conversation."""
+        first = ask(server, alpha)
+        second = ask(server, beta)
+        third = ask(server, alpha + first['tokens'] + more)
+        fourth = ask(server, beta + more)
+        fifth = ask(server, gamma)
+        return first, second, third, fourth, fifth
+
+    server = Server(binary, *flags)
+    plain = Server(binary, '--model', model, '--backend', 'cpu')
+    try:
+        assert server.port and plain.port, server.output() + plain.output()
+        assert 'cache store of 64 MiB in memory and 1.0 GiB in ' + str(directory) in server.output(), server.output()
+        assert plain.get('/slots')[0]['cache_store'] is None and plain.get('/props')['cache_store'] is None
+        first = ask(server, alpha)
+        assert first['tokens_cached'] == 0 and first['timings']['cache_store_n'] == 0
+        # The sequence is saved in the background once the reply is out.
+        deadline = time.time() + 30
+        while store(server)['snapshots'] < 1 and time.time() < deadline:
+            time.sleep(0.02)
+        saved = store(server)
+        assert saved['snapshots'] == 1 and saved['tokens'] == len(alpha) // 64 * 64 and saved['ram_bytes'] > 0, saved
+        assert saved['ram_limit'] == 64 << 20 and saved['disk_limit'] == 1 << 30 and saved['chunk_tokens'] == 64
+        # Another conversation takes the engine. It shares the instructions with
+        # the first, so it leaves a snapshot where the two part.
+        second = ask(server, beta)
+        assert second['tokens_cached'] == 0
+        # The first conversation returns after its reply: nothing up to the end
+        # of that reply is evaluated. The engine still holds the instructions
+        # (cache_n counts all reuse); the rest comes from the store (cache_store_n).
+        # The last token of a reply is sampled but not consumed, so it is evaluated with the new turn.
+        turn = alpha + first['tokens'] + more
+        third = ask(server, turn)
+        resumed = len(alpha) + len(first['tokens']) - 1
+        assert third['tokens_cached'] == resumed and third['timings']['cache_store_n'] == resumed - parting, third['timings']
+        assert third['timings']['prompt_n'] == len(more) + 1
+        # The second returns with a different continuation: its prompt end is restored.
+        fourth = ask(server, beta + more)
+        assert fourth['tokens_cached'] == len(beta) and fourth['timings']['cache_store_n'] == len(beta) - parting, fourth['timings']
+        # A third conversation resumes where the others parted.
+        fifth = ask(server, gamma)
+        assert fifth['tokens_cached'] == parting, (fifth['tokens_cached'], parting)
+        # Stored state gives the replies of a server that evaluates everything.
+        expected = turns(plain)
+        for ours, theirs in zip([first, second, third, fourth, fifth], expected):
+            assert ours['tokens'] == theirs['tokens'], (ours['tokens'], theirs['tokens'])
+        assert [reply['tokens_cached'] for reply in expected] == [0, 0, 0, 0, 0]
+        # cache_prompt false evaluates everything and keeps the store.
+        assert ask(server, turn, cache_prompt=False)['tokens_cached'] == 0
+        again = ask(server, turn)
+        assert again['tokens_cached'] == len(turn) and again['tokens'] == third['tokens']
+        values = dict(line.split(' ') for line in server.request('GET', '/metrics')[1].splitlines() if not line.startswith('#'))
+        assert int(values['tidal:cache_store_restores_total']) == 2 and int(values['tidal:cache_store_snapshots']) >= 3, values
+        assert int(values['tidal:cache_store_restored_tokens_total']) >= resumed + len(beta) - 2 * parting
+        assert server.get('/props')['cache_store']['directory'] == str(directory)
+    except BaseException:
+        print(server.output()[-3000:])
+        server.stop(); plain.stop()
+        raise
+    assert plain.stop() == 0
+    # An orderly shutdown writes what memory holds; the next run resumes from the files.
+    assert server.stop() == 0
+    server = Server(binary, *flags)
+    try:
+        assert server.port, server.output()
+        adopted = store(server)
+        assert adopted['snapshots'] >= 3 and adopted['disk_bytes'] > 0 and adopted['ram_bytes'] == 0, adopted
+        reply = ask(server, beta + more)
+        assert reply['tokens_cached'] == len(beta) + len(more) and reply['tokens'] == fourth['tokens'], reply['timings']
+        assert store(server)['read_bytes'] > 0
+        # Erasing the slot empties the store.
+        server.post('/slots/0?action=erase', {})
+        emptied = store(server)
+        assert emptied['snapshots'] == 0 and emptied['ram_bytes'] == 0 and emptied['disk_bytes'] == 0, emptied
+        assert not list(Path(directory).rglob('*.tkv'))
+        assert ask(server, beta + more)['tokens_cached'] == 0
+    except BaseException:
+        print(server.output()[-3000:])
+        server.stop()
+        raise
+    assert server.stop() == 0
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--bin-dir', type=Path, required=True)
@@ -540,6 +641,9 @@ def main():
         assert server.stop() == 0
         print('OpenAI and Anthropic prompt caching passed', flush=True)
 
+        session_cache(binary, cache_model, Path(directory) / 'cache-store')
+        print('cache store across conversations and restarts passed', flush=True)
+
         # Defaults and authentication come from the command line.
         server = Server(binary, '--model', model, '--backend', 'cpu', '--api-key', 'secret', '--alias', 'named',
                         '--temp', '0', '--n-predict', '5', '--webui', '0', '--context', '64')
@@ -568,7 +672,11 @@ def main():
         for flags in [['--model', Path(directory) / 'missing.gguf', '--backend', 'cpu'], ['--backend', 'cpu'],
                       ['--model', model, '--backend', 'cpu', '--thinking', 'maybe'],
                       ['--model', model, '--backend', 'cpu', '--temp', '-2'],
-                      ['--model', model, '--backend', 'cpu', '--cache-min-tokens', '0']]:
+                      ['--model', model, '--backend', 'cpu', '--cache-min-tokens', '0'],
+                      ['--model', model, '--backend', 'cpu', '--cache-disk', '1G'],
+                      ['--model', model, '--backend', 'cpu', '--cache-dir', directory],
+                      ['--model', model, '--backend', 'cpu', '--cache-ram', 'lots'],
+                      ['--model', model, '--backend', 'cpu', '--cache-branch-tokens', '64']]:
             failed = Server(binary, *flags)
             assert failed.process.wait(timeout=60) == 1, flags
             assert 'tidal-server: ' in failed.output()

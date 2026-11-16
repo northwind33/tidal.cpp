@@ -173,7 +173,9 @@ baseline comparisons, and the distinction between wall timings and CUDA kernel m
 (`/v1/chat/completions`, `/v1/completions`), Anthropic clients (`/v1/messages`) and
 llama.cpp server clients (`/completion`, `/tokenize`, `/props`, `/slots`, `/metrics`, ...)
 can all use, with streaming, thinking, tool calls and prompt-cache reuse between
-requests. It reads the tokenizer from the GGUF, so real Qwen GGUFs need no Python
+requests. With `--cache-ram` and `--cache-disk`, conversations that take turns on
+the engine resume from stored KV rows and state instead of being evaluated again.
+It reads the tokenizer from the GGUF, so real Qwen GGUFs need no Python
 frontend. A test page is served at `/`.
 
 ```sh

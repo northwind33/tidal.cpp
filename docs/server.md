@@ -35,6 +35,7 @@ tidal-server --model MODEL.gguf [--host 127.0.0.1] [--port 8080] [--alias NAME] 
   [--sampler device|cpu] [--temp T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R]
   [--frequency-penalty F] [--presence-penalty F] [--penalty-last-n N] [--seed S]
   [--cache-min-tokens 1024] [--cache-snapshots 16]
+  [--cache-ram SIZE] [--cache-disk SIZE --cache-dir DIR] [--cache-chunk-tokens 256] [--cache-branch-tokens 512]
 ```
 
 The KV placement, precision and prefill options of `tidal-cli` are accepted too
@@ -60,6 +61,9 @@ The KV placement, precision and prefill options of `tidal-cli` are accepted too
   name. Responses echo the `model` a request names.
 - `--cache-min-tokens` and `--cache-snapshots` configure
   [prompt caching](#prompt-caching).
+- `--cache-ram`, `--cache-disk` and `--cache-dir` enable the
+  [cache store](#cache-store), which lets conversations take turns on the
+  engine without being evaluated again.
 
 ## Execution model
 
@@ -79,6 +83,12 @@ endpoints report the reuse as `tokens_cached` / `timings.cache_n`; the OpenAI an
 Anthropic endpoints report cache usage as their APIs define it
 ([prompt caching](#prompt-caching)), and also carry `timings.cache_n`
 where the response has `timings`.
+
+**Cache store.** The engine holds one sequence, so on its own a second
+conversation overwrites the first and the first is evaluated again when it
+returns. With `--cache-ram` and/or `--cache-disk`, the state a request
+overwrites is kept in host memory and on disk, and a prompt that returns to it
+resumes from there ([cache store](#cache-store)).
 
 **Cancellation.** Closing the connection stops the generation at the next
 token, for streamed and non-streamed requests alike. A prompt that is being
@@ -165,6 +175,88 @@ implicit behavior**: the prefix the engine reused is reported as
 `POST /slots/0?action=erase` drops the cache entries with the sequence, and
 `/metrics` adds `tidal:cache_read_tokens_total`, `tidal:cache_write_tokens_total`,
 `tidal:cache_entries`, `tidal:cache_snapshots` and `tidal:cache_snapshot_bytes`.
+
+## Cache store
+
+```sh
+tidal-server --model MODEL.gguf --context 65536 \
+  --cache-ram 8G --cache-disk 100G --cache-dir /var/cache/tidal
+```
+
+Agents rarely take turns politely: session A asks, session B asks, A comes
+back. The engine has one sequence, so without a store B overwrites A's KV rows
+and A's whole conversation is prefilled again on its return. The cache store
+keeps what would be lost, in as much host memory and disk space as the flags
+allow, and brings it back:
+
+- **What is stored.** KV rows, cut into chunks of `--cache-chunk-tokens`
+  positions, and state snapshots (the recurrent state that KV rows alone cannot
+  rebuild, with the rows since the last chunk boundary). Both are addressed by
+  the tokens and image contents of the prefix they belong to, so conversations
+  that share a system prompt and tool definitions share those chunks, and a
+  conversation that grows only adds chunks.
+- **When.** After each reply, while the engine is idle, the server copies the
+  prompt's state into the store in the background; a request that arrives
+  meanwhile interrupts the copy after the blob in progress. A request that
+  replaces the sequence first saves whatever is not stored yet, up to the end
+  of the last reply, so nothing is lost by switching quickly. `SIGTERM`/`SIGINT`
+  save the current sequence before exiting.
+- **Resuming.** Every prompt is matched against the store. If a stored
+  snapshot lies deeper in the prompt than what the engine can reuse on its own,
+  the rows beyond the prefix that the engine still holds are loaded and the
+  snapshot is restored; only the rest of the prompt is evaluated. A
+  conversation that comes back with its last reply unchanged resumes after that
+  reply; one whose reply is rendered differently (thinking removed, for
+  example) resumes at the end of its previous prompt.
+- **Parting points.** A prompt that leaves another conversation
+  `--cache-branch-tokens` or more past the state it resumes from takes a
+  snapshot where the two part, typically the end of a shared system prompt.
+  Later conversations with that prefix start from there. Zero disables it.
+- **Budgets.** `--cache-ram` bounds the host memory and `--cache-disk` the
+  files under `--cache-dir`; sizes take `K`, `M`, `G` or `T` and are MiB
+  without a suffix. New state enters memory. When memory fills up, the least
+  recently used state is written to disk in the background and dropped from
+  memory; state read back from disk stays in memory while there is room. When
+  neither tier has room, the least recently used conversation goes, deepest
+  state first, so that nothing is kept that could no longer be restored.
+  Snapshots that a conversation has moved past are the first to go and are
+  never written to disk. Either flag alone works: memory only, or disk only.
+- **Sizing.** A snapshot is as large as a pinned one (about 150 MB for the 27B
+  Qwen3.8 model); the KV rows are what the engine's own KV cache holds per
+  token. `--cache-ram` smaller than one snapshot only works together with a
+  disk budget. `GET /slots` shows the usage.
+- **Restarts.** Files are tied to the model file and to the options that shape
+  the state (backend, KV placement and precision, context, chunk size, MTP,
+  vision model). A server started with the same ones adopts the files and
+  resumes conversations from them; with other ones it uses a separate
+  directory below `--cache-dir`. Files are checksummed: a damaged file is
+  dropped and its conversation is evaluated instead.
+
+A restore brings back exactly the saved bytes, so a conversation continues as
+if it had never left. Chunks of a shared prefix hold the rows of whichever
+conversation stored them first; on CUDA those may differ from another
+conversation's own rows in the last bits, as prefill and decode do.
+
+`"cache_prompt": false` evaluates the whole prompt but still saves the sequence
+it replaces. `POST /slots/0?action=erase` empties the store, files included.
+`timings.cache_store_n` is the part of `cache_n` that came from the store
+(beyond what the engine itself still held); `timings.cache_store_ms` is the
+time loading it took and `timings.cache_save_ms` the time spent saving the
+sequence the request replaced, both part of `prompt_ms`. `GET /slots` and
+`GET /props` carry a `cache_store` object (budgets, bytes in memory and on
+disk, snapshots, stored token positions, restores, time spent restoring and
+saving, disk traffic, the latest disk error), and `/metrics` adds
+`tidal:cache_store_ram_bytes`, `tidal:cache_store_disk_bytes`,
+`tidal:cache_store_snapshots`, `tidal:cache_store_tokens`,
+`tidal:cache_store_restores_total`, `tidal:cache_store_restored_tokens_total`,
+`tidal:cache_store_restore_seconds_total`, `tidal:cache_store_save_seconds_total`,
+`tidal:cache_store_written_bytes_total`, `tidal:cache_store_read_bytes_total`
+and `tidal:cache_store_dropped_total`. After a disk failure the store keeps
+serving what it has and stops writing.
+
+The API cache accounting above is unchanged: a response reports as read only
+what the engine reused, and with the store that now includes entries whose
+state another conversation had overwritten.
 
 ## Chat format
 

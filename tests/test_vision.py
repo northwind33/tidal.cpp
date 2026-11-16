@@ -310,6 +310,37 @@ def check_server(root, bins, text, vision, backend):
     print("server: image chat (OpenAI, Anthropic, /completion), cache reuse, rejections and /placement", flush=True)
 
 
+def check_store(root, bins, text, vision, backend):
+    """A conversation with an image leaves the engine and comes back from the cache store."""
+    server = Server(bins / "tidal-server", "--model", text, "--vision-model", vision, "--backend", backend, "--context", 256,
+                    "--image-min-tokens", 1, "--threads", 4, "--cache-ram", "64M", "--cache-chunk-tokens", 16)
+    try:
+        assert server.port, server.output()
+        image = test_image(96, 64, 8)
+        with_image = lambda pixels: {"role": "user", "content": [{"type": "image_url", "image_url": {"url": png_data_uri(pixels)}},
+                                                                 {"type": "text", "text": "what is in this picture?"}]}
+        body = {"max_tokens": 4, "temperature": 0}
+        other = {**body, "messages": [{"role": "user", "content": "an unrelated conversation without any image at all"}]}
+        count = lambda: float(re.search(r"^tidal:images_encoded_total (\S+)$", server.get("/metrics"), re.M).group(1))
+        first = server.post("/v1/chat/completions", {**body, "messages": [with_image(image)]})
+        tokens = first["usage"]["prompt_tokens"]
+        server.post("/v1/chat/completions", other)
+        # Chunks carry image positions (their MRoPE rows and content hashes): the
+        # whole prompt comes back without the vision tower running again.
+        encoded = count()
+        again = server.post("/v1/chat/completions", {**body, "messages": [with_image(image)]})
+        assert again["timings"]["cache_n"] == tokens and again["timings"]["cache_store_n"] == tokens, again["timings"]
+        assert count() == encoded and again["choices"][0]["message"] == first["choices"][0]["message"], (first, again)
+        # The same tokens with another image are another prefix.
+        server.post("/v1/chat/completions", other)
+        changed = server.post("/v1/chat/completions", {**body, "messages": [with_image(255 - image)]})
+        assert changed["timings"]["cache_store_n"] == 0 and changed["timings"]["cache_n"] < tokens - 6, changed["timings"]
+    finally:
+        server.process.terminate()
+        server.process.wait(timeout=30)
+    print("server: image conversation restored from the cache store", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bin-dir", type=Path, required=True)
@@ -337,7 +368,8 @@ def main():
                       ("prompt-ple", lambda: check_prompt(root, bins, ple, vision, backend, "ple-sequential"))]
         cases += [("cache", lambda: check_cache(root, bins, text, vision, backend)),
                   ("rejections", lambda: check_rejections(root, bins, text, vision, backend)),
-                  ("server", lambda: check_server(root, bins, text, vision, backend))]
+                  ("server", lambda: check_server(root, bins, text, vision, backend)),
+                  ("store", lambda: check_store(root, bins, text, vision, backend))]
         for name, check in cases:
             try:
                 check()
