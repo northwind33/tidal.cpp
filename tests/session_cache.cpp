@@ -10,6 +10,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace {
 using Tokens = std::vector<int32_t>;
@@ -275,13 +276,64 @@ void drafting(const char * model, tidal::Options base) {
     };
     require(run(cached, more_cached) == run(fresh, more_fresh) && more_cached == more_fresh, "Speculative decoding after a restore");
 }
+
+// For large models, by hand: one long sequence goes to disk, and an engine
+// that resumes it from the files evaluates what follows exactly as the first
+// engine did while it still held the sequence.
+void long_restart(const char * model, tidal::Options base, int count, const std::string & directory) {
+    base.threads = int(std::clamp(std::thread::hardware_concurrency(), 2u, 8u));
+    base.prefill_chunk_tokens = 4096; base.prefill_attention_tile = 256; // Independent of free memory.
+    base.cache_store.ram_bytes = 256ull << 20;
+    base.cache_store.disk_bytes = 64ull << 30;
+    base.cache_store.directory = directory;
+    std::filesystem::remove_all(directory);
+    Tokens prompt, decoded;
+    std::vector<tidal::Step> live, live_decoded;
+    {
+        tidal::Engine first(model, base);
+        vocab = first.config().vocab;
+        require(count + 64 <= first.config().context, "The prompt does not fit the context");
+        uint32_t state = 20261116;
+        for (int i = 0; i < count; ++i) { state = state * 1664525u + 1013904223u; prompt.push_back(int32_t((state >> 8) % uint32_t(vocab))); }
+        first.prefill_cached(prompt, {}, false, {});
+        for (int i = 0; i < 8; ++i) { prompt.push_back(first.sample()); first.decode(prompt.back(), false); }
+        first.cache_flush();
+        const auto info = first.cache_store();
+        require(info.error.empty(), info.error);
+        require(info.snapshots == 2 && info.tokens == uint64_t(prompt.size() / info.chunk_tokens * info.chunk_tokens), "The sequence was not saved whole");
+        std::cout << "saved " << prompt.size() << " tokens: " << info.disk_bytes + info.ram_bytes << " bytes in " << info.chunks << " chunks and "
+                  << info.snapshots << " snapshots, " << first.statistics().cache_store_save_ms << " ms of copying\n";
+        live = first.prefill_cached(join(prompt, pattern(24, 5, 1)));
+        // Long enough to complete QSA blocks after the restore, with and without captured logits.
+        for (int i = 0; i < 40; ++i) { decoded.push_back(first.sample()); live_decoded.push_back(first.decode(decoded.back())); }
+        for (int i = 0; i < 40; ++i) { decoded.push_back(first.sample()); first.decode(decoded.back(), false); }
+        decoded.push_back(first.sample());
+    }
+    tidal::Engine second(model, base);
+    const auto restored = second.prefill_cached(join(prompt, pattern(24, 5, 1)));
+    require(second.statistics().cache_store_restores == 1 && second.statistics().cache_store_restored_tokens == prompt.size(),
+            "The sequence was not resumed from the files");
+    std::cout << "restored " << prompt.size() << " tokens in " << second.statistics().cache_store_restore_ms << " ms\n";
+    equal_steps(live, restored, "tokens after a long restored sequence");
+    for (size_t i = 0; i < decoded.size(); ++i) {
+        require(second.sample() == decoded[i], "Token " + std::to_string(i) + " sampled after a long restored sequence differs");
+        if (i < live_decoded.size()) equal(live_decoded[i], second.decode(decoded[i]));
+        else if (i + 1 < decoded.size()) second.decode(decoded[i], false);
+    }
+}
 } // namespace
 
 int main(int argc, char ** argv) {
     try {
-        if (argc < 3) throw std::runtime_error("Usage: tidal-session-cache-test model.gguf cpu|cuda [mtp|SIDECAR]");
+        if (argc < 3) throw std::runtime_error("Usage: tidal-session-cache-test model.gguf cpu|cuda [mtp|SIDECAR | long TOKENS DIRECTORY]");
         const std::string backend = argv[2];
         tidal::Options base{backend, 0, 2};
+        if (argc > 3 && std::string(argv[3]) == "long") {
+            if (argc != 6) throw std::runtime_error("Usage: tidal-session-cache-test model.gguf cuda long TOKENS DIRECTORY");
+            long_restart(argv[1], base, std::stoi(argv[4]), argv[5]);
+            std::cout << "Session cache: a long sequence resumed from disk continues bit-identically\n";
+            return 0;
+        }
         base.prefill_chunk_tokens = 8; base.prefill_attention_tile = 5; // Independent of free memory.
         base.sampling.repeat_penalty = 1.3f; base.sampling.penalty_last_n = 8; // Penalty history is rebuilt on a restore.
         {
