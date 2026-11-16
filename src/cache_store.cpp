@@ -241,8 +241,6 @@ CacheStore::CacheStore(const Config & config) : config_(config) {
             throw;
         }
     }
-    const uint64_t headroom = config_.disk_bytes ? std::min<uint64_t>(config_.ram_bytes / 8, 256ull << 20) : 0;
-    ram_soft_ = config_.ram_bytes - headroom;
     spiller_ = std::thread([this] { spill(); });
     if (config_.disk_bytes)
         for (int i = 0; i < 2; ++i) readers_.emplace_back([this] { read_loop(); });
@@ -452,6 +450,13 @@ bool CacheStore::promote(Entry & entry, const std::vector<Blob> & parts) {
     set_ram(entry, parts);
     return true;
 }
+// The coldest part of host memory that is kept written to disk ahead of
+// need, so that it can be dropped at once: room for a snapshot and a few
+// chunks, which is what a prompt that replaces a sequence saves on the spot.
+uint64_t CacheStore::headroom() const {
+    if (!(config_.disk_bytes && disk_ok_)) return 0;
+    return std::min(config_.ram_bytes / 2, std::max(std::min<uint64_t>(config_.ram_bytes / 8, 256ull << 20), 2 * largest_));
+}
 CacheStore::Entry * CacheStore::coldest_leaf() const {
     for (auto * entry : leaf_order_)
         if (deletable(*entry)) return entry;
@@ -499,6 +504,7 @@ bool CacheStore::put(StoreMeta meta, std::vector<Blob> parts, uint64_t stamp, co
     entry.file_bytes = bytes + header_size(entry.meta);
     entry.stamp = stamp;
     entry.oversize = oversize;
+    if (!oversize) largest_ = std::max(largest_, bytes);
     index_.emplace(key, std::move(owned));
     Entry * above = parent_of(entry);
     if (above) {
@@ -767,9 +773,8 @@ bool CacheStore::step(std::unique_lock<std::mutex> & lock) {
                 return true;
             }
         }
-    } else if (disk && ram_used_ > ram_soft_) {
+    } else if (const uint64_t window = headroom(); disk && ram_used_ + window > config_.ram_bytes) {
         // Write ahead of need so that the coldest part of memory can be dropped at once.
-        const uint64_t window = config_.ram_bytes - ram_soft_;
         uint64_t seen = 0;
         for (auto * entry : ram_order_) {
             if (seen >= window) break;

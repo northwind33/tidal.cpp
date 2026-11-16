@@ -147,7 +147,7 @@ private:
 
     Config config_;
     std::string root_;      // Directory of this fingerprint's files.
-    uint64_t ram_soft_ = 0; // Above this, cold blobs are written ahead of need.
+    uint64_t largest_ = 0;  // Largest blob stored so far.
     mutable std::mutex mutex_;
     std::condition_variable work_, changed_;
     std::unordered_map<StoreKey, std::unique_ptr<Entry>, StoreKeyHash> index_;
@@ -176,6 +176,7 @@ private:
     void erase(Entry & entry);
     void supersede(Entry & entry);
     bool promote(Entry & entry, const std::vector<Blob> & parts);
+    uint64_t headroom() const;
     Entry * coldest_leaf() const;
     std::string path_of(const StoreKey & key) const;
     void scan();
