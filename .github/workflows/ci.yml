@@ -1,0 +1,58 @@
+name: build-and-test
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install numpy
+      - name: Check Dev Container cache relocation (no GPU required)
+        run: python tests/test_devcontainer.py
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF
+      - run: cmake --build build -j 2
+      - run: ctest --test-dir build --output-on-failure
+
+  cuda-compile:
+    # Compile and link the CUDA path for Titan RTX/Turing. Hosted runners have no
+    # GPU: this job must never be presented as a GPU runtime test.
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    steps:
+      - run: apt-get update && apt-get install -y --no-install-recommends git cmake build-essential python3 python3-numpy
+      - uses: actions/checkout@v4
+      # No GPU driver is mounted on hosted runners. VMM would add a direct
+      # libcuda.so.1 dependency and fail at final executable link/load time.
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTIDAL_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DGGML_NATIVE=OFF -DGGML_CUDA_NO_VMM=ON -DGGML_CUDA_FA=OFF
+      - run: cmake --build build -j 2
+      - run: ctest --test-dir build --output-on-failure
+
+  devcontainer-image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --tag tidal-dev --file .devcontainer/Dockerfile .devcontainer
+      - name: Check development tools (no GPU runtime test)
+        run: |
+          docker run --rm --entrypoint bash tidal-dev -lc '
+            test "$(id -un)" = vscode &&
+            test "$(id -u)" -ne 0 &&
+            test -w /home/vscode/.cache &&
+            test -w /home/vscode/.cache/ccache &&
+            nvcc --version &&
+            cmake --version &&
+            ninja --version &&
+            ccache --version &&
+            gdb --version &&
+            python3 -c "import numpy; print(numpy.__version__)"
+          '

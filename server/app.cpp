@@ -1,0 +1,1403 @@
+#include "app.hpp"
+#include "media.hpp"
+#include "webui.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <map>
+#include <random>
+#include <tuple>
+
+namespace tidal::server {
+
+struct App::ChatTask {
+    // The end of a content block of the request, mapped to a prompt position by prepare().
+    struct Block {
+        enum class At { None, Tool, Content, Call } at = At::None;
+        size_t index = 0;      // Tool: rendered tool number; Content and Call: message number.
+        size_t offset = 0;     // Content: bytes of the message content through the block; Call: call number.
+        int ttl = 0;           // Lifetime in seconds of an explicit breakpoint on the block, 0 without one.
+        bool cacheable = true; // Anthropic: may take the automatic breakpoint.
+        int run = -1;          // Anthropic: run of tool_use or tool_result blocks, one lookback position.
+        // OpenAI: message endings that can take the implicit breakpoint.
+        enum class End { None, User, Tool, Developer } end = End::None;
+        int position = 0;
+    };
+    std::vector<Block> blocks;
+    bool openai_explicit = false;  // prompt_cache_options.mode == "explicit"
+    std::string cache_key;         // prompt_cache_key
+    std::string model;
+    std::vector<Message> messages;
+    ChatOptions options;
+    GenerationParams params;
+    bool stream = false, include_usage = false, inline_reasoning = false;
+    ChatPrompt prompt;
+    std::vector<int32_t> tokens;           // After image expansion.
+    std::vector<std::shared_ptr<const Image>> images; // In prompt order.
+    Prompt input;
+};
+struct App::ChatRun {
+    std::string reasoning, content;
+    std::vector<ToolCall> calls;
+    GenerationResult result;
+};
+
+namespace {
+
+const char * const json_type = "application/json; charset=utf-8";
+const char * const version = "tidal-server 0.1.0";
+
+bool trim_empty(const std::string & text) { return text.find_first_not_of(" \t\r\n") == std::string::npos; }
+Json list(std::initializer_list<Json> items) { return Json(Json::Array(items)); }
+
+uint64_t random_u64() {
+    thread_local std::mt19937_64 generator(std::random_device{}() ^
+        uint64_t(std::chrono::steady_clock::now().time_since_epoch().count()));
+    return generator();
+}
+std::string random_token(size_t length) {
+    static const char alphabet[] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    std::string out;
+    for (size_t i = 0; i < length; ++i) out += alphabet[random_u64() % 62];
+    return out;
+}
+int64_t unix_time() {
+    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+Json openai_error(int status, const std::string & type, const std::string & message) {
+    return Json::object({{"error", Json::object({{"code", status}, {"message", message}, {"type", type}})}});
+}
+Json anthropic_error(int status, const std::string & type, const std::string & message) {
+    const char * name = status == 400 || status == 501 ? "invalid_request_error" : status == 401 ? "authentication_error"
+        : status == 404 ? "not_found_error" : status == 413 ? "request_too_large" : status == 503 ? "overloaded_error" : "api_error";
+    (void) type;
+    return Json::object({{"type", "error"}, {"error", Json::object({{"type", name}, {"message", message}})}});
+}
+void send_json(Response & response, int status, const Json & value) { response.send(status, json_type, value.dump()); }
+bool sse(Response & response, const Json & data) { return response.write("data: " + data.dump() + "\n\n"); }
+bool sse(Response & response, const char * event, const Json & data) {
+    return response.write(std::string("event: ") + event + "\ndata: " + data.dump() + "\n\n");
+}
+
+Json parse_body(const Request & request) {
+    if (request.body.empty()) return Json::object();
+    Json body;
+    try { body = Json::parse(request.body); }
+    catch (const JsonError & e) { throw invalid_request(e.what()); }
+    if (!body.is_object()) throw invalid_request("The request body must be a JSON object");
+    return body;
+}
+// The value of `key` unless absent or null.
+const Json * present(const Json & body, std::string_view key) {
+    const auto * value = body.find(key);
+    return value && !value->is_null() ? value : nullptr;
+}
+std::optional<double> number(const Json & body, std::string_view key) {
+    const auto * value = present(body, key);
+    if (!value) return std::nullopt;
+    if (!value->is_number()) throw invalid_request("'" + std::string(key) + "' must be a number");
+    return value->number();
+}
+std::optional<int64_t> integer(const Json & body, std::string_view key) {
+    const auto value = number(body, key);
+    if (!value) return std::nullopt;
+    if (std::floor(*value) != *value || std::fabs(*value) > 9e15) throw invalid_request("'" + std::string(key) + "' must be an integer");
+    return int64_t(*value);
+}
+std::optional<bool> boolean(const Json & body, std::string_view key) {
+    const auto * value = present(body, key);
+    if (!value) return std::nullopt;
+    if (!value->is_bool()) throw invalid_request("'" + std::string(key) + "' must be a boolean");
+    return value->boolean();
+}
+std::optional<std::string> text(const Json & body, std::string_view key) {
+    const auto * value = present(body, key);
+    if (!value) return std::nullopt;
+    if (!value->is_string()) throw invalid_request("'" + std::string(key) + "' must be a string");
+    return value->string();
+}
+std::vector<std::string> stop_words(const Json & body, std::string_view key) {
+    std::vector<std::string> words;
+    const auto * value = present(body, key);
+    if (!value) return words;
+    if (value->is_string()) { if (!value->string().empty()) words.push_back(value->string()); return words; }
+    if (!value->is_array()) throw invalid_request("'" + std::string(key) + "' must be a string or an array of strings");
+    for (const auto & item : value->items()) {
+        if (!item.is_string()) throw invalid_request("'" + std::string(key) + "' must contain only strings");
+        if (!item.string().empty()) words.push_back(item.string());
+    }
+    return words;
+}
+
+using Images = std::vector<std::shared_ptr<const Image>>;
+
+// An image content part: OpenAI image_url / input_image or an Anthropic image
+// block (base64 source). Null when `part` is not an image.
+std::shared_ptr<const Image> image_part(const Json & part) {
+    const auto type = part.at("type").is_string() ? part.at("type").string() : std::string();
+    try {
+        if (type == "image_url" || (type.empty() && part.contains("image_url"))) {
+            const auto & value = part.at("image_url");
+            const auto & url = value.is_string() ? value : value.at("url");
+            if (!url.is_string()) throw invalid_request("image_url needs a url");
+            return image_from_url(url.string());
+        }
+        if (type == "input_image") {
+            if (!part.at("image_url").is_string()) throw invalid_request("input_image needs image_url");
+            return image_from_url(part.at("image_url").string());
+        }
+        if (type == "image") {
+            const auto & source = part.at("source");
+            const auto kind = source.at("type").is_string() ? source.at("type").string() : std::string();
+            if (kind == "base64" && source.at("data").is_string()) return image_from_base64(source.at("data").string());
+            if (kind == "url" && source.at("url").is_string()) return image_from_url(source.at("url").string());
+            throw invalid_request("image blocks need a base64 or data-URI source");
+        }
+    } catch (const std::invalid_argument & e) {
+        throw invalid_request(std::string("Invalid image: ") + e.what());
+    }
+    return nullptr;
+}
+
+// Message content: a string, null, or an array of text and image parts. Text
+// parts are joined with `separator`; each image becomes the chat template's
+// image marker and is appended to `images` (null rejects images).
+// A content part and the length of the joined text through it.
+struct PartEnd { const Json * part; size_t end; };
+std::string content_text(const Json & content, const char * separator = "", Images * images = nullptr,
+                         std::vector<PartEnd> * ends = nullptr) {
+    if (content.is_null()) return {};
+    if (content.is_string()) return content.string();
+    if (!content.is_array()) throw invalid_request("Message content must be a string or an array of content parts");
+    std::string out;
+    bool first = true;
+    for (const auto & part : content.items()) {
+        if (part.is_string()) { if (!first) out += separator; out += part.string(); first = false; }
+        else {
+            const auto type = part.at("type").is_string() ? part.at("type").string() : std::string();
+            if ((type == "text" || type.empty()) && part.at("text").is_string()) {
+                if (!first) out += separator;
+                out += part.at("text").string(); first = false;
+            } else if (auto image = image_part(part)) {
+                if (!images) throw invalid_request("Images are not allowed in this message");
+                images->push_back(std::move(image));
+                out += image_marker;
+            } else throw invalid_request("Unsupported content part '" + type + "': this server accepts text and images");
+        }
+        if (ends) ends->push_back({&part, out.size()});
+    }
+    return out;
+}
+
+Json timings(const GenerationResult & r) {
+    const int evaluated = r.prompt_tokens - r.cached_tokens, predicted = int(r.tokens.size());
+    const auto rate = [](int count, double ms) { return ms > 0 ? Json(count * 1000.0 / ms) : Json(); };
+    const auto each = [](int count, double ms) { return count > 0 ? Json(ms / count) : Json(); };
+    return Json::object({{"cache_n", r.cached_tokens}, {"cache_store_n", r.restored_tokens}, {"cache_store_ms", r.restore_ms},
+        {"cache_save_ms", r.save_ms}, {"prompt_n", evaluated}, {"prompt_ms", r.prompt_ms},
+        {"prompt_per_token_ms", each(evaluated, r.prompt_ms)}, {"prompt_per_second", rate(evaluated, r.prompt_ms)},
+        {"predicted_n", predicted}, {"predicted_ms", r.generation_ms},
+        {"predicted_per_token_ms", each(predicted, r.generation_ms)}, {"predicted_per_second", rate(predicted, r.generation_ms)}});
+}
+Json openai_usage(const GenerationResult & r) {
+    return Json::object({{"prompt_tokens", r.prompt_tokens}, {"completion_tokens", int(r.tokens.size())},
+        {"total_tokens", r.prompt_tokens + int(r.tokens.size())},
+        {"prompt_tokens_details", Json::object({{"cached_tokens", r.cache.read}, {"cache_write_tokens", r.cache.written_total()}})}});
+}
+constexpr int five_minutes = 300, one_hour = 3600, thirty_minutes = 1800, twelve_hours = 43200;
+Json anthropic_usage(const GenerationResult & r) {
+    const int created = r.cache.written_total();
+    return Json::object({{"input_tokens", r.prompt_tokens - r.cache.read - created}, {"cache_creation_input_tokens", created},
+        {"cache_read_input_tokens", r.cache.read},
+        {"cache_creation", Json::object({{"ephemeral_5m_input_tokens", r.cache.written_for(five_minutes)},
+                                         {"ephemeral_1h_input_tokens", r.cache.written_for(one_hour)}})},
+        {"output_tokens", int(r.tokens.size())}});
+}
+Json bytes_json(std::string_view bytes) {
+    Json out = Json::array();
+    for (const char c : bytes) out.push(int(uint8_t(c)));
+    return out;
+}
+Json tool_calls_json(const std::vector<ToolCall> & calls, size_t first_index, bool with_index) {
+    Json out = Json::array();
+    for (size_t i = 0; i < calls.size(); ++i) {
+        Json call = Json::object();
+        if (with_index) call["index"] = first_index + i;
+        call["id"] = calls[i].id; call["type"] = "function";
+        call["function"] = Json::object({{"name", calls[i].name}, {"arguments", calls[i].arguments.dump()}});
+        out.push(std::move(call));
+    }
+    return out;
+}
+
+} // namespace
+
+App::App(AppConfig config, Runtime & runtime, HttpServer & server)
+    : config_(std::move(config)), runtime_(runtime), started_(unix_time()) {
+    const auto is_public = [](const std::string & path) {
+        return path == "/health" || path == "/v1/health" || path == "/" || path == "/index.html";
+    };
+    const auto is_anthropic = [](const std::string & path) { return path.rfind("/v1/messages", 0) == 0; };
+    server.before = [=, this](const Request & request, Response & response) {
+        if (is_public(request.path)) return true;
+        const auto fail = [&](int status, const char * type, const std::string & message) {
+            send_json(response, status, is_anthropic(request.path) ? anthropic_error(status, type, message) : openai_error(status, type, message));
+            return false;
+        };
+        if (!config_.api_key.empty() && request.path != "/models" && request.path != "/v1/models") {
+            const auto & authorization = request.header("authorization");
+            const bool bearer = authorization.rfind("Bearer ", 0) == 0 && authorization.substr(7) == config_.api_key;
+            if (!bearer && request.header("x-api-key") != config_.api_key) return fail(401, "authentication_error", "Invalid API key");
+        }
+        if (runtime_.state() == Runtime::State::Loading) return fail(503, "unavailable_error", "Loading model");
+        if (runtime_.state() == Runtime::State::Failed) return fail(500, "server_error", "Model failed to load: " + runtime_.error());
+        return true;
+    };
+    const auto add = [&](const char * method, std::initializer_list<const char *> paths, Style style,
+                         void (App::*handler)(const Request &, Response &)) {
+        Handler wrapped = [this, style, handler](const Request & request, Response & response) {
+            int status = 500;
+            std::string type = "server_error", message;
+            try { (this->*handler)(request, response); return; }
+            catch (const ApiError & e) { status = e.status; type = e.type; message = e.what(); }
+            catch (const ChatError & e) { status = 400; type = "invalid_request_error"; message = e.what(); }
+            catch (const JsonError & e) { status = 400; type = "invalid_request_error"; message = e.what(); }
+            catch (const std::exception & e) { message = e.what(); }
+            const Json error = style == Style::Anthropic ? anthropic_error(status, type, message) : openai_error(status, type, message);
+            if (!response.started()) send_json(response, status, error);
+            else if (response.streaming()) { if (style == Style::Anthropic) sse(response, "error", error); else sse(response, error); }
+        };
+        for (const char * path : paths) server.route(method, path, wrapped);
+    };
+    add("GET", {"/health", "/v1/health"}, Style::OpenAI, &App::health);
+    add("GET", {"/v1/models", "/models"}, Style::OpenAI, &App::models);
+    add("POST", {"/v1/chat/completions", "/chat/completions"}, Style::OpenAI, &App::chat_completions);
+    add("POST", {"/v1/completions"}, Style::OpenAI, &App::completions);
+    add("POST", {"/v1/messages"}, Style::Anthropic, &App::messages);
+    add("POST", {"/v1/messages/count_tokens"}, Style::Anthropic, &App::count_tokens);
+    add("POST", {"/tokenize"}, Style::OpenAI, &App::tokenize);
+    add("POST", {"/detokenize"}, Style::OpenAI, &App::detokenize);
+    add("POST", {"/apply-template"}, Style::OpenAI, &App::apply_template);
+    add("GET", {"/props"}, Style::OpenAI, &App::props);
+    add("GET", {"/slots"}, Style::OpenAI, &App::slots);
+    add("POST", {"/slots/*"}, Style::OpenAI, &App::slot_action);
+    add("GET", {"/metrics"}, Style::OpenAI, &App::metrics);
+    add("GET", {"/placement", "/v1/placement"}, Style::OpenAI, &App::placement);
+    add("POST", {"/completion", "/completions"}, Style::OpenAI, &App::completion);
+    add("POST", {"/infill"}, Style::OpenAI, &App::infill);
+    for (const char * path : {"/embedding", "/embeddings", "/v1/embeddings", "/reranking", "/rerank", "/v1/rerank", "/v1/reranking",
+                              "/lora-adapters", "/v1/responses", "/v1/audio/transcriptions", "/v1/images/generations"})
+        server.route("POST", path, [](const Request &, Response & response) {
+            send_json(response, 501, openai_error(501, "not_supported_error", "This endpoint is not supported by tidal-server"));
+        });
+    if (config_.webui) {
+        const Handler page = [](const Request &, Response & response) {
+            response.send(200, "text/html; charset=utf-8", std::string_view(reinterpret_cast<const char *>(webui_html), webui_html_size));
+        };
+        server.route("GET", "/", page);
+        server.route("GET", "/index.html", page);
+    }
+}
+
+std::string App::model_name() const {
+    if (!config_.alias.empty()) return config_.alias;
+    const auto & path = runtime_.config().model;
+    const auto slash = path.find_last_of('/');
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+SamplingConfig App::default_sampling() const {
+    SamplingConfig s;
+    s.temperature = 0.8f; s.top_k = 40; s.top_p = 0.95f; s.min_p = 0.05f;
+    const auto & m = runtime_.tokenizer().metadata();
+    const auto & o = config_.sampling;
+    const auto pick = [](auto & target, const auto & cli, const auto & model) {
+        if (cli) target = *cli; else if (model) target = *model;
+    };
+    pick(s.temperature, o.temperature, m.temperature); pick(s.top_p, o.top_p, m.top_p);
+    pick(s.min_p, o.min_p, m.min_p); pick(s.top_k, o.top_k, m.top_k);
+    pick(s.repeat_penalty, o.repeat_penalty, m.repeat_penalty);
+    if (o.frequency_penalty) s.frequency_penalty = *o.frequency_penalty;
+    if (o.presence_penalty) s.presence_penalty = *o.presence_penalty;
+    if (o.penalty_last_n) s.penalty_last_n = *o.penalty_last_n;
+    if (o.seed) s.seed = *o.seed;
+    return s;
+}
+
+void App::sampling(const Json & body, GenerationParams & params) const {
+    auto & s = params.sampling;
+    s = default_sampling();
+    if (const auto v = number(body, "temperature")) s.temperature = float(*v);
+    if (const auto v = number(body, "top_p")) s.top_p = float(*v);
+    if (const auto v = integer(body, "top_k")) s.top_k = int(std::clamp<int64_t>(*v, -1, 1 << 30));
+    if (const auto v = number(body, "min_p")) s.min_p = float(*v);
+    if (const auto v = number(body, "repeat_penalty")) s.repeat_penalty = float(*v);
+    if (const auto v = integer(body, "repeat_last_n")) s.penalty_last_n = int(std::clamp<int64_t>(*v, -1, 1 << 30));
+    if (const auto v = number(body, "presence_penalty")) s.presence_penalty = float(*v);
+    if (const auto v = number(body, "frequency_penalty")) s.frequency_penalty = float(*v);
+    // top_p 0 asks for the single most likely token.
+    if (s.top_p <= 0) { s.temperature = 0; s.top_p = 1; }
+    const auto seed = integer(body, "seed");
+    if (seed && *seed >= 0) s.seed = uint64_t(*seed);
+    else if (!config_.sampling.seed) s.seed = random_u64();
+    try { s.validate(); }
+    catch (const std::invalid_argument &) {
+        throw invalid_request("Invalid sampling parameters: temperature >= 0, 0 <= top_p <= 1, 0 <= min_p <= 1, "
+                              "repeat_penalty > 0, top_k >= -1 and repeat_last_n >= -1 are required");
+    }
+}
+
+Json App::sampling_json(const GenerationParams & params) const {
+    const auto & s = params.sampling;
+    Json stop = Json::array();
+    for (const auto & word : params.stop) stop.push(word);
+    return Json::object({{"n_predict", params.max_tokens}, {"seed", s.seed}, {"temperature", s.temperature},
+        {"top_k", s.top_k}, {"top_p", s.top_p}, {"min_p", s.min_p}, {"repeat_penalty", s.repeat_penalty},
+        {"repeat_last_n", s.penalty_last_n}, {"presence_penalty", s.presence_penalty},
+        {"frequency_penalty", s.frequency_penalty}, {"stop", std::move(stop)},
+        {"n_probs", params.logprobs ? params.top_logprobs : 0}, {"cache_prompt", params.cache_prompt}});
+}
+
+// A prompt is a string, an array of token ids, or an array mixing both.
+std::vector<int32_t> App::prompt_tokens(const Json & prompt) const {
+    const auto & tokenizer = runtime_.tokenizer();
+    std::vector<int32_t> tokens;
+    if (prompt.is_string()) tokens = tokenizer.encode(prompt.string(), true);
+    else if (prompt.is_array()) {
+        for (const auto & item : prompt.items()) {
+            if (item.is_string()) {
+                const auto part = tokenizer.encode(item.string(), true);
+                tokens.insert(tokens.end(), part.begin(), part.end());
+            } else if (item.is_int() && item.integer() >= 0 && item.integer() < tokenizer.size()) tokens.push_back(int32_t(item.integer()));
+            else throw invalid_request("'prompt' array items must be strings or token ids inside the vocabulary");
+        }
+    } else throw invalid_request("'prompt' must be a string or an array of strings and token ids");
+    if (tokens.empty() && tokenizer.bos() >= 0) tokens.push_back(tokenizer.bos());
+    if (tokens.empty()) throw invalid_request("The prompt is empty");
+    return tokens;
+}
+
+Json App::token_logprob(const GeneratedToken & token) const {
+    const auto & tokenizer = runtime_.tokenizer();
+    const auto entry = [&](int32_t id, float logprob) {
+        const auto piece = tokenizer.piece(id, true);
+        return Json::object({{"id", id}, {"token", sanitize_utf8(piece)}, {"bytes", bytes_json(piece)}, {"logprob", logprob}});
+    };
+    Json out = entry(token.id, token.logprob);
+    Json top = Json::array();
+    for (const auto & candidate : token.top) top.push(entry(candidate.id, candidate.logprob));
+    out["top_logprobs"] = std::move(top);
+    return out;
+}
+
+void App::prepare(ChatTask & task) const {
+    if (!runtime_.chat().supports_tools()) task.options.tools = Json();
+    task.prompt = runtime_.chat().render(task.messages, task.options);
+    task.input = tokenize_with_images(task.prompt.text, task.images);
+    task.tokens = task.input.tokens;
+    if (task.blocks.empty()) return;
+
+    // Text offset of each block's end, then the number of prompt tokens that
+    // lie entirely before it.
+    const auto & prompt = task.prompt;
+    const auto offset = [&](const ChatTask::Block & block) -> std::optional<size_t> {
+        using At = ChatTask::Block::At;
+        if (block.at == At::Tool) {
+            if (block.index < prompt.tools.size()) return prompt.tools[block.index];
+        } else if (block.at != At::None && block.index < prompt.layout.size() && prompt.layout[block.index].rendered) {
+            const auto & message = prompt.layout[block.index];
+            if (block.at == At::Content) return message.at(block.offset);
+            if (block.offset < message.calls.size()) return message.calls[block.offset];
+        }
+        return std::nullopt;
+    };
+    // ends[i]: text bytes covered by tokens 0..i. An image's placeholder run
+    // stands for its <|image_pad|> marker and ends with its last token.
+    const auto & tokenizer = runtime_.tokenizer();
+    std::vector<size_t> ends(task.tokens.size());
+    size_t at = 0, image = 0;
+    for (size_t i = 0; i < task.tokens.size(); ++i) {
+        if (image < task.input.images.size() && size_t(task.input.images[image].offset) == i) {
+            const int32_t pad = task.tokens[i];
+            while (i + 1 < task.tokens.size() && task.tokens[i + 1] == pad) ends[i++] = at;
+            at += std::string_view("<|image_pad|>").size();
+            ++image;
+        } else at += tokenizer.piece(task.tokens[i], true).size();
+        ends[i] = at;
+    }
+    const bool exact = at == prompt.text.size();
+    for (auto & block : task.blocks) {
+        const auto end = offset(block);
+        if (!end) { block.position = 0; continue; }
+        if (exact) block.position = int(std::upper_bound(ends.begin(), ends.end(), *end) - ends.begin());
+        else {
+            // The tokenizer's pieces do not spell the text: tokenize the prefix itself.
+            const auto head = prompt.text.substr(0, *end);
+            size_t count = 0;
+            for (size_t i = 0; (i = head.find("<|image_pad|>", i)) != std::string::npos; i += 13) ++count;
+            const Images used(task.images.begin(), task.images.begin() + long(std::min(count, task.images.size())));
+            block.position = int(tokenize_with_images(head, used).tokens.size());
+        }
+    }
+}
+
+// The text is tokenized between its <|image_pad|> markers, which then expand
+// to the images' placeholder tokens. The markers sit between special tokens
+// (<|vision_start|>, <|vision_end|>), so segment-wise tokenization equals
+// tokenizing the whole text.
+Prompt App::tokenize_with_images(const std::string & text, const std::vector<std::shared_ptr<const Image>> & images) const {
+    static constexpr std::string_view pad = "<|image_pad|>";
+    std::vector<std::vector<int32_t>> segments;
+    size_t start = 0;
+    for (size_t at; (at = text.find(pad, start)) != std::string::npos; start = at + pad.size())
+        segments.push_back(runtime_.tokenizer().encode(std::string_view(text).substr(start, at - start), true));
+    segments.push_back(runtime_.tokenizer().encode(std::string_view(text).substr(start), true));
+    return runtime_.expand(segments, images);
+}
+
+App::ChatTask App::openai_task(const Json & body) const {
+    ChatTask task;
+    task.model = text(body, "model").value_or(model_name());
+    // Prompt caching (GPT-5.6 and later semantics).
+    int request_ttl = thirty_minutes;
+    if (const auto * options = present(body, "prompt_cache_options")) {
+        if (!options->is_object()) throw invalid_request("Invalid type for 'prompt_cache_options': expected an object.");
+        if (const auto mode = text(*options, "mode")) {
+            if (*mode != "implicit" && *mode != "explicit")
+                throw invalid_request("Invalid value for 'prompt_cache_options.mode': '" + *mode + "'. Supported values are: 'implicit' and 'explicit'.");
+            task.openai_explicit = *mode == "explicit";
+        }
+        if (const auto ttl = text(*options, "ttl"); ttl && *ttl != "30m")
+            throw invalid_request("Invalid value for 'prompt_cache_options.ttl': '" + *ttl + "'. Supported values are: '30m'.");
+    }
+    if (const auto key = text(body, "prompt_cache_key")) task.cache_key = *key;
+    if (const auto retention = text(body, "prompt_cache_retention"); retention && *retention != "in_memory" && *retention != "24h")
+        throw invalid_request("Invalid value for 'prompt_cache_retention': '" + *retention + "'. Supported values are: 'in_memory' and '24h'.");
+    // The lifetime of a content part's prompt_cache_breakpoint, 0 without one.
+    const auto breakpoint = [&](const Json & part, const std::string & path) {
+        if (!part.is_object()) return 0;
+        const auto * marker = present(part, "prompt_cache_breakpoint");
+        if (!marker) return 0;
+        const std::string where = path + ".prompt_cache_breakpoint";
+        if (!marker->is_object()) throw invalid_request("Invalid type for '" + where + "': expected an object.");
+        if (const auto mode = text(*marker, "mode"); mode && *mode != "explicit")
+            throw invalid_request("Invalid value for '" + where + ".mode': '" + *mode + "'. Supported values are: 'explicit'.");
+        const auto ttl = text(*marker, "ttl");
+        if (!ttl) return request_ttl;
+        if (*ttl == "30m") return thirty_minutes;
+        if (*ttl == "12h") return twelve_hours;
+        throw invalid_request("Invalid value for '" + where + ".ttl': '" + *ttl + "'. Supported values are: '30m' and '12h'.");
+    };
+    using Block = ChatTask::Block;
+    const auto * messages = present(body, "messages");
+    if (!messages || !messages->is_array() || !messages->size()) throw invalid_request("'messages' must be a non-empty array");
+    bool only_system = true;
+    size_t number = 0;
+    for (const auto & item : messages->items()) {
+        const std::string path = "messages[" + std::to_string(number++) + "]";
+        if (!item.is_object() || !item.at("role").is_string()) throw invalid_request("Each message needs a string 'role'");
+        Message message;
+        message.role = item.at("role").string();
+        if (message.role == "developer") message.role = "system";
+        if (message.role == "function") message.role = "tool";
+        if (message.role != "system" && message.role != "user" && message.role != "assistant" && message.role != "tool")
+            throw invalid_request("Unexpected message role '" + message.role + "'");
+        std::vector<PartEnd> ends;
+        message.content = content_text(item.at("content"), "", message.role == "system" ? nullptr : &task.images, &ends);
+        // Several leading system messages become one; the template allows a single one.
+        const bool merge = message.role == "system" && only_system && !task.messages.empty();
+        const size_t index = merge ? task.messages.size() - 1 : task.messages.size();
+        const size_t base = merge ? task.messages.back().content.size() + 2 : 0;
+        if (merge) // Only the end of the whole leading block is an implicit boundary.
+            for (auto & block : task.blocks) if (block.end == Block::End::Developer) block.end = Block::End::None;
+        if (message.role == "tool" && !task.messages.empty() && task.messages.back().role == "tool")
+            for (auto & block : task.blocks) if (block.end == Block::End::Tool) block.end = Block::End::None;
+        for (size_t k = 0; k < ends.size(); ++k)
+            if (const int ttl = breakpoint(*ends[k].part, path + ".content[" + std::to_string(k) + "]"))
+                task.blocks.push_back({Block::At::Content, index, base + ends[k].end, ttl});
+        Block end{Block::At::Content, index, base + message.content.size()};
+        end.end = message.role == "user" ? Block::End::User : message.role == "tool" ? Block::End::Tool
+                : message.role == "system" && only_system ? Block::End::Developer : Block::End::None;
+        if (end.end != Block::End::None) task.blocks.push_back(end);
+        if (message.role == "assistant") {
+            if (item.at("reasoning_content").is_string()) message.reasoning = item.at("reasoning_content").string();
+            if (const auto * calls = present(item, "tool_calls")) {
+                if (!calls->is_array()) throw invalid_request("'tool_calls' must be an array");
+                for (const auto & entry : calls->items()) {
+                    const auto & function = entry.at("function").is_object() ? entry.at("function") : entry;
+                    if (!function.at("name").is_string()) throw invalid_request("A tool call needs a function name");
+                    ToolCall call;
+                    call.name = function.at("name").string();
+                    if (entry.at("id").is_string()) call.id = entry.at("id").string();
+                    const auto & arguments = function.at("arguments");
+                    if (arguments.is_object()) call.arguments = arguments;
+                    else if (arguments.is_string() && !trim_empty(arguments.string())) {
+                        try { call.arguments = Json::parse(arguments.string()); }
+                        catch (const JsonError &) { throw invalid_request("Tool call arguments must be a JSON object"); }
+                        if (!call.arguments.is_object()) throw invalid_request("Tool call arguments must be a JSON object");
+                    }
+                    message.tool_calls.push_back(std::move(call));
+                }
+            }
+        }
+        if (merge) {
+            task.messages.back().content += "\n\n" + message.content;
+            continue;
+        }
+        only_system = only_system && message.role == "system";
+        task.messages.push_back(std::move(message));
+    }
+    if (const auto * tools = present(body, "tools")) {
+        if (!tools->is_array()) throw invalid_request("'tools' must be an array");
+        for (const auto & tool : tools->items())
+            if (!tool.at("function").at("name").is_string()) throw invalid_request("Each tool needs function.name");
+        task.options.tools = *tools;
+    }
+    if (const auto * choice = present(body, "tool_choice")) {
+        if (choice->is_string()) {
+            if (choice->string() == "none") task.options.tools = Json();
+            else if (choice->string() == "required") task.options.forced_tool = "*";
+            else if (choice->string() != "auto") throw invalid_request("'tool_choice' must be none, auto, required or a function");
+        } else if (choice->at("function").at("name").is_string()) task.options.forced_tool = choice->at("function").at("name").string();
+        else throw invalid_request("'tool_choice' must be none, auto, required or a function");
+        if (!task.options.forced_tool.empty() && !task.options.tools.size()) throw invalid_request("'tool_choice' requires 'tools'");
+    }
+    // Thinking: template arguments first, then the common request spellings.
+    task.options.enable_thinking = config_.thinking;
+    const auto effort = [&](const std::string & value) {
+        if (value == "none") { task.options.enable_thinking = false; return; }
+        task.options.enable_thinking = true;
+        task.options.reasoning_effort = value == "minimal" || value == "low" ? "low" : value == "medium" ? "medium" : "xhigh";
+    };
+    if (const auto value = text(body, "reasoning_effort")) effort(*value);
+    if (const auto * thinking = present(body, "thinking"); thinking && thinking->at("type").is_string())
+        task.options.enable_thinking = thinking->at("type").string() != "disabled";
+    if (const auto value = boolean(body, "enable_thinking")) task.options.enable_thinking = *value;
+    if (const auto * kwargs = present(body, "chat_template_kwargs")) {
+        if (!kwargs->is_object()) throw invalid_request("'chat_template_kwargs' must be an object");
+        if (const auto value = boolean(*kwargs, "enable_thinking")) task.options.enable_thinking = *value;
+        if (const auto value = text(*kwargs, "reasoning_effort")) task.options.reasoning_effort = *value;
+        if (const auto value = boolean(*kwargs, "preserve_thinking")) task.options.preserve_thinking = *value;
+    }
+    if (const auto value = boolean(body, "add_generation_prompt")) task.options.add_generation_prompt = *value;
+    if (const auto value = text(body, "reasoning_format")) task.inline_reasoning = *value == "none";
+
+    sampling(body, task.params);
+    task.params.stop = stop_words(body, "stop");
+    task.params.max_tokens = config_.max_tokens;
+    for (const char * key : {"n_predict", "max_tokens", "max_completion_tokens"})
+        if (const auto value = integer(body, key)) task.params.max_tokens = int(std::clamp<int64_t>(*value, -1, 1 << 30));
+    task.params.cache_prompt = boolean(body, "cache_prompt").value_or(true);
+    task.params.logprobs = boolean(body, "logprobs").value_or(false);
+    if (const auto value = integer(body, "top_logprobs")) {
+        if (*value < 0 || *value > 20) throw invalid_request("'top_logprobs' must be within 0-20");
+        task.params.top_logprobs = int(*value);
+        if (*value) task.params.logprobs = true;
+    }
+    task.stream = boolean(body, "stream").value_or(false);
+    if (const auto * options = present(body, "stream_options")) task.include_usage = boolean(*options, "include_usage").value_or(false);
+    if (const auto n = integer(body, "n"); n && *n != 1) throw invalid_request("Only n = 1 is supported");
+    if (const auto * format = present(body, "response_format"); format && !(format->at("type").is_string() && format->at("type").string() == "text"))
+        throw invalid_request("Only response_format type 'text' is supported: constrained output is not implemented");
+    for (const char * key : {"grammar", "json_schema"})
+        if (present(body, key)) throw invalid_request(std::string("'") + key + "' is not supported: constrained output is not implemented");
+    return task;
+}
+
+App::ChatTask App::anthropic_task(const Json & body, bool counting) const {
+    ChatTask task;
+    task.model = text(body, "model").value_or(model_name());
+    using Block = ChatTask::Block;
+    // The lifetime of a block's cache_control, 0 without one.
+    const auto cache_ttl = [](const Json & block, const std::string & path) {
+        if (!block.is_object()) return 0;
+        const auto * control = present(block, "cache_control");
+        if (!control) return 0;
+        const std::string where = path.empty() ? std::string("cache_control") : path + ".cache_control";
+        if (!control->is_object()) throw invalid_request(where + ": Input should be a valid dictionary");
+        const auto & type = control->at("type");
+        if (!type.is_string() || type.string() != "ephemeral") throw invalid_request(where + ".type: Input should be 'ephemeral'");
+        const auto * ttl = present(*control, "ttl");
+        if (!ttl) return five_minutes;
+        if (ttl->is_string() && ttl->string() == "5m") return five_minutes;
+        if (ttl->is_string() && ttl->string() == "1h") return one_hour;
+        throw invalid_request(where + ".ephemeral.ttl: Input should be '5m' or '1h'");
+    };
+    // Tools render first, then the system prompt, then the messages; blocks
+    // are recorded in that order.
+    if (const auto * tools = present(body, "tools")) {
+        if (!tools->is_array()) throw invalid_request("tools: must be an array");
+        Json converted = Json::array();
+        size_t number = 0;
+        for (const auto & tool : tools->items()) {
+            const int ttl = cache_ttl(tool, "tools." + std::to_string(number++));
+            // Only client tools carry a schema; server-side tools cannot run here.
+            if (tool.at("name").is_string() && tool.contains("input_schema")) {
+                Json function = Json::object({{"name", tool.at("name")}});
+                if (tool.at("description").is_string()) function["description"] = tool.at("description");
+                function["parameters"] = tool.at("input_schema");
+                converted.push(Json::object({{"type", "function"}, {"function", std::move(function)}}));
+            }
+            // A skipped tool ends where the previous rendered one does.
+            const size_t rendered = converted.size();
+            task.blocks.push_back({rendered ? Block::At::Tool : Block::At::None, rendered ? rendered - 1 : 0, 0, ttl});
+        }
+        if (converted.size()) task.options.tools = std::move(converted);
+    }
+    if (const auto * system = present(body, "system")) {
+        std::vector<PartEnd> ends;
+        const auto content = content_text(*system, "\n\n", nullptr, &ends);
+        const bool rendered = !content.empty();
+        for (size_t k = 0; k < ends.size(); ++k) {
+            const std::string path = "system." + std::to_string(k);
+            const auto & part = *ends[k].part;
+            const bool empty = part.is_object() && part.at("text").is_string() && part.at("text").string().empty();
+            const int ttl = cache_ttl(part, path);
+            if (ttl && empty) throw invalid_request(path + ".text: cache_control cannot be set for empty text blocks");
+            Block block{rendered ? Block::At::Content : Block::At::None, 0, ends[k].end, ttl};
+            block.cacheable = !empty;
+            task.blocks.push_back(block);
+        }
+        if (rendered) task.messages.push_back({"system", content, std::nullopt, {}});
+    }
+    const auto * messages = present(body, "messages");
+    if (!messages || !messages->is_array() || !messages->size()) throw invalid_request("messages: Field required");
+    int runs = 0;
+    size_t number = 0;
+    for (const auto & item : messages->items()) {
+        const std::string where = "messages." + std::to_string(number++);
+        if (!item.is_object() || !item.at("role").is_string()) throw invalid_request("messages: each message needs a role");
+        const auto & role = item.at("role").string();
+        const auto & content = item.at("content");
+        if (role != "user" && role != "assistant") throw invalid_request("messages: role must be user or assistant");
+        Message message;
+        message.role = role;
+        if (content.is_string()) {
+            message.content = content.string();
+            Block block{Block::At::Content, task.messages.size(), message.content.size()};
+            block.cacheable = !message.content.empty();
+            task.blocks.push_back(block);
+            task.messages.push_back(std::move(message));
+            continue;
+        }
+        if (!content.is_array()) throw invalid_request("messages: content must be a string or an array of blocks");
+        bool any = false, after_text = false;
+        const auto flush = [&] {
+            if (any) task.messages.push_back(std::move(message));
+            message = Message(); message.role = role; any = false; after_text = false;
+        };
+        std::string previous; // Type of the previous block of this message.
+        size_t index = 0;
+        for (const auto & block : content.items()) {
+            const std::string path = where + ".content." + std::to_string(index++);
+            const auto type = block.at("type").is_string() ? block.at("type").string() : std::string();
+            Block mark{Block::At::Content, task.messages.size()};
+            int ttl = 0;
+            if (type == "thinking" || type == "redacted_thinking") {
+                if (present(block, "cache_control")) throw invalid_request(path + "." + type + ".cache_control: Extra inputs are not permitted");
+            } else ttl = cache_ttl(block, path);
+            if (type == "text" && block.at("text").is_string()) {
+                const auto & value = block.at("text").string();
+                if (ttl && value.empty()) throw invalid_request(path + ".text: cache_control cannot be set for empty text blocks");
+                // Consecutive user text blocks are separate lines; an image
+                // marker joins the following text directly, as content parts do.
+                if (after_text && role == "user") message.content += "\n";
+                message.content += value; any = true; after_text = true;
+                mark.offset = message.content.size(); mark.cacheable = !value.empty();
+            } else if (type == "image") {
+                task.images.push_back(image_part(block));
+                message.content += image_marker; any = true; after_text = false;
+                mark.offset = message.content.size();
+            } else if ((type == "thinking" || type == "redacted_thinking") && role == "assistant") {
+                if (type == "thinking" && block.at("thinking").is_string())
+                    message.reasoning = message.reasoning.value_or("") + block.at("thinking").string();
+                any = true;
+                mark.at = Block::At::None; mark.cacheable = false;
+            } else if (type == "tool_use" && role == "assistant") {
+                if (!block.at("name").is_string()) throw invalid_request("messages: tool_use needs a name");
+                ToolCall call;
+                call.name = block.at("name").string();
+                if (block.at("id").is_string()) call.id = block.at("id").string();
+                if (block.at("input").is_object()) call.arguments = block.at("input");
+                message.tool_calls.push_back(std::move(call)); any = true;
+                mark.at = Block::At::Call; mark.offset = message.tool_calls.size() - 1;
+                mark.run = previous == type ? runs : ++runs;
+            } else if (type == "tool_result" && role == "user") {
+                flush();
+                std::vector<PartEnd> ends;
+                std::string result = content_text(block.at("content"), "\n", &task.images, &ends);
+                mark.index = task.messages.size();
+                for (size_t k = 0; k < ends.size(); ++k)
+                    if (const int nested = cache_ttl(*ends[k].part, path + ".content." + std::to_string(k)))
+                        task.blocks.push_back({Block::At::Content, mark.index, ends[k].end, nested});
+                mark.offset = result.size();
+                mark.run = previous == type ? runs : ++runs;
+                task.messages.push_back({"tool", std::move(result), std::nullopt, {}});
+            } else throw invalid_request("messages: unsupported content block '" + type + "' (this server accepts text, image, thinking and tool blocks)");
+            mark.ttl = ttl;
+            task.blocks.push_back(mark);
+            previous = type;
+        }
+        flush();
+    }
+    // A top-level cache_control places a breakpoint on the last block that can take one.
+    if (present(body, "cache_control")) {
+        const int ttl = cache_ttl(body, "");
+        for (size_t k = task.blocks.size(); k-- > 0;) {
+            auto & block = task.blocks[k];
+            if (!block.cacheable || block.at == Block::At::None) continue;
+            if (block.ttl && block.ttl != ttl)
+                throw invalid_request("cache_control: the automatic breakpoint falls on the last cacheable block, whose own "
+                                      "cache_control has a different ttl");
+            if (!block.ttl) block.ttl = ttl;
+            break;
+        }
+    }
+    int count = 0, shortest = 0;
+    for (const auto & block : task.blocks) {
+        if (!block.ttl) continue;
+        ++count;
+        if (shortest && block.ttl > shortest)
+            throw invalid_request("a ttl='1h' cache_control block must not come after a ttl='5m' cache_control block. "
+                                  "Note that blocks are processed in the following order: `tools`, `system`, `messages`.");
+        shortest = shortest ? std::min(shortest, block.ttl) : block.ttl;
+    }
+    if (count > 4) throw invalid_request("A maximum of 4 blocks with cache_control may be provided. Found " + std::to_string(count) + ".");
+    if (const auto * choice = present(body, "tool_choice")) {
+        const auto type = choice->at("type").is_string() ? choice->at("type").string() : std::string();
+        if (type == "none") task.options.tools = Json();
+        else if (type == "any") task.options.forced_tool = "*";
+        else if (type == "tool" && choice->at("name").is_string()) task.options.forced_tool = choice->at("name").string();
+        else if (type != "auto") throw invalid_request("tool_choice: type must be auto, any, tool or none");
+        if (!task.options.forced_tool.empty() && !task.options.tools.size()) task.options.forced_tool.clear();
+    }
+    // Without a `thinking` field the Messages API does not think.
+    task.options.enable_thinking = false;
+    std::string thinking_type;
+    if (const auto * thinking = present(body, "thinking"); thinking && thinking->at("type").is_string()) {
+        thinking_type = thinking->at("type").string();
+        task.options.enable_thinking = thinking_type != "disabled";
+    }
+    if (const auto * output = present(body, "output_config"))
+        if (const auto value = text(*output, "effort"))
+            task.options.reasoning_effort = *value == "low" ? "low" : *value == "medium" ? "medium" : "xhigh";
+
+    sampling(body, task.params);
+    task.params.stop = stop_words(body, "stop_sequences");
+    const auto max_tokens = integer(body, "max_tokens");
+    if (!max_tokens && !counting) throw invalid_request("max_tokens: Field required");
+    task.params.max_tokens = int(std::clamp<int64_t>(max_tokens.value_or(0), 0, 1 << 30));
+    task.stream = boolean(body, "stream").value_or(false);
+    // max_tokens 0 only evaluates the prompt, which pre-warms the cache.
+    if (max_tokens && *max_tokens == 0 && !counting) {
+        if (task.stream) throw invalid_request("max_tokens: 0 is not supported with stream: true");
+        if (thinking_type == "enabled") throw invalid_request("max_tokens: 0 is not supported with thinking type 'enabled'");
+        if (const auto * choice = present(body, "tool_choice"); choice && choice->at("type").is_string() &&
+            (choice->at("type").string() == "any" || choice->at("type").string() == "tool"))
+            throw invalid_request("max_tokens: 0 is not supported with tool_choice type '" + choice->at("type").string() + "'");
+    }
+    return task;
+}
+
+// OpenAI (GPT-5.6 and later): an implicit breakpoint at the end of the latest
+// eligible message unless the mode is explicit; up to four writes per
+// request; lookups at the first 2 and latest 50 explicit breakpoints and, in
+// implicit mode, the implicit breakpoint, up to 20 earlier eligible message
+// endings and the end of the leading developer messages.
+CachePlan App::openai_cache(const ChatTask & task) const {
+    using Block = ChatTask::Block;
+    CachePlan plan;
+    plan.enabled = true;
+    plan.space = "openai:" + task.cache_key;
+    plan.upgrade = true;
+    plan.read_ttl = thirty_minutes;
+    std::vector<const Block *> marked, endings;
+    const Block * developer = nullptr;
+    for (const auto & block : task.blocks) {
+        if (block.position <= 0) continue;
+        if (block.ttl) marked.push_back(&block);
+        if (block.end != Block::End::None) endings.push_back(&block);
+        if (block.end == Block::End::Developer) developer = &block;
+    }
+    const int minimum = std::max(config_.cache_min_tokens, 1);
+    std::vector<const Block *> writable;
+    for (const auto * block : marked) if (block->position >= minimum) writable.push_back(block);
+    const size_t explicit_writes = task.openai_explicit ? 4 : 3;
+    for (size_t k = writable.size() > explicit_writes ? writable.size() - explicit_writes : 0; k < writable.size(); ++k)
+        plan.writes.push_back({writable[k]->position, writable[k]->ttl});
+    for (size_t k = 0; k < marked.size(); ++k)
+        if (k < 2 || k + 50 >= marked.size()) plan.lookups.push_back(marked[k]->position);
+    if (!task.openai_explicit && !endings.empty()) {
+        const int implicit = endings.back()->position;
+        if (implicit >= minimum) plan.writes.push_back({implicit, thirty_minutes});
+        for (size_t k = endings.size(), taken = 0; k-- > 0 && taken <= 20; ++taken) plan.lookups.push_back(endings[k]->position);
+        if (developer) plan.lookups.push_back(developer->position);
+    }
+    return plan;
+}
+
+// Anthropic: breakpoints are the blocks with cache_control (including the
+// automatic one); each writes an entry when its prefix reaches the minimum
+// length, and each looks for an earlier entry over at most 20 block positions
+// before it (a run of tool_use or tool_result blocks is one position).
+// Without any breakpoint the request reports the physical reuse as before.
+CachePlan App::anthropic_cache(const ChatTask & task) const {
+    using Block = ChatTask::Block;
+    CachePlan plan;
+    plan.space = "anthropic";
+    const int minimum = std::max(config_.cache_min_tokens, 1);
+    const auto & blocks = task.blocks;
+    for (size_t j = 0; j < blocks.size(); ++j) {
+        if (!blocks[j].ttl) continue;
+        plan.enabled = true;
+        if (blocks[j].position >= minimum) plan.writes.push_back({blocks[j].position, blocks[j].ttl});
+        int steps = 0;
+        for (size_t k = j + 1; k-- > 0;) {
+            if (k < j && !(blocks[k].run >= 0 && blocks[k].run == blocks[k + 1].run) && ++steps > 20) break;
+            if (blocks[k].at != Block::At::None && blocks[k].position > 0) plan.lookups.push_back(blocks[k].position);
+        }
+    }
+    return plan;
+}
+
+App::ChatRun App::run_chat(ChatTask & task, const char * id_prefix, Response & response, std::function<void()> on_start,
+                           std::function<void(const GenerationResult &)> on_prompt,
+                           std::function<bool(const ChatDelta &, const std::vector<GeneratedToken> &)> on_delta) {
+    ChatRun run;
+    ChatParser parser(task.prompt.thinking, &task.options.tools, task.inline_reasoning);
+    const auto absorb = [&](ChatDelta delta, const std::vector<GeneratedToken> & tokens) {
+        for (auto & call : delta.tool_calls) call.id = id_prefix + random_token(24);
+        run.reasoning += delta.reasoning; run.content += delta.content;
+        run.calls.insert(run.calls.end(), delta.tool_calls.begin(), delta.tool_calls.end());
+        return !on_delta || on_delta(delta, tokens);
+    };
+    absorb(parser.feed(task.prompt.reply_prefix), {});
+    GenerationCallbacks callbacks;
+    callbacks.on_start = std::move(on_start);
+    callbacks.on_prompt = std::move(on_prompt);
+    callbacks.on_text = [&](std::string_view piece, const std::vector<GeneratedToken> & tokens) { return absorb(parser.feed(piece), tokens); };
+    callbacks.cancelled = [&] { return !response.alive(); };
+    run.result = runtime_.generate(task.input, task.params, callbacks);
+    absorb(parser.finish(), {});
+    return run;
+}
+
+void App::chat_completions(const Request & request, Response & response) {
+    auto task = openai_task(parse_body(request));
+    prepare(task);
+    task.params.cache = openai_cache(task);
+    const std::string id = "chatcmpl-" + random_token(24);
+    const int64_t created = unix_time();
+    const auto finish_reason = [](const ChatRun & run) {
+        return !run.calls.empty() && run.result.stop != StopType::Limit ? "tool_calls" : run.result.stop == StopType::Limit ? "length" : "stop";
+    };
+    const auto logprobs = [&](const std::vector<GeneratedToken> & tokens) {
+        Json content = Json::array();
+        for (const auto & token : tokens) content.push(token_logprob(token));
+        return Json::object({{"content", std::move(content)}});
+    };
+    if (!task.stream) {
+        const auto run = run_chat(task, "call_", response, {}, {}, {});
+        Json message = Json::object({{"role", "assistant"}, {"content", run.content.empty() && !run.calls.empty() ? Json() : Json(run.content)}});
+        if (!run.reasoning.empty()) message["reasoning_content"] = run.reasoning;
+        if (!run.calls.empty()) message["tool_calls"] = tool_calls_json(run.calls, 0, false);
+        Json choice = Json::object({{"index", 0}, {"message", std::move(message)},
+            {"logprobs", task.params.logprobs ? logprobs(run.result.tokens) : Json()}, {"finish_reason", finish_reason(run)}});
+        send_json(response, 200, Json::object({{"id", id}, {"object", "chat.completion"}, {"created", created},
+            {"model", task.model}, {"system_fingerprint", version}, {"choices", list({std::move(choice)})},
+            {"usage", openai_usage(run.result)}, {"timings", timings(run.result)}}));
+        return;
+    }
+    const auto chunk = [&](Json delta, Json finish) {
+        return Json::object({{"id", id}, {"object", "chat.completion.chunk"}, {"created", created}, {"model", task.model},
+            {"system_fingerprint", version},
+            {"choices", list({Json::object({{"index", 0}, {"delta", std::move(delta)}, {"finish_reason", std::move(finish)}})})}});
+    };
+    size_t call_index = 0;
+    std::vector<GeneratedToken> unreported;
+    const auto run = run_chat(task, "call_", response,
+        [&] { response.begin(200, "text/event-stream"); },
+        [&](const GenerationResult &) { sse(response, chunk(Json::object({{"role", "assistant"}, {"content", Json()}}), Json())); },
+        [&](const ChatDelta & delta, const std::vector<GeneratedToken> & tokens) {
+            if (task.params.logprobs) unreported.insert(unreported.end(), tokens.begin(), tokens.end());
+            const auto send = [&](Json body) {
+                Json event = chunk(std::move(body), Json());
+                if (task.params.logprobs && !unreported.empty()) {
+                    event["choices"].items()[0]["logprobs"] = logprobs(unreported);
+                    unreported.clear();
+                }
+                return sse(response, event);
+            };
+            bool ok = true;
+            if (!delta.reasoning.empty()) ok = send(Json::object({{"reasoning_content", delta.reasoning}}));
+            if (ok && !delta.content.empty()) ok = send(Json::object({{"content", delta.content}}));
+            if (ok && !delta.tool_calls.empty()) {
+                ok = send(Json::object({{"tool_calls", tool_calls_json(delta.tool_calls, call_index, true)}}));
+                call_index += delta.tool_calls.size();
+            }
+            return ok;
+        });
+    if (!response.started()) return; // Cancelled while queued.
+    Json last = chunk(Json::object(), finish_reason(run));
+    if (!unreported.empty()) last["choices"].items()[0]["logprobs"] = logprobs(unreported);
+    last["timings"] = timings(run.result);
+    sse(response, last);
+    if (task.include_usage) {
+        Json usage = chunk(Json::object(), Json());
+        usage["choices"] = Json::array();
+        usage["usage"] = openai_usage(run.result);
+        sse(response, usage);
+    }
+    response.write("data: [DONE]\n\n");
+}
+
+void App::completions(const Request & request, Response & response) {
+    const Json body = parse_body(request);
+    const auto * prompt = present(body, "prompt");
+    if (!prompt) throw invalid_request("'prompt' is required");
+    const auto tokens = prompt_tokens(*prompt);
+    GenerationParams params;
+    sampling(body, params);
+    params.stop = stop_words(body, "stop");
+    params.max_tokens = config_.max_tokens;
+    for (const char * key : {"n_predict", "max_tokens"})
+        if (const auto value = integer(body, key)) params.max_tokens = int(std::clamp<int64_t>(*value, -1, 1 << 30));
+    params.cache_prompt = boolean(body, "cache_prompt").value_or(true);
+    if (const auto value = integer(body, "logprobs")) {
+        if (*value < 0 || *value > 20) throw invalid_request("'logprobs' must be within 0-20");
+        params.logprobs = true; params.top_logprobs = int(*value);
+    }
+    if (const auto n = integer(body, "n"); n && *n != 1) throw invalid_request("Only n = 1 is supported");
+    if (const auto suffix = text(body, "suffix"); suffix && !suffix->empty()) throw invalid_request("'suffix' is not supported; use /infill");
+    const bool stream = boolean(body, "stream").value_or(false), echo = boolean(body, "echo").value_or(false);
+    const std::string model = text(body, "model").value_or(model_name()), id = "cmpl-" + random_token(24);
+    const int64_t created = unix_time();
+    const auto & tokenizer = runtime_.tokenizer();
+    size_t offset = 0;
+    const auto logprobs = [&](const std::vector<GeneratedToken> & generated) {
+        Json pieces = Json::array(), values = Json::array(), top = Json::array(), offsets = Json::array();
+        for (const auto & token : generated) {
+            const auto piece = sanitize_utf8(tokenizer.piece(token.id, true));
+            Json alternatives = Json::object();
+            for (const auto & candidate : token.top) alternatives[sanitize_utf8(tokenizer.piece(candidate.id, true))] = candidate.logprob;
+            offsets.push(offset); offset += piece.size();
+            pieces.push(piece); values.push(token.logprob); top.push(std::move(alternatives));
+        }
+        return Json::object({{"tokens", std::move(pieces)}, {"token_logprobs", std::move(values)},
+                             {"top_logprobs", std::move(top)}, {"text_offset", std::move(offsets)}});
+    };
+    const auto event = [&](std::string content, Json probabilities, Json finish) {
+        return Json::object({{"id", id}, {"object", "text_completion"}, {"created", created}, {"model", model},
+            {"system_fingerprint", version},
+            {"choices", list({Json::object({{"text", std::move(content)}, {"index", 0}, {"logprobs", std::move(probabilities)},
+                                            {"finish_reason", std::move(finish)}})})}});
+    };
+    const auto finish_reason = [](const GenerationResult & r) { return r.stop == StopType::Limit ? "length" : "stop"; };
+    const std::string prefix = echo ? tokenizer.decode(tokens, false) : std::string();
+    GenerationCallbacks callbacks;
+    callbacks.cancelled = [&] { return !response.alive(); };
+    if (!stream) {
+        const auto result = runtime_.generate(tokens, params, callbacks);
+        Json out = event(prefix + result.text, params.logprobs ? logprobs(result.tokens) : Json(), finish_reason(result));
+        out["usage"] = openai_usage(result); out["timings"] = timings(result);
+        send_json(response, 200, out);
+        return;
+    }
+    callbacks.on_start = [&] { response.begin(200, "text/event-stream"); if (echo) sse(response, event(prefix, Json(), Json())); };
+    callbacks.on_text = [&](std::string_view piece, const std::vector<GeneratedToken> & generated) {
+        return sse(response, event(std::string(piece), params.logprobs ? logprobs(generated) : Json(), Json()));
+    };
+    const auto result = runtime_.generate(tokens, params, callbacks);
+    if (!response.started()) return;
+    Json last = event("", Json(), finish_reason(result));
+    last["usage"] = openai_usage(result); last["timings"] = timings(result);
+    sse(response, last);
+    response.write("data: [DONE]\n\n");
+}
+
+void App::messages(const Request & request, Response & response) {
+    auto task = anthropic_task(parse_body(request), false);
+    prepare(task);
+    task.params.cache = anthropic_cache(task);
+    const std::string id = "msg_" + random_token(24);
+    const auto stop_reason = [](const ChatRun & run) {
+        return run.result.stop == StopType::Limit ? "max_tokens" : !run.calls.empty() ? "tool_use"
+             : run.result.stop == StopType::Word ? "stop_sequence" : "end_turn";
+    };
+    const auto stop_sequence = [](const ChatRun & run) {
+        return run.result.stop == StopType::Word && run.calls.empty() ? Json(run.result.stopping_word) : Json();
+    };
+    if (!task.stream) {
+        const auto run = run_chat(task, "toolu_", response, {}, {}, {});
+        Json content = Json::array();
+        if (!run.reasoning.empty()) content.push(Json::object({{"type", "thinking"}, {"thinking", run.reasoning}, {"signature", ""}}));
+        // A pre-warming request (max_tokens 0) has no content at all.
+        if (!run.content.empty() || (run.calls.empty() && run.reasoning.empty() && task.params.max_tokens != 0))
+            content.push(Json::object({{"type", "text"}, {"text", run.content}}));
+        for (const auto & call : run.calls)
+            content.push(Json::object({{"type", "tool_use"}, {"id", call.id}, {"name", call.name}, {"input", call.arguments}}));
+        send_json(response, 200, Json::object({{"id", id}, {"type", "message"}, {"role", "assistant"}, {"model", task.model},
+            {"content", std::move(content)}, {"stop_reason", stop_reason(run)}, {"stop_sequence", stop_sequence(run)},
+            {"usage", anthropic_usage(run.result)}}));
+        return;
+    }
+    enum class Block { None, Thinking, Text } open = Block::None;
+    int index = -1;
+    const auto close = [&] {
+        if (open == Block::None) return true;
+        if (open == Block::Thinking)
+            sse(response, "content_block_delta", Json::object({{"type", "content_block_delta"}, {"index", index},
+                {"delta", Json::object({{"type", "signature_delta"}, {"signature", ""}})}}));
+        open = Block::None;
+        return sse(response, "content_block_stop", Json::object({{"type", "content_block_stop"}, {"index", index}}));
+    };
+    const auto start = [&](Json block) {
+        return sse(response, "content_block_start", Json::object({{"type", "content_block_start"}, {"index", ++index},
+            {"content_block", std::move(block)}}));
+    };
+    const auto delta_event = [&](Json delta) {
+        return sse(response, "content_block_delta", Json::object({{"type", "content_block_delta"}, {"index", index}, {"delta", std::move(delta)}}));
+    };
+    const auto run = run_chat(task, "toolu_", response,
+        [&] { response.begin(200, "text/event-stream"); sse(response, "ping", Json::object({{"type", "ping"}})); },
+        [&](const GenerationResult & usage) {
+            sse(response, "message_start", Json::object({{"type", "message_start"}, {"message", Json::object({{"id", id},
+                {"type", "message"}, {"role", "assistant"}, {"model", task.model}, {"content", Json::array()},
+                {"stop_reason", Json()}, {"stop_sequence", Json()}, {"usage", anthropic_usage(usage)}})}}));
+        },
+        [&](const ChatDelta & delta, const std::vector<GeneratedToken> &) {
+            bool ok = true;
+            if (!delta.reasoning.empty()) {
+                if (open != Block::Thinking) { close(); start(Json::object({{"type", "thinking"}, {"thinking", ""}, {"signature", ""}})); open = Block::Thinking; }
+                ok = delta_event(Json::object({{"type", "thinking_delta"}, {"thinking", delta.reasoning}}));
+            }
+            if (ok && !delta.content.empty()) {
+                if (open != Block::Text) { close(); start(Json::object({{"type", "text"}, {"text", ""}})); open = Block::Text; }
+                ok = delta_event(Json::object({{"type", "text_delta"}, {"text", delta.content}}));
+            }
+            for (const auto & call : delta.tool_calls) {
+                close();
+                start(Json::object({{"type", "tool_use"}, {"id", call.id}, {"name", call.name}, {"input", Json::object()}}));
+                delta_event(Json::object({{"type", "input_json_delta"}, {"partial_json", call.arguments.dump()}}));
+                ok = sse(response, "content_block_stop", Json::object({{"type", "content_block_stop"}, {"index", index}}));
+            }
+            return ok;
+        });
+    if (!response.started()) return;
+    close();
+    sse(response, "message_delta", Json::object({{"type", "message_delta"},
+        {"delta", Json::object({{"stop_reason", stop_reason(run)}, {"stop_sequence", stop_sequence(run)}})},
+        {"usage", anthropic_usage(run.result)}}));
+    sse(response, "message_stop", Json::object({{"type", "message_stop"}}));
+}
+
+void App::count_tokens(const Request & request, Response & response) {
+    auto task = anthropic_task(parse_body(request), true);
+    prepare(task);
+    send_json(response, 200, Json::object({{"input_tokens", task.tokens.size()}}));
+}
+
+void App::native_completion(const Request & request, Response & response, bool infill) {
+    const Json body = parse_body(request);
+    const auto & tokenizer = runtime_.tokenizer();
+    std::vector<int32_t> tokens;
+    Images images;
+    Prompt input;
+    if (infill) {
+        const int32_t prefix = tokenizer.added_token("<|fim_prefix|>"), suffix = tokenizer.added_token("<|fim_suffix|>"),
+                      middle = tokenizer.added_token("<|fim_middle|>");
+        if (prefix < 0 || suffix < 0 || middle < 0) throw ApiError(501, "not_supported_error", "The model has no fill-in-the-middle tokens");
+        const auto part = [&](const char * key) { return tokenizer.encode(text(body, key).value_or(""), false); };
+        const auto before = part("input_prefix"), after = part("input_suffix");
+        tokens.push_back(prefix); tokens.insert(tokens.end(), before.begin(), before.end());
+        tokens.push_back(suffix); tokens.insert(tokens.end(), after.begin(), after.end());
+        tokens.push_back(middle);
+    } else {
+        const auto * prompt = present(body, "prompt");
+        if (!prompt) throw invalid_request("'prompt' is required");
+        if (prompt->is_object()) {
+            // llama.cpp multimodal form: {"prompt_string": "... <__media__> ...", "multimodal_data": [base64, ...]}
+            const auto & text = prompt->at("prompt_string");
+            if (!text.is_string()) throw invalid_request("'prompt.prompt_string' must be a string");
+            std::string rendered = text.string();
+            for (size_t at = 0; (at = rendered.find(media_marker, at)) != std::string::npos;) {
+                rendered.replace(at, std::string_view(media_marker).size(), image_marker);
+                at += std::string_view("<|image_pad|>").size();
+            }
+            if (const auto & data = prompt->at("multimodal_data"); data.is_array())
+                for (const auto & item : data.items()) {
+                    if (!item.is_string()) throw invalid_request("'multimodal_data' must hold base64 strings");
+                    try { images.push_back(image_from_base64(item.string())); }
+                    catch (const std::invalid_argument & e) { throw invalid_request(std::string("Invalid image: ") + e.what()); }
+                }
+            input = tokenize_with_images(rendered, images);
+            if (input.tokens.empty()) throw invalid_request("The prompt is empty");
+            tokens = input.tokens;
+        } else tokens = prompt_tokens(*prompt);
+    }
+    if (input.tokens.empty()) input.tokens = tokens;
+    GenerationParams params;
+    sampling(body, params);
+    params.stop = stop_words(body, "stop");
+    params.max_tokens = config_.max_tokens;
+    for (const char * key : {"max_tokens", "n_predict"})
+        if (const auto value = integer(body, key)) params.max_tokens = int(std::clamp<int64_t>(*value, -1, 1 << 30));
+    params.cache_prompt = boolean(body, "cache_prompt").value_or(true);
+    params.render_special = boolean(body, "special").value_or(false);
+    if (const auto value = integer(body, "n_probs"); value && *value > 0) {
+        params.logprobs = true; params.top_logprobs = int(std::min<int64_t>(*value, 100));
+    }
+    for (const char * key : {"grammar", "json_schema"})
+        if (present(body, key)) throw invalid_request(std::string("'") + key + "' is not supported: constrained output is not implemented");
+    const bool stream = boolean(body, "stream").value_or(false);
+    const bool return_tokens = boolean(body, "return_tokens").value_or(false) || stream;
+    const std::string model = model_name();
+    const auto ids = [](const std::vector<GeneratedToken> & generated) {
+        Json out = Json::array();
+        for (const auto & token : generated) out.push(token.id);
+        return out;
+    };
+    const auto probabilities = [&](const std::vector<GeneratedToken> & generated) {
+        Json out = Json::array();
+        for (const auto & token : generated) out.push(token_logprob(token));
+        return out;
+    };
+    GenerationCallbacks callbacks;
+    callbacks.cancelled = [&] { return !response.alive(); };
+    int evaluated = int(tokens.size());
+    size_t predicted = 0;
+    if (stream) {
+        callbacks.on_start = [&] { response.begin(200, "text/event-stream"); };
+        callbacks.on_text = [&](std::string_view piece, const std::vector<GeneratedToken> & generated) {
+            predicted += generated.size();
+            Json event = Json::object({{"index", 0}, {"content", piece}, {"tokens", ids(generated)}, {"stop", false},
+                {"id_slot", 0}, {"tokens_predicted", predicted}, {"tokens_evaluated", evaluated}});
+            if (params.logprobs) event["completion_probabilities"] = probabilities(generated);
+            return sse(response, event);
+        };
+    }
+    const auto result = runtime_.generate(input, params, callbacks);
+    if (stream && !response.started()) return;
+    const char * stop_type = result.stop == StopType::Eos ? "eos" : result.stop == StopType::Limit ? "limit"
+                           : result.stop == StopType::Word ? "word" : "none";
+    Json out = Json::object({{"index", 0}, {"content", stream ? std::string() : result.text},
+        {"tokens", return_tokens && !stream ? ids(result.tokens) : Json::array()}, {"id_slot", 0}, {"stop", true}, {"model", model},
+        {"tokens_predicted", result.tokens.size()}, {"tokens_evaluated", result.prompt_tokens},
+        {"generation_settings", sampling_json(params)}, {"has_new_line", result.text.find('\n') != std::string::npos},
+        {"truncated", false}, {"stop_type", stop_type}, {"stopping_word", result.stopping_word},
+        {"stopped_eos", result.stop == StopType::Eos}, {"stopped_word", result.stop == StopType::Word},
+        {"stopped_limit", result.stop == StopType::Limit}, {"tokens_cached", result.cached_tokens},
+        {"timings", timings(result)}});
+    if (params.logprobs && !stream) out["completion_probabilities"] = probabilities(result.tokens);
+    if (stream) sse(response, out); else send_json(response, 200, out);
+}
+
+void App::tokenize(const Request & request, Response & response) {
+    const Json body = parse_body(request);
+    const auto & tokenizer = runtime_.tokenizer();
+    const bool parse_special = boolean(body, "parse_special").value_or(true);
+    std::vector<int32_t> tokens;
+    if (boolean(body, "add_special").value_or(false) && tokenizer.bos() >= 0) tokens.push_back(tokenizer.bos());
+    const auto & content = body.at("content");
+    const auto add = [&](const Json & item) {
+        if (item.is_string()) {
+            const auto part = tokenizer.encode(item.string(), parse_special);
+            tokens.insert(tokens.end(), part.begin(), part.end());
+        } else if (item.is_int() && item.integer() >= 0 && item.integer() < tokenizer.size()) tokens.push_back(int32_t(item.integer()));
+        else throw invalid_request("'content' must be a string or an array of strings and token ids");
+    };
+    if (content.is_array()) for (const auto & item : content.items()) add(item);
+    else add(content);
+    Json out = Json::array();
+    const bool pieces = boolean(body, "with_pieces").value_or(false);
+    for (const auto token : tokens) {
+        if (!pieces) { out.push(token); continue; }
+        // A piece that is not valid UTF-8 on its own is given as bytes.
+        const auto piece = tokenizer.piece(token, true);
+        out.push(Json::object({{"id", token}, {"piece", sanitize_utf8(piece) == piece ? Json(piece) : bytes_json(piece)}}));
+    }
+    send_json(response, 200, Json::object({{"tokens", std::move(out)}}));
+}
+
+void App::detokenize(const Request & request, Response & response) {
+    const Json body = parse_body(request);
+    const auto & items = body.at("tokens");
+    if (!items.is_array()) throw invalid_request("'tokens' must be an array of token ids");
+    std::vector<int32_t> tokens;
+    for (const auto & item : items.items()) {
+        if (!item.is_int() || item.integer() < 0 || item.integer() >= runtime_.tokenizer().size())
+            throw invalid_request("'tokens' must contain token ids inside the vocabulary");
+        tokens.push_back(int32_t(item.integer()));
+    }
+    send_json(response, 200, Json::object({{"content", runtime_.tokenizer().decode(tokens, true)}}));
+}
+
+void App::apply_template(const Request & request, Response & response) {
+    auto task = openai_task(parse_body(request));
+    prepare(task);
+    send_json(response, 200, Json::object({{"prompt", task.prompt.text}}));
+}
+
+void App::health(const Request &, Response & response) {
+    if (runtime_.state() == Runtime::State::Ready) send_json(response, 200, Json::object({{"status", "ok"}}));
+    else if (runtime_.state() == Runtime::State::Loading) send_json(response, 503, openai_error(503, "unavailable_error", "Loading model"));
+    else send_json(response, 500, openai_error(500, "server_error", "Model failed to load: " + runtime_.error()));
+}
+
+void App::models(const Request &, Response & response) {
+    const auto & info = runtime_.model_info();
+    const std::string name = model_name();
+    Json model = Json::object({{"id", name}, {"object", "model"}, {"type", "model"}, {"display_name", name},
+        {"created", started_}, {"owned_by", "tidal"},
+        {"meta", Json::object({{"n_vocab", runtime_.model().vocab}, {"n_ctx_train", runtime_.context()},
+                               {"n_params", info.parameters}, {"size", info.stored_weight_bytes}})}});
+    send_json(response, 200, Json::object({{"object", "list"}, {"data", list({std::move(model)})},
+        {"has_more", false}, {"first_id", name}, {"last_id", name}}));
+}
+
+void App::props(const Request &, Response & response) {
+    const auto & tokenizer = runtime_.tokenizer();
+    GenerationParams params;
+    params.sampling = default_sampling();
+    params.max_tokens = config_.max_tokens;
+    const auto token_text = [&](int32_t token) { return token < 0 ? std::string() : sanitize_utf8(tokenizer.piece(token, true)); };
+    send_json(response, 200, Json::object({
+        {"default_generation_settings", Json::object({{"id", 0}, {"n_ctx", runtime_.context()}, {"params", sampling_json(params)}})},
+        {"total_slots", 1}, {"model_alias", model_name()}, {"model_path", runtime_.config().model},
+        {"modalities", Json::object({{"vision", runtime_.vision().enabled}, {"audio", false}})},
+        {"vision", vision_json()},
+        {"chat_template", tokenizer.metadata().chat_template}, {"chat_format", runtime_.chat().name()},
+        {"bos_token", token_text(tokenizer.bos())}, {"eos_token", token_text(tokenizer.eos())},
+        {"build_info", version}, {"backend", runtime_.backend()}, {"n_vocab", runtime_.model().vocab},
+        {"tokenizer", tokenizer.byte_fallback() ? "bytes" : "bpe"},
+        {"speculative", Json::object({{"draft_tokens", runtime_.config().draft_tokens}})},
+        {"cache_store", cache_store_json(runtime_.metrics())},
+        {"thinking_default", config_.thinking.value_or(runtime_.chat().thinking_default())}}));
+}
+
+// The cache store's budgets and contents; null when it is disabled.
+Json App::cache_store_json(const Metrics & m) const {
+    const auto & s = m.store;
+    if (!s.enabled) return Json();
+    return Json::object({{"ram_bytes", s.ram_bytes}, {"ram_limit", s.ram_limit}, {"disk_bytes", s.disk_bytes}, {"disk_limit", s.disk_limit},
+        {"directory", runtime_.config().options.cache_store.directory}, {"chunk_tokens", s.chunk_tokens},
+        {"chunks", s.chunks}, {"snapshots", s.snapshots}, {"tokens", s.tokens},
+        {"restores", m.store_restores}, {"restored_tokens", m.store_restored_tokens},
+        {"restore_seconds", m.store_restore_seconds}, {"save_seconds", m.store_save_seconds},
+        {"written_bytes", s.written_bytes}, {"read_bytes", s.read_bytes}, {"dropped", s.dropped}, {"dropped_bytes", s.dropped_bytes},
+        {"error", s.error.empty() ? Json() : Json(s.error)}});
+}
+
+Json App::vision_json() const {
+    const auto & v = runtime_.vision();
+    if (!v.enabled) return Json();
+    return Json::object({{"model", runtime_.config().options.vision_model}, {"placement", v.placement}, {"device", v.device},
+        {"layers", v.layers}, {"hidden", v.hidden}, {"heads", v.heads}, {"output", v.output}, {"patch_size", v.patch_size},
+        {"spatial_merge", v.merge}, {"min_image_tokens", v.min_tokens}, {"max_image_tokens", v.max_tokens},
+        {"parameters", v.parameters}, {"weight_bytes", v.weight_bytes}});
+}
+
+// Which device holds and computes each tensor. ?component=text|mtp|vision and
+// ?role=weight|state|kv_cache filter the list; ?tensors=0 returns the summary only.
+void App::placement(const Request & request, Response & response) {
+    const auto component = request.parameter("component"), role = request.parameter("role");
+    const bool tensors = request.parameter("tensors") != "0";
+    for (const auto & [name, value, allowed] : {std::tuple{"component", component, "text mtp vision"},
+                                                std::tuple{"role", role, "weight state kv_cache"}})
+        if (!value.empty() && std::string(" ") .append(allowed).append(" ").find(" " + value + " ") == std::string::npos)
+            throw invalid_request(std::string("Unknown ") + name + " '" + value + "'");
+    Json list = Json::array();
+    struct Total { uint64_t tensors = 0, bytes = 0; };
+    std::map<std::tuple<std::string, std::string, std::string, std::string>, Total> totals;
+    std::map<std::string, uint64_t> by_compute, by_memory;
+    for (const auto & t : runtime_.placements()) {
+        if ((!component.empty() && t.component != component) || (!role.empty() && t.role != role)) continue;
+        auto & total = totals[{t.component, t.role, t.memory, t.compute}];
+        ++total.tensors; total.bytes += t.bytes;
+        by_compute[t.compute] += t.bytes;
+        if (t.resident) by_memory[t.memory] += t.bytes;
+        if (!tensors) continue;
+        Json shape = Json::array();
+        for (const auto d : t.shape) shape.push(d);
+        list.push(Json::object({{"name", t.name}, {"component", t.component}, {"role", t.role}, {"group", t.group},
+            {"type", t.type}, {"shape", std::move(shape)}, {"bytes", t.bytes}, {"resident", t.resident},
+            {"memory", t.memory.empty() ? Json() : Json(t.memory)}, {"compute", t.compute}}));
+    }
+    Json summary = Json::array();
+    for (const auto & [key, total] : totals)
+        summary.push(Json::object({{"component", std::get<0>(key)}, {"role", std::get<1>(key)},
+            {"memory", std::get<2>(key).empty() ? Json() : Json(std::get<2>(key))}, {"compute", std::get<3>(key)},
+            {"tensors", total.tensors}, {"bytes", total.bytes}}));
+    Json compute = Json::object(), memory = Json::object();
+    for (const auto & [unit, bytes] : by_compute) compute[unit] = bytes;
+    for (const auto & [unit, bytes] : by_memory) memory[unit] = bytes;
+    Json out = Json::object({{"model", model_name()}, {"backend", runtime_.backend()}, {"vision", vision_json()},
+        {"bytes_by_compute", std::move(compute)}, {"bytes_by_memory", std::move(memory)}, {"summary", std::move(summary)}});
+    if (tensors) out["tensors"] = std::move(list);
+    send_json(response, 200, out);
+}
+
+void App::slots(const Request &, Response & response) {
+    GenerationParams params;
+    params.sampling = default_sampling();
+    params.max_tokens = config_.max_tokens;
+    send_json(response, 200, list({Json::object({{"id", 0}, {"n_ctx", runtime_.context()},
+        {"speculative", runtime_.config().draft_tokens > 0}, {"is_processing", runtime_.busy()},
+        {"queued", runtime_.queued()}, {"params", sampling_json(params)}, {"cache_store", cache_store_json(runtime_.metrics())},
+        {"next_token", Json::object({{"n_decoded", runtime_.decoded()}, {"n_remain", runtime_.remaining()}})}})}));
+}
+
+void App::slot_action(const Request & request, Response & response) {
+    const auto action = request.parameter("action");
+    if (request.path != "/slots/0") throw ApiError(404, "not_found_error", "Unknown slot: there is a single slot with id 0");
+    if (action != "erase") throw ApiError(501, "not_supported_error", "Only action=erase is supported");
+    runtime_.erase();
+    send_json(response, 200, Json::object({{"id_slot", 0}, {"n_erased", 0}}));
+}
+
+void App::metrics(const Request &, Response & response) {
+    const auto m = runtime_.metrics();
+    std::string out;
+    const auto metric = [&](const char * name, const char * kind, const char * help, double value) {
+        char number[64];
+        std::snprintf(number, sizeof number, "%.10g", value);
+        out += std::string("# HELP ") + name + " " + help + "\n# TYPE " + name + " " + kind + "\n" + name + " " + number + "\n";
+    };
+    metric("llamacpp:prompt_tokens_total", "counter", "Number of prompt tokens processed.", double(m.prompt_tokens));
+    metric("llamacpp:prompt_seconds_total", "counter", "Prompt process time", m.prompt_seconds);
+    metric("llamacpp:tokens_predicted_total", "counter", "Number of generation tokens processed.", double(m.generated_tokens));
+    metric("llamacpp:tokens_predicted_seconds_total", "counter", "Predict process time", m.generation_seconds);
+    metric("llamacpp:prompt_tokens_seconds", "gauge", "Average prompt throughput in tokens/s.",
+           m.prompt_seconds > 0 ? double(m.prompt_tokens) / m.prompt_seconds : 0);
+    metric("llamacpp:predicted_tokens_seconds", "gauge", "Average generation throughput in tokens/s.",
+           m.generation_seconds > 0 ? double(m.generated_tokens) / m.generation_seconds : 0);
+    metric("llamacpp:requests_processing", "gauge", "Number of requests processing.", runtime_.busy() ? 1 : 0);
+    metric("llamacpp:requests_deferred", "gauge", "Number of requests deferred.", runtime_.queued());
+    metric("tidal:requests_total", "counter", "Number of completed generation requests.", double(m.requests));
+    metric("tidal:prompt_tokens_cached_total", "counter", "Number of prompt tokens reused from the prompt cache.", double(m.cached_tokens));
+    metric("tidal:images_encoded_total", "counter", "Number of images run through the vision tower.", double(m.images));
+    metric("tidal:cache_read_tokens_total", "counter", "Prompt tokens reported to clients as cache reads.", double(m.cache_read_tokens));
+    metric("tidal:cache_write_tokens_total", "counter", "Prompt tokens reported to clients as cache writes.", double(m.cache_write_tokens));
+    metric("tidal:cache_entries", "gauge", "API cache entries as of the last request.", double(m.cache_entries));
+    metric("tidal:cache_snapshots", "gauge", "Engine state snapshots as of the last request.", double(m.cache_snapshots));
+    metric("tidal:cache_snapshot_bytes", "gauge", "Host memory held by engine state snapshots.", double(m.cache_snapshot_bytes));
+    if (m.store.enabled) {
+        metric("tidal:cache_store_ram_bytes", "gauge", "Host memory held by the cache store.", double(m.store.ram_bytes));
+        metric("tidal:cache_store_disk_bytes", "gauge", "Disk space held by the cache store.", double(m.store.disk_bytes));
+        metric("tidal:cache_store_snapshots", "gauge", "State snapshots in the cache store.", double(m.store.snapshots));
+        metric("tidal:cache_store_tokens", "gauge", "Token positions whose KV rows the cache store holds.", double(m.store.tokens));
+        metric("tidal:cache_store_restores_total", "counter", "Requests that resumed from the cache store.", double(m.store_restores));
+        metric("tidal:cache_store_restored_tokens_total", "counter", "Prompt tokens resumed from the cache store.", double(m.store_restored_tokens));
+        metric("tidal:cache_store_restore_seconds_total", "counter", "Time spent loading state from the cache store.", m.store_restore_seconds);
+        metric("tidal:cache_store_save_seconds_total", "counter", "Time spent copying state into the cache store.", m.store_save_seconds);
+        metric("tidal:cache_store_written_bytes_total", "counter", "Bytes the cache store wrote to disk.", double(m.store.written_bytes));
+        metric("tidal:cache_store_read_bytes_total", "counter", "Bytes the cache store read from disk.", double(m.store.read_bytes));
+        metric("tidal:cache_store_dropped_total", "counter", "Blobs dropped for lack of room in the cache store.", double(m.store.dropped));
+    }
+    response.send(200, "text/plain; version=0.0.4; charset=utf-8", out);
+}
+
+} // namespace tidal::server

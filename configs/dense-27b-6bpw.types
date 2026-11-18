@@ -1,0 +1,5 @@
+# Synthetic 27B Dense recipe; remaining matrix weights use --type q6_K.
+# Norms, convolution and decay tensors retain their F32 defaults.
+blk.*.ffn.gate=q5_K
+blk.*.ffn.up=q5_K
+token_embd.weight=q8_0

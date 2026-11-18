@@ -1,0 +1,258 @@
+# Validation contract
+
+The numerical suites compare synthetic decoders and native Qwen3.5 against
+independent NumPy GGUF readers and model implementations. Machine-specific measurements,
+hardware/software inventories and local test logs are not stored in this file.
+
+## Reproduce
+
+```sh
+cmake --build --preset dev-cuda
+ctest --preset dev-cuda
+python3 tests/test_reference.py --bin-dir build/dev-cuda/bin --backend cuda
+python3 tests/test_moe.py --bin-dir build/dev-cuda/bin --backend cuda
+python3 tests/test_quant.py --bin-dir build/dev-cuda/bin --backend cuda
+python3 tests/test_qwen35.py --bin-dir build/dev-cuda/bin --backend cuda
+python3 tests/test_prefill.py --bin-dir build/dev-cuda/bin --backend cuda
+python3 tests/test_residency.py --bin-dir build/dev-cuda/bin --backend cuda
+```
+
+CTest's numerical reference suite uses CPU execution, including in a CUDA build.
+The explicit Python commands exercise GPU batch prefill followed by CUDA
+model/indexer graphs with CPU attention during decoding.
+A CUDA compile alone does not establish GPU runtime correctness.
+
+A CPU-only build can use:
+
+```sh
+cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF
+cmake --build build-cpu -j
+ctest --test-dir build-cpu --output-on-failure
+```
+
+## Numerical coverage
+
+### Native Qwen3.5
+
+`qwen35-reference` uses independently written F32 GGUF fixtures and a separate
+NumPy decoder. It compares full vocabulary logits with atol/rtol 4e-4 on CPU
+and 2e-3 for CUDA batch prefill/continuation, and per-token
+NRMSE below 0.2%, greedy decisions, every full-attention prefix, exact transfer
+bytes, reset and chunked state. Cases include tied/untied output embeddings,
+implicit/explicit recurrent masks, unequal GDN key/value head counts (tiled GGUF
+ordering), MTP tail exclusion, EOS stopping and malformed metadata/payloads.
+Node profiling verifies all neural graphs on the requested backend, GPU
+FlashAttention during CUDA prefill, and QK/softmax/weighted V on CPU during
+decoding, with no QSA stages.
+
+The opt-in public BF16/Q8_0 integration suite also validates native kernels,
+generation and placement using the actual Qwen3.5-0.8B GGUFs. It is not part of
+CTest and does not download weights automatically. Its numerical bounds and
+independent llama.cpp comparison are described in [the real-model guide](qwen35.md).
+
+### Synthetic qwen4exp Dense
+
+Each format uses seed 42, hidden 128, three GDN layers plus one QSA layer,
+24 fixed prompt tokens and six greedily generated tokens. Every step's entire
+256-logit vector and selected QSA token IDs are compared to the NumPy reference
+with the requested backend's arithmetic. Generated tokens must equal the oracle's
+argmax. Reset/replay requires identical positions, logits and QSA selections.
+
+Tests compare each GGUF to its own weights and native operand conversions, not
+quantized logits to the original F32 model. Low-precision CPU and CUDA execution
+can produce different trajectories. This validates implementation on synthetic
+fixtures, not trained-model quality or universal error bounds.
+
+Absolute and relative tolerances used by `assert_allclose` are:
+
+| Matrix format | CPU atol / rtol | CUDA atol / rtol |
+|---|---:|---:|
+| F32 | 2e-4 | 8e-4 |
+| F16 | 3e-3 | 1e-3 |
+| BF16 | 0.012 | 8e-4 |
+| Q8_0 / Q4_0 | 0.025 | 0.025 |
+
+Every token additionally requires normalized vocabulary RMS error below 2.5%.
+F32 reductions can cross BF16 cache rounding boundaries even with F32 matrix
+weights. The eight-layer, hidden-256, seed-123 fixture exercises two independent
+QSA caches and reset/replay, using atol/rtol 3e-4.
+A separate F32 fixture retains the 27B preset's 40 heads and width-128 GDN/QSA,
+with a smaller residual/FFN and four layers, for independent NumPy validation of
+the wider state layout. The full 27B opt-in test is described in
+[the large-model guide](large-model.md).
+
+## PLE coverage and limits
+
+The same commands also exercise optional PLE. Two modules in a four-layer model
+cover beginning-of-sequence padding, consecutive EOS and an EOS later in the
+prompt, all convolution taps, greedy decoding, reset and exact transfer budgets.
+An eight-layer fixture uses three PLE modules, n-gram size 4, a different EOS,
+embedding width 192 and kernel size 3. Another uses n-gram size 2 and kernel size 1.
+Golden hash multipliers and prime vocabularies check dummy initialization against
+the pinned Transformers equations. Enabling PLE preserves the base model weights.
+
+F32/F16/BF16 PLE models compare full trajectories using the bounds above. Q4_0 and
+Q8_0 **embedding tables with F32 projections** use the tight F32 trajectory bounds,
+including QSA selections and greedy decisions. Native tests independently check
+PLE table lookup, repeated/boundary rows and key/value projections in all five
+formats. Quantized projection inputs include zeros, mixed values and halfway
+cases; projection comparisons retain atol/rtol 2e-5.
+
+Fully Q4_0/Q8_0 PLE models additionally run finite-logit generation, exact reset,
+repeatable chunked-prefill/decode state and placement checks. Their long trajectories
+are **not asserted equal to the independent NumPy oracle**: activation quantization
+thresholds can amplify reduction/reciprocal rounding differences, and near-tied
+QSA top-k or argmax decisions can then diverge. This remains a validation limit;
+native kernel agreement and deterministic replay do not establish independent
+end-to-end numerical equivalence for those combined quantized configurations.
+The original PLE-free quantized trajectory assertions remain enabled.
+
+`tidal-state-test` discards partially consumed sequences before replay, interleaves
+chunked prefill with single-token decode, and checks that rejected prompts do not
+advance state. Malformed PLE metadata tests cover missing/unknown keys, wrong
+array types, overflow, invalid EOS/dimensions/layers, duplicate layers, invalid
+head ranges and missing tensors. Old files with no PLE metadata remain supported.
+Profiling regression tests check the PLE graph, host hash events and replay.
+
+## MoE coverage
+
+`moe-reference` (CPU in CTest) and the explicit CUDA MoE suite compare logits,
+greedy decisions and QSA selection against an independent router/expert oracle.
+Cases cover top-1, top-2, all experts, normalized/unnormalized probabilities,
+absent/present shared experts and PLE plus MoE in F32. All original five formats
+also exercise isolated native expert matvecs against independently decoded weights,
+finite generation and reset/chunked state. Low-precision MoE trajectories are not
+required to match oracle expert selection near tied router scores; CUDA F16 expert
+kernels also use their native default accumulation rather than the Dense F32 hint.
+Invalid metadata and graph-node profiling are checked.
+Exact transfer accounting ensures routing does not introduce host round-trips.
+
+## Backend-specific reference arithmetic
+
+- CUDA F16/BF16 matvecs with F32 accumulation consume F32 activations. CPU dot
+  products convert those activations to the corresponding floating-point type.
+- Q4/Q8 dot products accumulate integer products within blocks before applying
+  scales. Dequantizing both operands before a floating-point matrix product
+  changes reduction rounding and can alter subsequent activation quantization.
+- CUDA Q8_1 uses half-away-from-zero rounding and stores the original activation
+  sum in FP16. Q4_0's unsigned-nibble correction uses that sum. CPU Q8_0 uses no
+  such sum; the AVX2 path rounds to nearest-even.
+- ggml's CUDA fast-math build turns Q8_1 division into reciprocal multiplication.
+  The oracle follows that operation order; the hardware's approximate reciprocal
+  is not promised bit-identical to NumPy at every quantization boundary.
+
+`tidal-matvec-test` runs native ggml matvecs on GGUF weights and F32 vectors supplied
+by Python. It checks five representative matrices per format with zero blocks,
+mixed values and positive/negative halfway and near-halfway inputs, at atol/rtol
+2e-5. The full model oracle remains pure NumPy and does not call this executable
+to calculate expected logits.
+
+Cases execute independently, so a failed format does not suppress other formats,
+multi-layer checks or malformed-input tests. To select one format:
+
+```sh
+python3 tests/test_reference.py --bin-dir build/dev-cuda/bin --backend cuda --formats q4_0
+```
+
+Core tests cover incomplete tails, block expansion, stable softmax, grouped KV
+heads, selected-only V aggregation and stale-KV exclusion after reset. CLI tests
+cover invalid inputs, capacity limits, malformed/truncated GGUF and strict CUDA
+rejection. Dev Container regression tests stub GPU preflight commands; they do
+not establish GPU correctness.
+
+## Placement and CI
+
+All model/indexer graphs use exactly one backend and check every node with
+`ggml_backend_supports_op`; CUDA requests have no automatic CPU fallback. CPU
+attention owns the main BF16 KV cache. Tests check backend identity,
+attention calls and the exact transfer-byte budget derived from model dimensions.
+Diagnostic decoding downloads current Q/K/V, selected block IDs, logits and compact
+sampler results; token/RoPE positions,
+PLE row IDs and attention outputs upload. PLE tables, projections and convolution
+state stay on the backend. During decoding the full main KV cache remains in
+CPU RAM; CUDA prefill temporarily holds the active layer’s KV on GPU.
+Native Qwen3.5 has no selected-block download or index cache; its attention reads
+the complete causal prefix, and its GDN state remains on the backend.
+
+The GitHub CUDA job builds SM 7.5 and runs numerical tests in CPU mode on GPU-less
+runners. It uses `GGML_CUDA_NO_VMM=ON` to avoid a host-driver linking dependency.
+The GPU development container uses normal VMM and host drivers supplied by
+NVIDIA Container Toolkit. Real GPU validation is a separate explicit test run.
+
+## Sampling
+
+The `sampling` CTest and explicit CUDA suite use an independent NumPy oracle for
+probabilities, filtering, penalties, seeded draws and generation. See
+[sampling validation](sampling.md) for coverage and commands. Compact generation
+checks finite logits without downloading the full vector; numerical reference
+tests retain full-logit capture.
+
+## Layer-major prefill
+
+`test_prefill.py` checks strict layer order, batched matrix shapes, GPU
+FlashAttention placement, exact BF16 export byte counts and absence of CPU
+attention during CUDA prefill. F32 Dense, MoE, PLE and native qwen35 fixtures
+compare complete trajectories with independent NumPy equations and exercise
+chunked prefixes, subsequent decoding, reset and capture-independent sampling.
+Pressure tests require eviction/reload and compare the resulting logits; an
+impossible managed budget must fail and allow recovery after reset.
+
+Explicit internal ranges of 1, 5 and 11 tokens exercise convolution/ngram and
+incomplete QSA-block boundaries for Dense, PLE, MoE and native qwen35. Their
+trajectories and subsequent CPU-KV decoding are compared with the unsplit and
+independent reference paths; graph events must remain in layer order. Memory
+pressure may select different GEMM partitions, so that comparison uses the same
+bounded floating-point tolerance as other partition changes. Core tests simulate
+changing allocation capacity to check progressive reduction, exact-once commits,
+minimum-size failure, explicit-size rejection and no replay after consumer or
+compute errors. Benchmark tests cover automatic defaults, manual bounds, invalid
+flags and rejection of comparisons with incompatible chunk settings.
+Residency tests also enforce a managed cap on real backend buffers, requiring
+8-token and 4-token allocation failures followed by successful 2-token ranges,
+exact-once completion and full workspace release on both CPU and CUDA. A second
+cap rejects even one token and verifies termination after 8/4/2/1 attempts.
+Additional 513-token QSA/PLE and native qwen35 fixtures cross the 256-token KV
+padding boundaries with 37-token ranges and 17-query tiles. They compare one
+prefill call with a 300-token prefix plus 213-token extension, including logits,
+selections and subsequent decoding.
+
+Large-model validation is opt-in. With a local GGUF whose context supports the
+requested length, `tidal-bench --model MODEL --backend cuda --prompt 262144
+--steps 0 --warmup 0 --repetitions 1 --json build/long-prefill.json` exercises a
+single layer-major call at that length without retaining diagnostic histories.
+Keep the model, measurements and machine-specific validation notes under ignored
+directories. Small fixtures do not establish that a particular large model fits;
+validate the actual target model and device before making that claim.
+
+### Persistent GPU KV
+
+CUDA builds register `gpu-kv` in CTest; it requires a usable CUDA device. It can
+also run directly with `python3 tests/test_gpu_kv.py --bin-dir build/dev-cuda/bin`.
+The independent NumPy oracles select direct FP16 or BF16 KV rounding and model
+the pinned CUDA MMA path's half query scaling and half softmax numerators.
+Floating and Q4/Q8 weights, PLE, MoE and native qwen35 are checked against these
+equations without relaxing the existing numerical bounds. Backend reduction
+order and activation quantization can still introduce bounded differences.
+
+C++ state checks compare batch prefill, token-by-token decode, split prefixes,
+decode-to-prefill transitions and reset in each format. Longer cases cross KV
+padding boundaries and the sparse-gather length threshold with wide GQA; the
+latter also compares against CPU selected-only attention. Profile nodes verify
+CUDA FlashAttention and KV dtype. Compact prefill plus decode must read back
+exactly two finiteness scalars, with no CPU attention calls or KV exports.
+Tests also cover allocation failure/poison/reset, persistent-byte accounting,
+CPU-backend rejection, benchmark replay and incompatible placement reports.
+
+F32/F16/BF16/Q8_0/Q4_0 matrices also have isolated 24-column tests. The CUDA
+reference distinguishes batch MMQ from single-token MMVQ: Q8 batch scales use
+F32, and the Q4 MMA path subtracts the integer zero point before multiplication.
+This prevents activation quantization differences being misclassified as state
+or layout errors. Exact reset replay uses the same input partition; independent
+cross-partition checks allow bounded floating-point error. See [prefill](prefill.md).
+
+`test_residency.py` verifies completed-layer-first and farthest-future-first
+eviction, protection of active and requested prefetch groups, delayed restoration,
+exact asynchronous reloads (including runtime-converted formats and tied weights),
+and failure on an impossible budget. CUDA tests also export KV across multiple
+staging chunks, checking the existing prefix, every BF16 byte and GPU source
+lifetime through transfer completion.
